@@ -60,7 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     let test_regs: [u16; 2] = [0x4248, 0x0000]; // 50.0 as F32 in BigEndian
-    println!("  Test registers: {:04X} {:04X}", test_regs[0], test_regs[1]);
+    println!(
+        "  Test registers: {:04X} {:04X}",
+        test_regs[0], test_regs[1]
+    );
 
     for order in &byte_orders {
         let f32_val = voltage_modbus::regs_to_f32(&test_regs, *order);
@@ -80,7 +83,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         u16::from_be_bytes([f32_bytes[0], f32_bytes[1]]),
         u16::from_be_bytes([f32_bytes[2], f32_bytes[3]]),
     ];
-    println!("  F32 {} -> registers: {:04X} {:04X}", f32_value, encoded_f32[0], encoded_f32[1]);
+    println!(
+        "  F32 {} -> registers: {:04X} {:04X}",
+        f32_value, encoded_f32[0], encoded_f32[1]
+    );
 
     // Decode back using regs_to_f32
     let decoded_f32 = regs_to_f32(&encoded_f32, ByteOrder::BigEndian);
@@ -89,7 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // U32 encoding example
     let u32_value: u32 = 0x12345678;
     let encoded_u32 = [(u32_value >> 16) as u16, (u32_value & 0xFFFF) as u16];
-    println!("  U32 0x{:08X} -> registers: {:04X} {:04X}", u32_value, encoded_u32[0], encoded_u32[1]);
+    println!(
+        "  U32 0x{:08X} -> registers: {:04X} {:04X}",
+        u32_value, encoded_u32[0], encoded_u32[1]
+    );
 
     // =========================================================================
     // Part 4: DeviceLimits Demo
@@ -99,18 +108,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let default_limits = DeviceLimits::default();
     println!("  Default limits:");
-    println!("    Max read registers: {}", default_limits.max_read_registers);
-    println!("    Max write registers: {}", default_limits.max_write_registers);
+    println!(
+        "    Max read registers: {}",
+        default_limits.max_read_registers
+    );
+    println!(
+        "    Max write registers: {}",
+        default_limits.max_write_registers
+    );
     println!("    Max read coils: {}", default_limits.max_read_coils);
-    println!("    Inter-request delay: {}ms", default_limits.inter_request_delay_ms);
+    println!(
+        "    Inter-request delay: {}ms",
+        default_limits.inter_request_delay_ms
+    );
 
     let custom_limits = DeviceLimits::new()
         .with_max_read_registers(50)
         .with_max_write_registers(20)
         .with_inter_request_delay_ms(100);
     println!("  Custom limits:");
-    println!("    Max read registers: {}", custom_limits.max_read_registers);
-    println!("    Inter-request delay: {}ms", custom_limits.inter_request_delay_ms);
+    println!(
+        "    Max read registers: {}",
+        custom_limits.max_read_registers
+    );
+    println!(
+        "    Inter-request delay: {}ms",
+        custom_limits.inter_request_delay_ms
+    );
 
     // =========================================================================
     // Part 5: TCP Client Demo (requires Modbus server)
@@ -161,7 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match client.read_01(slave_id, 0, 8).await {
         Ok(coils) => {
-            let states: Vec<&str> = coils.iter().map(|&c| if c { "ON" } else { "OFF" }).collect();
+            let states: Vec<&str> = coils
+                .iter()
+                .map(|&c| if c { "ON" } else { "OFF" })
+                .collect();
             println!("    FC01 Coils 0-7: {:?}", states);
         }
         Err(e) => println!("    FC01 Error: {}", e),
@@ -192,8 +219,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Statistics
     let stats = client.get_stats();
     println!("\n  📊 Statistics:");
-    println!("    Requests: {}, Responses: {}", stats.requests_sent, stats.responses_received);
-    println!("    Bytes sent: {}, received: {}", stats.bytes_sent, stats.bytes_received);
+    println!(
+        "    Requests: {}, Responses: {}",
+        stats.requests_sent, stats.responses_received
+    );
+    println!(
+        "    Bytes sent: {}, received: {}",
+        stats.bytes_sent, stats.bytes_received
+    );
 
     if let Err(e) = client.close().await {
         eprintln!("  ⚠️  Close error: {}", e);
