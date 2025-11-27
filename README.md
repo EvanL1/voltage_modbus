@@ -2,14 +2,14 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/rust-1.70+-blue.svg)](https://www.rust-lang.org)
-[![GitHub](https://img.shields.io/badge/github-voltage_modbus-blue.svg)](https://github.com/voltage-llc/voltage_modbus)
+[![GitHub](https://img.shields.io/badge/github-voltage_modbus-blue.svg)](https://github.com/EvanL1/voltage_modbus)
 [![Crates.io](https://img.shields.io/crates/v/voltage_modbus.svg)](https://crates.io/crates/voltage_modbus)
 [![docs.rs](https://docs.rs/voltage_modbus/badge.svg)](https://docs.rs/voltage_modbus)
 
 > **High-Performance Modbus TCP/RTU/ASCII Library for Rust**
 >
-> **Author:** Evan Liu <evan.liu@voltageenergy.com>
-> **Version:** 0.2.0
+> **Author:** Evan Liu <liuyifanz.1996@gmail.com>
+> **Version:** 0.4.0
 > **License:** MIT
 
 A comprehensive, high-performance Modbus TCP/RTU/ASCII implementation in pure Rust designed for industrial automation, IoT applications, and smart grid systems.
@@ -30,14 +30,16 @@ A comprehensive, high-performance Modbus TCP/RTU/ASCII implementation in pure Ru
 
 | Code | Function                 | Client | Server |
 | ---- | ------------------------ | ------ | ------ |
-| 0x01 | Read Coils               | ✅     | ✅     |
-| 0x02 | Read Discrete Inputs     | ✅     | ✅     |
-| 0x03 | Read Holding Registers   | ✅     | ✅     |
-| 0x04 | Read Input Registers     | ✅     | ✅     |
-| 0x05 | Write Single Coil        | ✅     | ✅     |
-| 0x06 | Write Single Register    | ✅     | ✅     |
-| 0x0F | Write Multiple Coils     | ✅     | ✅     |
-| 0x10 | Write Multiple Registers | ✅     | ✅     |
+| 0x01 | Read Coils               | ✅     | 🚧     |
+| 0x02 | Read Discrete Inputs     | ✅     | 🚧     |
+| 0x03 | Read Holding Registers   | ✅     | 🚧     |
+| 0x04 | Read Input Registers     | ✅     | 🚧     |
+| 0x05 | Write Single Coil        | ✅     | 🚧     |
+| 0x06 | Write Single Register    | ✅     | 🚧     |
+| 0x0F | Write Multiple Coils     | ✅     | 🚧     |
+| 0x10 | Write Multiple Registers | ✅     | 🚧     |
+
+> 🚧 Server functionality is planned for a future release.
 
 ## 🚀 Quick Start
 
@@ -45,7 +47,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-voltage_modbus = "0.2.0"
+voltage_modbus = "0.4.0"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -103,6 +105,8 @@ async fn main() -> ModbusResult<()> {
 
 ### Server Example
 
+> ⚠️ **Note**: Server functionality is not included in this release. The example below is for reference only and will be available in a future version.
+
 ```rust
 use voltage_modbus::{
     ModbusTcpServer, ModbusTcpServerConfig, ModbusServer, ModbusRegisterBank
@@ -119,11 +123,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         request_timeout: Duration::from_secs(30),
         register_bank: Some(Arc::new(ModbusRegisterBank::new())),
     };
-    
+
     // Start server
     let mut server = ModbusTcpServer::with_config(config)?;
     server.start().await?;
-    
+
     // Server is now running...
     Ok(())
 }
@@ -133,7 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 - **[API Reference](https://docs.rs/voltage_modbus)** - Complete API documentation
 - **[Crates.io](https://crates.io/crates/voltage_modbus)** - Package information
-- **[GitHub Repository](https://github.com/voltage-llc/voltage_modbus)** - Source code and issues
+- **[GitHub Repository](https://github.com/EvanL1/voltage_modbus)** - Source code and issues
 
 ## 🏗️ Architecture
 
@@ -272,6 +276,8 @@ let mut rtu_client = ModbusRtuClient::with_config(
 
 ### Server Configuration
 
+> ⚠️ **Note**: Server functionality is planned for a future release.
+
 ```rust
 use voltage_modbus::{ModbusTcpServerConfig, ModbusRegisterBank};
 use std::sync::Arc;
@@ -282,7 +288,7 @@ let config = ModbusTcpServerConfig {
     request_timeout: Duration::from_secs(30),
     register_bank: Some(Arc::new(ModbusRegisterBank::with_sizes(
         10000, // coils
-        10000, // discrete_inputs  
+        10000, // discrete_inputs
         10000, // holding_registers
         10000, // input_registers
     ))),
@@ -294,8 +300,8 @@ let config = ModbusTcpServerConfig {
 ### Building from Source
 
 ```bash
-git clone https://github.com/voltage-llc/voltage_modbus.git
-cd voltage_modbus
+git clone https://github.com/EvanL1/voltage_modbus.git
+cd voltage-modbus
 cargo build --release
 ```
 
@@ -326,8 +332,8 @@ cargo add voltage_modbus
 ### From Source
 
 ```bash
-git clone https://github.com/voltage-llc/voltage_modbus.git
-cd voltage_modbus
+git clone https://github.com/EvanL1/voltage_modbus.git
+cd voltage-modbus
 cargo install --path .
 ```
 
@@ -348,12 +354,29 @@ We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) f
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release notes.
 
-### Recent Updates (v0.2.0)
+### v0.4.0 - Industrial Enhancement
+
+- 🏭 **Industrial Data Types**: New `ModbusValue` enum supporting U16/I16/U32/I32/F32/F64/Bool/String
+- 🔄 **Byte Order Support**: `ByteOrder` with BigEndian/LittleEndian/BigEndianSwap/LittleEndianSwap
+- 📦 **ModbusCodec**: Unified encoding/decoding for all industrial data types
+- ⚡ **CommandBatcher**: Write command batching for optimized communication
+- 🎛️ **DeviceLimits**: Configurable protocol limits per device
+- 🧱 **Stack-allocated PDU**: Fixed 253-byte array with zero heap allocation
+- 🎯 **Simplified API**: Function code naming (`read_03`, `write_06`, etc.)
+- 📊 **CallbackLogger**: Flexible logging system with callback support
+- 📈 **PerformanceMetrics**: Built-in performance monitoring
+- 🚧 **Server**: Temporarily not included (planned for future release)
+
+### v0.3.1
+
+- 🐛 Bug fixes and stability improvements
+
+### v0.2.0
 
 - ✨ **Generic Client Architecture**: Eliminated code duplication between TCP/RTU clients
 - 🎯 **Improved API**: Cleaner, more intuitive client interfaces
-- 🔧 **Enhanced RTU Support**: Full RTU client and server implementations
-- 📊 **Better Testing**: Comprehensive test coverage with 43 total tests
+- 🔧 **Enhanced RTU Support**: Full RTU client implementation
+- 📊 **Better Testing**: Comprehensive test coverage
 - 🏗️ **Architectural Refinement**: Clean separation of transport and application layers
 
 ## 📄 License
@@ -370,9 +393,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 - **Documentation**: https://docs.rs/voltage_modbus
 - **Package**: https://crates.io/crates/voltage_modbus
-- **Issues**: https://github.com/voltage-llc/voltage_modbus/issues
-- **Discussions**: https://github.com/voltage-llc/voltage_modbus/discussions
-- **Email**: evan.liu@voltageenergy.com
+- **Issues**: https://github.com/EvanL1/voltage_modbus/issues
+- **Discussions**: https://github.com/EvanL1/voltage_modbus/discussions
+- **Email**: liuyifanz.1996@gmail.com
 
 ---
 

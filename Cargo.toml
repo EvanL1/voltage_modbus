@@ -1,13 +1,13 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
-authors = ["Evan Liu <evan.liu@voltageenergy.com>"]
-description = "A high-performance Modbus library for Rust with TCP and RTU support"
+authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
+description = "A high-performance industrial Modbus library for Rust with TCP and RTU support"
 license = "MIT"
-homepage = "https://github.com/voltage-llc/voltage_modbus"
-repository = "https://github.com/voltage-llc/voltage_modbus"
+homepage = "https://github.com/EvanL1/voltage_modbus"
+repository = "https://github.com/EvanL1/voltage_modbus"
 documentation = "https://docs.rs/voltage_modbus"
 readme = "README.md"
 keywords = ["modbus", "industrial", "automation", "tcp", "rtu"]
@@ -26,99 +26,34 @@ exclude = [
 name = "voltage_modbus"
 path = "src/lib.rs"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
 # Async runtime
 tokio = { version = "1.0", features = ["full"] }
-tokio-serial = "5.4"
 
-# Error handling  
+# Error handling
 thiserror = "1.0"
-anyhow = "1.0"
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-serde_yaml = "0.9"
 
 # Logging
-log = "0.4"
-env_logger = "0.10"
 tracing = "0.1"
-tracing-subscriber = "0.3"
 
 # Utilities
-hex = "0.4"
 bytes = "1.4"
-byteorder = "1.4"
 crc = "3.0"
-rand = "0.8"
 
-# Time and async utilities
-chrono = { version = "0.4", features = ["serde"] }
-futures = "0.3"
+# Async utilities
 async-trait = "0.1"
 
-# Performance monitoring
-prometheus = { version = "0.13", optional = true }
+# RTU serial support (optional)
+tokio-serial = { version = "5.4", optional = true }
 
-# Testing utilities (dev dependencies)
 [dev-dependencies]
 tokio-test = "0.4"
-criterion = { version = "0.5", features = ["html_reports"] }
 
-[[bin]]
-name = "demo"
-path = "src/bin/demo.rs"
-
-[[bin]]
-name = "simple_test"
-path = "src/bin/simple_test.rs"
-
-[[bin]]
-name = "performance_test"
-path = "src/bin/performance_test.rs"
-
-[[bin]]
-name = "advanced_test"
-path = "src/bin/advanced_test.rs"
-
-[[bin]]
-name = "simple_protocol_test"
-path = "src/bin/simple_protocol_test.rs"
-
-[[bin]]
-name = "server_demo"
-path = "src/bin/server_demo.rs"
-
-[[bin]]
-name = "full_function_test"
-path = "src/bin/full_function_test.rs"
-
-[[bin]]
-name = "rtu_test"
-path = "src/bin/rtu_test.rs"
-
-[[bin]]
-name = "rtu_simulator"
-path = "src/bin/rtu_simulator.rs"
-
-[[bin]]
-name = "ascii_test"
-path = "src/bin/ascii_test.rs"
+[features]
+default = []
+rtu = ["dep:tokio-serial"]
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
-
-[profile.bench]
-debug = true
-
-[features]
-default = ["tcp", "rtu"]
-tcp = []
-rtu = []
-ascii = []
-full = ["tcp", "rtu", "ascii"] 

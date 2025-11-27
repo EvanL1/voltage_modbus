@@ -37,7 +37,7 @@ impl LogLevel {
 }
 
 /// Type alias for log callback functions
-/// 
+///
 /// The callback receives a log level and message string
 pub type LogCallback = Box<dyn Fn(LogLevel, &str) + Send + Sync>;
 
@@ -60,7 +60,11 @@ impl CallbackLogger {
     }
 
     /// Create a new callback logger with specific mode
-    pub fn with_mode(callback: Option<LogCallback>, min_level: LogLevel, mode: LoggingMode) -> Self {
+    pub fn with_mode(
+        callback: Option<LogCallback>,
+        min_level: LogLevel,
+        mode: LoggingMode,
+    ) -> Self {
         Self {
             callback: callback.map(Arc::new),
             min_level,
@@ -71,12 +75,17 @@ impl CallbackLogger {
     /// Create a logger with default console output
     pub fn console() -> Self {
         let callback: LogCallback = Box::new(|level, message| {
-            let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S%.3f");
+            use std::time::SystemTime;
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = now.as_secs();
+            let millis = now.subsec_millis();
             match level {
-                LogLevel::Error => eprintln!("[{}] ERROR: {}", timestamp, message),
-                LogLevel::Warn => eprintln!("[{}] WARN: {}", timestamp, message),
-                LogLevel::Info => println!("[{}] INFO: {}", timestamp, message),
-                LogLevel::Debug => println!("[{}] DEBUG: {}", timestamp, message),
+                LogLevel::Error => eprintln!("[{}.{:03}] ERROR: {}", secs, millis, message),
+                LogLevel::Warn => eprintln!("[{}.{:03}] WARN: {}", secs, millis, message),
+                LogLevel::Info => println!("[{}.{:03}] INFO: {}", secs, millis, message),
+                LogLevel::Debug => println!("[{}.{:03}] DEBUG: {}", secs, millis, message),
             }
         });
         Self::new(Some(callback), LogLevel::Info)
@@ -137,7 +146,8 @@ impl CallbackLogger {
             return;
         }
 
-        let hex_data = data.iter()
+        let hex_data = data
+            .iter()
             .map(|b| format!("{:02X}", b))
             .collect::<Vec<_>>()
             .join(" ");
@@ -147,11 +157,20 @@ impl CallbackLogger {
     }
 
     /// Log a Modbus request with different modes
-    pub fn log_request(&self, slave_id: u8, function_code: u8, address: u16, quantity: u16, data: &[u8]) {
+    pub fn log_request(
+        &self,
+        slave_id: u8,
+        function_code: u8,
+        address: u16,
+        quantity: u16,
+        data: &[u8],
+    ) {
         match self.mode {
             LoggingMode::Raw => {
-                let raw_packet = self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
-                let hex_data = raw_packet.iter()
+                let raw_packet =
+                    self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
+                let hex_data = raw_packet
+                    .iter()
                     .map(|b| format!("{:02X}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -174,10 +193,12 @@ impl CallbackLogger {
                     slave_id, function_name, function_code, address, quantity
                 );
                 self.info(&interpreted);
-                
+
                 // Then log raw
-                let raw_packet = self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
-                let hex_data = raw_packet.iter()
+                let raw_packet =
+                    self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
+                let hex_data = raw_packet
+                    .iter()
                     .map(|b| format!("{:02X}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -192,7 +213,8 @@ impl CallbackLogger {
         match self.mode {
             LoggingMode::Raw => {
                 let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
-                let hex_data = raw_packet.iter()
+                let hex_data = raw_packet
+                    .iter()
                     .map(|b| format!("{:02X}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -217,10 +239,11 @@ impl CallbackLogger {
                     slave_id, function_name, function_code, interpreted_data
                 );
                 self.info(&interpreted);
-                
+
                 // Then log raw
                 let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
-                let hex_data = raw_packet.iter()
+                let hex_data = raw_packet
+                    .iter()
                     .map(|b| format!("{:02X}", b))
                     .collect::<Vec<_>>()
                     .join(" ");
@@ -231,7 +254,14 @@ impl CallbackLogger {
     }
 
     /// Build raw request packet for logging
-    fn build_raw_request_packet(&self, slave_id: u8, function_code: u8, address: u16, quantity: u16, data: &[u8]) -> Vec<u8> {
+    fn build_raw_request_packet(
+        &self,
+        slave_id: u8,
+        function_code: u8,
+        address: u16,
+        quantity: u16,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut packet = Vec::new();
         // TCP MBAP header (simplified for logging)
         packet.extend_from_slice(&[0x00, 0x01]); // Transaction ID
@@ -256,6 +286,14 @@ impl CallbackLogger {
         packet.push(function_code);
         packet.extend_from_slice(data);
         packet
+    }
+
+    /// Simple hex encoding helper
+    fn hex_encode(data: &[u8]) -> String {
+        data.iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<Vec<_>>()
+            .join("")
     }
 
     /// Get human-readable function name
@@ -292,9 +330,13 @@ impl CallbackLogger {
                             }
                         }
                     }
-                    format!("Byte count: {}, Coils: {:?}", byte_count, &coils[..coils.len().min(16)])
+                    format!(
+                        "Byte count: {}, Coils: {:?}",
+                        byte_count,
+                        &coils[..coils.len().min(16)]
+                    )
                 } else {
-                    format!("Data: {}", hex::encode(data))
+                    format!("Data: {}", Self::hex_encode(data))
                 }
             }
             0x03 | 0x04 => {
@@ -308,9 +350,13 @@ impl CallbackLogger {
                             registers.push(value);
                         }
                     }
-                    format!("Byte count: {}, Registers: {:?}", byte_count, &registers[..registers.len().min(8)])
+                    format!(
+                        "Byte count: {}, Registers: {:?}",
+                        byte_count,
+                        &registers[..registers.len().min(8)]
+                    )
                 } else {
-                    format!("Data: {}", hex::encode(data))
+                    format!("Data: {}", Self::hex_encode(data))
                 }
             }
             0x05 => {
@@ -318,9 +364,14 @@ impl CallbackLogger {
                 if data.len() >= 4 {
                     let address = u16::from_be_bytes([data[0], data[1]]);
                     let value = u16::from_be_bytes([data[2], data[3]]);
-                    format!("Address: {}, Value: 0x{:04X} ({})", address, value, if value == 0xFF00 { "ON" } else { "OFF" })
+                    format!(
+                        "Address: {}, Value: 0x{:04X} ({})",
+                        address,
+                        value,
+                        if value == 0xFF00 { "ON" } else { "OFF" }
+                    )
                 } else {
-                    format!("Data: {}", hex::encode(data))
+                    format!("Data: {}", Self::hex_encode(data))
                 }
             }
             0x06 => {
@@ -330,7 +381,7 @@ impl CallbackLogger {
                     let value = u16::from_be_bytes([data[2], data[3]]);
                     format!("Address: {}, Value: {} (0x{:04X})", address, value, value)
                 } else {
-                    format!("Data: {}", hex::encode(data))
+                    format!("Data: {}", Self::hex_encode(data))
                 }
             }
             0x0F | 0x10 => {
@@ -340,11 +391,11 @@ impl CallbackLogger {
                     let quantity = u16::from_be_bytes([data[2], data[3]]);
                     format!("Address: {}, Quantity: {}", address, quantity)
                 } else {
-                    format!("Data: {}", hex::encode(data))
+                    format!("Data: {}", Self::hex_encode(data))
                 }
             }
             _ => {
-                format!("Data: {}", hex::encode(data))
+                format!("Data: {}", Self::hex_encode(data))
             }
         }
     }
@@ -376,4 +427,4 @@ macro_rules! custom_logger {
     ($callback:expr, $level:expr, $mode:expr) => {
         $crate::logging::CallbackLogger::with_mode(Some($callback), $level, $mode)
     };
-} 
+}

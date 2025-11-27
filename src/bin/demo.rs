@@ -1,147 +1,207 @@
-/// Voltage Modbus Demo
-/// 
-/// Author: Evan Liu <evan.liu@voltageenergy.com>
-/// This program demonstrates basic usage of the voltage_modbus library.
+//! Voltage Modbus Demo
+//!
+//! Demonstrates the voltage_modbus library features including:
+//! - Basic Modbus TCP client operations (read/write registers and coils)
+//! - Industrial Enhancement features (ModbusValue, ByteOrder, ModbusCodec)
+//! - Simplified API with function code naming (read_03, write_06, etc.)
+//!
+//! Usage: cargo run --bin demo [server_address]
+//! Example: cargo run --bin demo 127.0.0.1:502
 
 use std::time::Duration;
 use tokio::time::sleep;
-use voltage_modbus::{ModbusClient, ModbusTcpClient};
+use voltage_modbus::{
+    regs_to_f32, ByteOrder, DeviceLimits, ModbusClient, ModbusTcpClient, ModbusValue,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
-    
-    println!("🚀 Voltage Modbus Demo");
-    println!("=====================");
-    
+    println!("🚀 Voltage Modbus v0.4.0 Demo");
+    println!("=============================");
+    println!("Industrial Enhancement Features Showcase\n");
+
+    // =========================================================================
+    // Part 1: Industrial Data Types Demo (No connection required)
+    // =========================================================================
+    println!("📦 Part 1: Industrial Data Types (ModbusValue)");
+    println!("-----------------------------------------------");
+
+    // ModbusValue - Industrial data type abstraction
+    let values = [
+        ModbusValue::U16(1234),
+        ModbusValue::I16(-500),
+        ModbusValue::U32(100000),
+        ModbusValue::I32(-50000),
+        ModbusValue::F32(std::f32::consts::PI),
+        ModbusValue::F64(std::f64::consts::E),
+        ModbusValue::Bool(true),
+    ];
+
+    for value in &values {
+        println!(
+            "  {} -> as_f64: {:.4}, registers: {}",
+            value,
+            value.as_f64(),
+            value.register_count()
+        );
+    }
+
+    // =========================================================================
+    // Part 2: Byte Order Demo
+    // =========================================================================
+    println!("\n🔄 Part 2: Byte Order Handling");
+    println!("-------------------------------");
+
+    let byte_orders = [
+        ByteOrder::BigEndian,
+        ByteOrder::LittleEndian,
+        ByteOrder::BigEndianSwap,
+        ByteOrder::LittleEndianSwap,
+    ];
+
+    let test_regs: [u16; 2] = [0x4248, 0x0000]; // 50.0 as F32 in BigEndian
+    println!("  Test registers: {:04X} {:04X}", test_regs[0], test_regs[1]);
+
+    for order in &byte_orders {
+        let f32_val = voltage_modbus::regs_to_f32(&test_regs, *order);
+        println!("    {:?} -> f32: {:.2}", order, f32_val);
+    }
+
+    // =========================================================================
+    // Part 3: Data Encoding/Decoding Demo
+    // =========================================================================
+    println!("\n📊 Part 3: Data Encoding/Decoding");
+    println!("----------------------------------");
+
+    // Encode F32 to registers (BigEndian)
+    let f32_value: f32 = 123.456;
+    let f32_bytes = f32_value.to_be_bytes();
+    let encoded_f32 = [
+        u16::from_be_bytes([f32_bytes[0], f32_bytes[1]]),
+        u16::from_be_bytes([f32_bytes[2], f32_bytes[3]]),
+    ];
+    println!("  F32 {} -> registers: {:04X} {:04X}", f32_value, encoded_f32[0], encoded_f32[1]);
+
+    // Decode back using regs_to_f32
+    let decoded_f32 = regs_to_f32(&encoded_f32, ByteOrder::BigEndian);
+    println!("  Decoded F32: {:.3}", decoded_f32);
+
+    // U32 encoding example
+    let u32_value: u32 = 0x12345678;
+    let encoded_u32 = [(u32_value >> 16) as u16, (u32_value & 0xFFFF) as u16];
+    println!("  U32 0x{:08X} -> registers: {:04X} {:04X}", u32_value, encoded_u32[0], encoded_u32[1]);
+
+    // =========================================================================
+    // Part 4: DeviceLimits Demo
+    // =========================================================================
+    println!("\n🎛️  Part 4: DeviceLimits - Protocol Configuration");
+    println!("-------------------------------------------------");
+
+    let default_limits = DeviceLimits::default();
+    println!("  Default limits:");
+    println!("    Max read registers: {}", default_limits.max_read_registers);
+    println!("    Max write registers: {}", default_limits.max_write_registers);
+    println!("    Max read coils: {}", default_limits.max_read_coils);
+    println!("    Inter-request delay: {}ms", default_limits.inter_request_delay_ms);
+
+    let custom_limits = DeviceLimits::new()
+        .with_max_read_registers(50)
+        .with_max_write_registers(20)
+        .with_inter_request_delay_ms(100);
+    println!("  Custom limits:");
+    println!("    Max read registers: {}", custom_limits.max_read_registers);
+    println!("    Inter-request delay: {}ms", custom_limits.inter_request_delay_ms);
+
+    // =========================================================================
+    // Part 5: TCP Client Demo (requires Modbus server)
+    // =========================================================================
+    println!("\n🔌 Part 5: TCP Client Operations");
+    println!("---------------------------------");
+
     let server_address = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:502".to_string());
-    
-    println!("Connecting to Modbus server at {}...", server_address);
-    
+
+    println!("  Connecting to {}...", server_address);
+
     let timeout = Duration::from_secs(5);
-    
-    // Parse address
-    let address: std::net::SocketAddr = server_address.parse()
-        .map_err(|e| format!("Invalid server address: {}", e))?;
-    
+
     let mut client = match ModbusTcpClient::from_address(&server_address, timeout).await {
         Ok(client) => {
-            println!("✅ Connected successfully!");
+            println!("  ✅ Connected successfully!");
             client
-        },
+        }
         Err(e) => {
-            eprintln!("❌ Failed to connect: {}", e);
-            eprintln!("Make sure a Modbus server is running on {}", server_address);
+            println!("  ⚠️  Connection failed: {}", e);
+            println!("  (This is expected if no Modbus server is running)");
+            println!("\n🎉 Demo completed! (TCP operations skipped)");
             return Ok(());
         }
     };
-    
+
     let slave_id = 1;
-    
-    println!("\n📖 Testing read operations...");
-    
-    // Test reading holding registers
-    match client.read_03(slave_id, 100, 5).await {
+
+    // Read operations using simplified API
+    println!("\n  📖 Read Operations:");
+
+    match client.read_03(slave_id, 0, 5).await {
         Ok(values) => {
-            println!("📈 Read holding registers 100-104: {:?}", values);
-            for (i, value) in values.iter().enumerate() {
-                println!("  Register {}: {} (0x{:04X})", 100 + i, value, value);
+            println!("    FC03 Holding registers 0-4: {:?}", values);
+
+            // Decode as F32 using regs_to_f32
+            if values.len() >= 2 {
+                let f32_val = regs_to_f32(&[values[0], values[1]], ByteOrder::BigEndian);
+                println!("    -> First 2 registers as F32: {:.4}", f32_val);
             }
-        },
-        Err(e) => println!("❌ Failed to read holding registers: {}", e),
+        }
+        Err(e) => println!("    FC03 Error: {}", e),
     }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Test reading input registers
-    match client.read_04(slave_id, 200, 3).await {
-        Ok(values) => {
-            println!("📊 Read input registers 200-202: {:?}", values);
-        },
-        Err(e) => println!("❌ Failed to read input registers: {}", e),
-    }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Test reading coils
+
+    sleep(Duration::from_millis(50)).await;
+
     match client.read_01(slave_id, 0, 8).await {
         Ok(coils) => {
-            println!("💡 Read coils 0-7: {:?}", coils);
-            for (i, &coil) in coils.iter().enumerate() {
-                println!("  Coil {}: {}", i, if coil { "ON" } else { "OFF" });
-            }
-        },
-        Err(e) => println!("❌ Failed to read coils: {}", e),
+            let states: Vec<&str> = coils.iter().map(|&c| if c { "ON" } else { "OFF" }).collect();
+            println!("    FC01 Coils 0-7: {:?}", states);
+        }
+        Err(e) => println!("    FC01 Error: {}", e),
     }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Test reading discrete inputs
-    match client.read_02(slave_id, 100, 4).await {
-        Ok(inputs) => {
-            println!("🔌 Read discrete inputs 100-103: {:?}", inputs);
-        },
-        Err(e) => println!("❌ Failed to read discrete inputs: {}", e),
+
+    // Write operations
+    println!("\n  ✏️  Write Operations:");
+
+    match client.write_06(slave_id, 100, 0x1234).await {
+        Ok(_) => println!("    FC06 Wrote register 100 = 0x1234"),
+        Err(e) => println!("    FC06 Error: {}", e),
     }
-    
-    println!("\n✏️  Testing write operations...");
-    
-    // Write single register using function code 0x06
-    match client.write_06(slave_id, 300, 0xABCD).await {
-        Ok(_) => println!("✅ Wrote single register 300 = 0xABCD"),
-        Err(e) => println!("❌ Failed to write single register: {}", e),
+
+    sleep(Duration::from_millis(50)).await;
+
+    // Write F32 value (encode manually)
+    let temp: f32 = 98.6;
+    let temp_bytes = temp.to_be_bytes();
+    let f32_regs = [
+        u16::from_be_bytes([temp_bytes[0], temp_bytes[1]]),
+        u16::from_be_bytes([temp_bytes[2], temp_bytes[3]]),
+    ];
+    match client.write_10(slave_id, 200, &f32_regs).await {
+        Ok(_) => println!("    FC16 Wrote F32 98.6 to registers 200-201"),
+        Err(e) => println!("    FC16 Error: {}", e),
     }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Write single coil using function code 0x05
-    match client.write_05(slave_id, 100, true).await {
-        Ok(_) => println!("✅ Wrote single coil 100 = true"),
-        Err(e) => println!("❌ Failed to write single coil: {}", e),
-    }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Write multiple registers using function code 0x10
-    match client.write_10(slave_id, 400, &[0x1111, 0x2222, 0x3333]).await {
-        Ok(_) => println!("✅ Wrote multiple registers 400-402"),
-        Err(e) => println!("❌ Failed to write multiple registers: {}", e),
-    }
-    
-    sleep(Duration::from_millis(100)).await;
-    
-    // Write multiple coils using function code 0x0F
-    match client.write_0f(slave_id, 200, &[true, false, true, false]).await {
-        Ok(_) => println!("✅ Wrote multiple coils 200-203"),
-        Err(e) => println!("❌ Failed to write multiple coils: {}", e),
-    }
-    
-    // Show connection statistics
+
+    // Statistics
     let stats = client.get_stats();
-    println!("\n📊 Connection Statistics:");
-    println!("   Requests sent: {}", stats.requests_sent);
-    println!("   Responses received: {}", stats.responses_received);
-    println!("   Errors: {}", stats.errors);
-    println!("   Timeouts: {}", stats.timeouts);
-    println!("   Bytes sent: {}", stats.bytes_sent);
-    println!("   Bytes received: {}", stats.bytes_received);
-    
-    if stats.requests_sent > 0 {
-        let success_rate = (stats.responses_received as f64 / stats.requests_sent as f64) * 100.0;
-        println!("   Success rate: {:.1}%", success_rate);
-    }
-    
-    // Close connection
+    println!("\n  📊 Statistics:");
+    println!("    Requests: {}, Responses: {}", stats.requests_sent, stats.responses_received);
+    println!("    Bytes sent: {}, received: {}", stats.bytes_sent, stats.bytes_received);
+
     if let Err(e) = client.close().await {
-        eprintln!("⚠️  Error closing connection: {}", e);
-    } else {
-        println!("\n✅ Connection closed successfully");
+        eprintln!("  ⚠️  Close error: {}", e);
     }
-    
+
     println!("\n🎉 Demo completed!");
-    println!("👋 Thank you for using Voltage Modbus by Evan Liu!");
-    
+    println!("📚 Documentation: https://docs.rs/voltage_modbus");
+    println!("🔗 Repository: https://github.com/EvanL1/voltage_modbus");
+
     Ok(())
-} 
+}
