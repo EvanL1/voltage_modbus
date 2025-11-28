@@ -16,7 +16,7 @@ use voltage_modbus::{
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 Voltage Modbus v0.4.0 Demo");
+    println!("🚀 Voltage Modbus v0.4.2 Demo");
     println!("=============================");
     println!("Industrial Enhancement Features Showcase\n");
 

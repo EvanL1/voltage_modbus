@@ -89,9 +89,9 @@ pub trait ModbusClient: Send + Sync {
     /// Get transport statistics
     fn get_stats(&self) -> TransportStats;
 
-    // ===== Legacy read function names (deprecated, for backward compatibility) =====
+    // ===== Semantic name aliases (for readability) =====
 
-    #[deprecated(since = "0.4.0", note = "Use read_01() instead")]
+    /// Alias for `read_01` - Read coils
     async fn read_coils(
         &mut self,
         slave_id: SlaveId,
@@ -101,7 +101,7 @@ pub trait ModbusClient: Send + Sync {
         self.read_01(slave_id, address, quantity).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use read_02() instead")]
+    /// Alias for `read_02` - Read discrete inputs
     async fn read_discrete_inputs(
         &mut self,
         slave_id: SlaveId,
@@ -111,7 +111,7 @@ pub trait ModbusClient: Send + Sync {
         self.read_02(slave_id, address, quantity).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use read_03() instead")]
+    /// Alias for `read_03` - Read holding registers
     async fn read_holding_registers(
         &mut self,
         slave_id: SlaveId,
@@ -121,7 +121,7 @@ pub trait ModbusClient: Send + Sync {
         self.read_03(slave_id, address, quantity).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use read_04() instead")]
+    /// Alias for `read_04` - Read input registers
     async fn read_input_registers(
         &mut self,
         slave_id: SlaveId,
@@ -131,9 +131,7 @@ pub trait ModbusClient: Send + Sync {
         self.read_04(slave_id, address, quantity).await
     }
 
-    // ===== Legacy write function names (deprecated, for backward compatibility) =====
-
-    #[deprecated(since = "0.4.0", note = "Use write_05() instead")]
+    /// Alias for `write_05` - Write single coil
     async fn write_single_coil(
         &mut self,
         slave_id: SlaveId,
@@ -143,7 +141,7 @@ pub trait ModbusClient: Send + Sync {
         self.write_05(slave_id, address, value).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use write_06() instead")]
+    /// Alias for `write_06` - Write single register
     async fn write_single_register(
         &mut self,
         slave_id: SlaveId,
@@ -153,7 +151,7 @@ pub trait ModbusClient: Send + Sync {
         self.write_06(slave_id, address, value).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use write_0f() instead")]
+    /// Alias for `write_0f` - Write multiple coils
     async fn write_multiple_coils(
         &mut self,
         slave_id: SlaveId,
@@ -163,7 +161,7 @@ pub trait ModbusClient: Send + Sync {
         self.write_0f(slave_id, address, values).await
     }
 
-    #[deprecated(since = "0.4.0", note = "Use write_10() instead")]
+    /// Alias for `write_10` - Write multiple registers
     async fn write_multiple_registers(
         &mut self,
         slave_id: SlaveId,

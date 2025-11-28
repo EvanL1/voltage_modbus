@@ -1,7 +1,7 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.4.0
+//! **Version:** 0.4.2
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
@@ -103,29 +103,59 @@ pub mod device_limits;
 // Re-exports for convenience
 // ============================================================================
 
-pub use client::{GenericModbusClient, ModbusClient, ModbusTcpClient};
-pub use constants::*;
-pub use error::{ModbusError, ModbusResult};
-pub use logging::{CallbackLogger, LogCallback, LogLevel, LoggingMode};
-pub use pdu::{ModbusPdu, PduBuilder};
-pub use protocol::{ModbusFunction, ModbusRequest, ModbusResponse};
-pub use transport::{ModbusTransport, TcpTransport, TransportStats};
-pub use utils::{OperationTimer, PerformanceMetrics};
+// === Async runtime (users can use voltage_modbus::tokio) ===
+pub use tokio;
 
-// Industrial enhancement re-exports
-pub use batcher::{BatchCommand, CommandBatcher, DEFAULT_BATCH_WINDOW_MS, DEFAULT_MAX_BATCH_SIZE};
-pub use bytes::{
-    regs_to_bytes_4, regs_to_bytes_8, regs_to_f32, regs_to_f64, regs_to_i32, regs_to_u32, ByteOrder,
+// === Core client API ===
+pub use client::{GenericModbusClient, ModbusClient, ModbusTcpClient};
+
+// === Error handling ===
+pub use error::{ModbusError, ModbusResult};
+
+// === Core types ===
+pub use bytes::ByteOrder;
+pub use protocol::{ModbusFunction, ModbusRequest, ModbusResponse, SlaveId};
+pub use value::ModbusValue;
+
+// === Industrial features ===
+pub use batcher::{BatchCommand, CommandBatcher};
+pub use codec::ModbusCodec;
+pub use device_limits::DeviceLimits;
+
+// === Monitoring ===
+pub use transport::{ModbusTransport, TcpTransport, TransportStats};
+pub use utils::PerformanceMetrics;
+
+// === Protocol limits (commonly needed constants) ===
+pub use constants::{
+    MAX_PDU_SIZE, MAX_READ_COILS, MAX_READ_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS,
 };
+
+// === Logging ===
+pub use logging::{CallbackLogger, LogCallback, LogLevel, LoggingMode};
+
+// === PDU (advanced usage) ===
+pub use pdu::{ModbusPdu, PduBuilder};
+
+// === Hidden but preserved (backward compatibility) ===
+#[doc(hidden)]
+pub use batcher::{DEFAULT_BATCH_WINDOW_MS, DEFAULT_MAX_BATCH_SIZE};
+#[doc(hidden)]
+pub use bytes::{
+    regs_to_bytes_4, regs_to_bytes_8, regs_to_f32, regs_to_f64, regs_to_i32, regs_to_u32,
+};
+#[doc(hidden)]
 pub use codec::{
     clamp_to_data_type, decode_register_value, encode_f64_as_type, encode_value,
-    parse_read_response, registers_for_type, ModbusCodec,
+    parse_read_response, registers_for_type,
 };
+#[doc(hidden)]
 pub use device_limits::{
-    DeviceLimits, DEFAULT_INTER_REQUEST_DELAY_MS, DEFAULT_MAX_READ_COILS,
-    DEFAULT_MAX_READ_REGISTERS, DEFAULT_MAX_WRITE_COILS, DEFAULT_MAX_WRITE_REGISTERS,
+    DEFAULT_INTER_REQUEST_DELAY_MS, DEFAULT_MAX_READ_COILS, DEFAULT_MAX_READ_REGISTERS,
+    DEFAULT_MAX_WRITE_COILS, DEFAULT_MAX_WRITE_REGISTERS,
 };
-pub use value::ModbusValue;
+#[doc(hidden)]
+pub use utils::OperationTimer;
 
 #[cfg(feature = "rtu")]
 pub use client::ModbusRtuClient;

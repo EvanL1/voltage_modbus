@@ -1,7 +1,7 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
 description = "A high-performance industrial Modbus library for Rust with TCP and RTU support"

@@ -9,7 +9,7 @@
 > **High-Performance Modbus TCP/RTU/ASCII Library for Rust**
 >
 > **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-> **Version:** 0.4.0
+> **Version:** 0.4.2
 > **License:** MIT
 
 A comprehensive, high-performance Modbus TCP/RTU/ASCII implementation in pure Rust designed for industrial automation, IoT applications, and smart grid systems.
@@ -47,8 +47,8 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-voltage_modbus = "0.4.0"
-tokio = { version = "1.0", features = ["full"] }
+voltage_modbus = "0.4.2"
+# Note: tokio is re-exported by voltage_modbus, you can use voltage_modbus::tokio
 ```
 
 ### Client Examples
@@ -62,15 +62,18 @@ use std::time::Duration;
 #[tokio::main]
 async fn main() -> ModbusResult<()> {
     // Connect to Modbus TCP server
-    let mut client = ModbusTcpClient::with_timeout("127.0.0.1:502", Duration::from_secs(5)).await?;
-    
-    // Read holding registers
-    let values = client.read_holding_registers(1, 0, 10).await?;
+    let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+
+    // Read holding registers (using function code name)
+    let values = client.read_03(1, 0, 10).await?;
     println!("Read registers: {:?}", values);
-    
+
+    // Or use semantic name (alias)
+    let values = client.read_holding_registers(1, 0, 10).await?;
+
     // Write single register
-    client.write_single_register(1, 100, 0x1234).await?;
-    
+    client.write_06(1, 100, 0x1234).await?;
+
     client.close().await?;
     Ok(())
 }
@@ -78,26 +81,23 @@ async fn main() -> ModbusResult<()> {
 
 #### RTU Client
 
+> ⚠️ **RTU Feature Required**: To use RTU (serial) support, enable the `rtu` feature:
+> ```toml
+> voltage_modbus = { version = "0.4.2", features = ["rtu"] }
+> ```
+
 ```rust
 use voltage_modbus::{ModbusRtuClient, ModbusClient, ModbusResult};
-use std::time::Duration;
 
-#[tokio::main] 
+#[tokio::main]
 async fn main() -> ModbusResult<()> {
     // Connect to Modbus RTU device
-    let mut client = ModbusRtuClient::with_config(
-        "/dev/ttyUSB0",
-        9600,
-        tokio_serial::DataBits::Eight,
-        tokio_serial::StopBits::One,
-        tokio_serial::Parity::None,
-        Duration::from_secs(1),
-    )?;
-    
+    let mut client = ModbusRtuClient::new("/dev/ttyUSB0", 9600)?;
+
     // Read coils
-    let coils = client.read_coils(1, 0, 8).await?;
+    let coils = client.read_01(1, 0, 8).await?;
     println!("Read coils: {:?}", coils);
-    
+
     client.close().await?;
     Ok(())
 }
