@@ -1,0 +1,210 @@
+//! Batch Reading Example
+//!
+//! Demonstrates how to read large ranges of registers efficiently
+//! by splitting requests according to device limits.
+//!
+//! # Why Batch Reading?
+//!
+//! The Modbus specification limits the number of registers per read request:
+//! - **FC03/FC04**: Max 125 registers per request
+//! - **FC01/FC02**: Max 2000 bits per request
+//!
+//! Some devices have even lower limits. This example shows how to:
+//! 1. Configure device-specific limits using `DeviceLimits`
+//! 2. Split large read requests into smaller batches
+//! 3. Handle inter-request delays for slow devices
+//!
+//! # Running this example
+//!
+//! ```bash
+//! cargo run --example batch_read
+//! ```
+
+use std::time::Duration;
+use voltage_modbus::{
+    regs_to_f32, ByteOrder, DeviceLimits, ModbusClient, ModbusResult, ModbusTcpClient,
+};
+
+/// Read a large range of registers in batches
+///
+/// This function automatically splits the read request based on device limits
+/// and reassembles the results into a single vector.
+///
+/// # Arguments
+///
+/// * `client` - Modbus TCP client
+/// * `slave_id` - Modbus slave/unit ID
+/// * `start_address` - Starting register address
+/// * `total_count` - Total number of registers to read
+/// * `limits` - Device-specific limits configuration
+///
+/// # Returns
+///
+/// A vector containing all requested registers
+async fn batch_read_registers(
+    client: &mut ModbusTcpClient,
+    slave_id: u8,
+    start_address: u16,
+    total_count: u16,
+    limits: &DeviceLimits,
+) -> ModbusResult<Vec<u16>> {
+    let mut all_registers = Vec::with_capacity(total_count as usize);
+    let mut current_address = start_address;
+    let mut remaining = total_count;
+
+    let batch_count = limits.read_request_count(total_count);
+    println!(
+        "Reading {} registers in {} batch(es) (max {} per request)",
+        total_count, batch_count, limits.max_read_registers
+    );
+
+    let mut batch_num = 1;
+    while remaining > 0 {
+        // Calculate how many registers to read in this batch
+        let count = remaining.min(limits.max_read_registers);
+
+        println!(
+            "  Batch {}/{}: address={}, count={}",
+            batch_num, batch_count, current_address, count
+        );
+
+        let registers = client.read_03(slave_id, current_address, count).await?;
+        all_registers.extend_from_slice(&registers);
+
+        current_address += count;
+        remaining -= count;
+        batch_num += 1;
+
+        // Optional: add inter-request delay for slow devices
+        if limits.inter_request_delay_ms > 0 && remaining > 0 {
+            tokio::time::sleep(Duration::from_millis(limits.inter_request_delay_ms)).await;
+        }
+    }
+
+    Ok(all_registers)
+}
+
+/// Example: Read coils in batches
+async fn batch_read_coils(
+    client: &mut ModbusTcpClient,
+    slave_id: u8,
+    start_address: u16,
+    total_count: u16,
+    limits: &DeviceLimits,
+) -> ModbusResult<Vec<bool>> {
+    let mut all_coils = Vec::with_capacity(total_count as usize);
+    let mut current_address = start_address;
+    let mut remaining = total_count;
+
+    while remaining > 0 {
+        let count = remaining.min(limits.max_read_coils);
+        let coils = client.read_01(slave_id, current_address, count).await?;
+        all_coils.extend_from_slice(&coils);
+
+        current_address += count;
+        remaining -= count;
+
+        if limits.inter_request_delay_ms > 0 && remaining > 0 {
+            tokio::time::sleep(Duration::from_millis(limits.inter_request_delay_ms)).await;
+        }
+    }
+
+    Ok(all_coils)
+}
+
+#[tokio::main]
+async fn main() -> ModbusResult<()> {
+    let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+
+    let slave_id = 1;
+
+    // =========================================================================
+    // Example 1: Default limits (Modbus specification)
+    // =========================================================================
+    println!("=== Example 1: Default Limits (125 registers/request) ===\n");
+
+    let default_limits = DeviceLimits::new();
+    println!(
+        "DeviceLimits: max_read_registers={}, delay={}ms",
+        default_limits.max_read_registers, default_limits.inter_request_delay_ms
+    );
+
+    let registers = batch_read_registers(&mut client, slave_id, 0, 200, &default_limits).await?;
+    println!("Read {} registers total\n", registers.len());
+
+    // =========================================================================
+    // Example 2: Conservative limits (for older/slower devices)
+    // =========================================================================
+    println!("=== Example 2: Conservative Limits (50 registers/request) ===\n");
+
+    let conservative_limits = DeviceLimits::conservative();
+    println!(
+        "DeviceLimits: max_read_registers={}, delay={}ms",
+        conservative_limits.max_read_registers, conservative_limits.inter_request_delay_ms
+    );
+
+    let registers =
+        batch_read_registers(&mut client, slave_id, 0, 200, &conservative_limits).await?;
+    println!("Read {} registers total\n", registers.len());
+
+    // =========================================================================
+    // Example 3: Custom limits for specific device
+    // =========================================================================
+    println!("=== Example 3: Custom Limits (30 registers/request, 5ms delay) ===\n");
+
+    let custom_limits = DeviceLimits::new()
+        .with_max_read_registers(30) // Device only supports 30 registers per read
+        .with_inter_request_delay_ms(5); // 5ms delay between requests
+
+    println!(
+        "DeviceLimits: max_read_registers={}, delay={}ms",
+        custom_limits.max_read_registers, custom_limits.inter_request_delay_ms
+    );
+
+    let registers = batch_read_registers(&mut client, slave_id, 0, 100, &custom_limits).await?;
+    println!("Read {} registers total\n", registers.len());
+
+    // =========================================================================
+    // Example 4: Batch read with Float32 decoding
+    // =========================================================================
+    println!("=== Example 4: Batch Read with Float Decoding ===\n");
+
+    // Read 10 float values (20 registers) starting at address 1000
+    let registers = batch_read_registers(&mut client, slave_id, 1000, 20, &default_limits).await?;
+
+    println!("Decoded Float32 values (BigEndian):");
+    for i in 0..10 {
+        let idx = i * 2;
+        if idx + 1 < registers.len() {
+            let value = regs_to_f32(&[registers[idx], registers[idx + 1]], ByteOrder::BigEndian);
+            println!("  Float[{}] @ address {}: {:.4}", i, 1000 + idx, value);
+        }
+    }
+
+    // =========================================================================
+    // Example 5: Batch read coils
+    // =========================================================================
+    println!("\n=== Example 5: Batch Read Coils ===\n");
+
+    let coil_limits = DeviceLimits::new().with_max_read_coils(500);
+
+    println!(
+        "Reading 1000 coils with max {} per request",
+        coil_limits.max_read_coils
+    );
+    let coils = batch_read_coils(&mut client, slave_id, 0, 1000, &coil_limits).await?;
+    println!("Read {} coils total", coils.len());
+    println!("First 16 coils: {:?}", &coils[..coils.len().min(16)]);
+
+    // =========================================================================
+    // Statistics
+    // =========================================================================
+    let stats = client.get_stats();
+    println!(
+        "\nTotal requests: {}, responses: {}",
+        stats.requests_sent, stats.responses_received
+    );
+
+    client.close().await?;
+    Ok(())
+}

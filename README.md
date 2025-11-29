@@ -9,7 +9,7 @@
 > **High-Performance Modbus TCP/RTU/ASCII Library for Rust**
 >
 > **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-> **Version:** 0.4.2
+> **Version:** 0.4.3
 > **License:** MIT
 
 A comprehensive, high-performance Modbus TCP/RTU/ASCII implementation in pure Rust designed for industrial automation, IoT applications, and smart grid systems.
@@ -62,7 +62,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-voltage_modbus = "0.4.2"
+voltage_modbus = "0.4.3"
 # Note: tokio is re-exported by voltage_modbus, you can use voltage_modbus::tokio
 ```
 

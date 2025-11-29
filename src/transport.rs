@@ -915,14 +915,12 @@ impl RtuTransport {
 
         let mut frame = Vec::new();
         let mut buffer = [0u8; 1];
-        let mut last_byte_time = tokio::time::Instant::now();
 
         // Read until frame gap timeout
         loop {
             match timeout(self.frame_gap, port.read_exact(&mut buffer)).await {
                 Ok(Ok(_)) => {
                     frame.push(buffer[0]);
-                    last_byte_time = tokio::time::Instant::now();
 
                     // Prevent frames from getting too large
                     if frame.len() > MAX_RTU_FRAME_SIZE {

@@ -1,14 +1,58 @@
-/// High-level Modbus client implementations
-///
-/// This module provides user-friendly client interfaces for Modbus communication,
-/// abstracting away the low-level protocol details.
-///
-/// The key insight is that Modbus TCP and RTU share the same application layer (PDU),
-/// differing only in transport layer encapsulation:
-/// - TCP: MBAP Header + PDU
-/// - RTU: Slave ID + PDU + CRC
-///
-/// This allows us to implement the application logic once and reuse it for both transports.
+//! High-level Modbus client implementations
+//!
+//! This module provides user-friendly client interfaces for Modbus communication,
+//! abstracting away the low-level protocol details.
+//!
+//! # Architecture
+//!
+//! The key insight is that Modbus TCP and RTU share the same application layer (PDU),
+//! differing only in transport layer encapsulation:
+//! - **TCP**: MBAP Header + PDU
+//! - **RTU**: Slave ID + PDU + CRC
+//!
+//! This allows us to implement the application logic once and reuse it for both transports
+//! through the [`GenericModbusClient`] abstraction.
+//!
+//! # API Naming Convention
+//!
+//! This library provides a **dual-track API**:
+//!
+//! | Function Code | Primary Name | Semantic Alias |
+//! |---------------|--------------|----------------|
+//! | 0x01 | `read_01()` | `read_coils()` |
+//! | 0x02 | `read_02()` | `read_discrete_inputs()` |
+//! | 0x03 | `read_03()` | `read_holding_registers()` |
+//! | 0x04 | `read_04()` | `read_input_registers()` |
+//! | 0x05 | `write_05()` | `write_single_coil()` |
+//! | 0x06 | `write_06()` | `write_single_register()` |
+//! | 0x0F | `write_0f()` | `write_multiple_coils()` |
+//! | 0x10 | `write_10()` | `write_multiple_registers()` |
+//!
+//! # Quick Start
+//!
+//! ```rust,no_run
+//! use voltage_modbus::{ModbusTcpClient, ModbusClient, ModbusResult};
+//! use std::time::Duration;
+//!
+//! #[tokio::main]
+//! async fn main() -> ModbusResult<()> {
+//!     // Create TCP client
+//!     let mut client = ModbusTcpClient::from_address(
+//!         "127.0.0.1:502",
+//!         Duration::from_secs(5)
+//!     ).await?;
+//!
+//!     // Read 10 holding registers from slave 1, starting at address 0
+//!     let registers = client.read_03(1, 0, 10).await?;
+//!     println!("Registers: {:?}", registers);
+//!
+//!     // Write a value to register 100
+//!     client.write_06(1, 100, 0x1234).await?;
+//!
+//!     client.close().await?;
+//!     Ok(())
+//! }
+//! ```
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -20,13 +64,44 @@ use crate::transport::{ModbusTransport, TcpTransport, TransportStats};
 #[cfg(feature = "rtu")]
 use crate::transport::RtuTransport;
 
-/// Trait defining the interface for Modbus client operations
+/// Trait defining the interface for Modbus client operations.
 ///
 /// This trait provides async methods for all standard Modbus functions,
 /// with clear function code references for better understanding.
+///
+/// # Implemented By
+///
+/// - [`ModbusTcpClient`] - Modbus TCP client
+/// - [`ModbusRtuClient`] - Modbus RTU client (requires `rtu` feature)
+/// - [`GenericModbusClient`] - Generic client for custom transports
+///
+/// # Protocol Limits
+///
+/// The Modbus specification defines these limits:
+///
+/// | Operation | Limit |
+/// |-----------|-------|
+/// | Read Coils (0x01) | 2000 coils |
+/// | Read Discrete Inputs (0x02) | 2000 bits |
+/// | Read Holding Registers (0x03) | 125 registers |
+/// | Read Input Registers (0x04) | 125 registers |
+/// | Write Multiple Coils (0x0F) | 1968 coils |
+/// | Write Multiple Registers (0x10) | 123 registers |
 #[async_trait::async_trait]
 pub trait ModbusClient: Send + Sync {
-    /// Read coils (function code 0x01)
+    /// Read coils (function code 0x01).
+    ///
+    /// Reads the ON/OFF status of discrete coils in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting coil address (0-65535)
+    /// * `quantity` - Number of coils to read (1-2000)
+    ///
+    /// # Returns
+    ///
+    /// A vector of boolean values representing coil states.
     async fn read_01(
         &mut self,
         slave_id: SlaveId,
@@ -34,7 +109,15 @@ pub trait ModbusClient: Send + Sync {
         quantity: u16,
     ) -> ModbusResult<Vec<bool>>;
 
-    /// Read discrete inputs (function code 0x02)
+    /// Read discrete inputs (function code 0x02).
+    ///
+    /// Reads the ON/OFF status of discrete inputs in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting input address (0-65535)
+    /// * `quantity` - Number of inputs to read (1-2000)
     async fn read_02(
         &mut self,
         slave_id: SlaveId,
@@ -42,7 +125,20 @@ pub trait ModbusClient: Send + Sync {
         quantity: u16,
     ) -> ModbusResult<Vec<bool>>;
 
-    /// Read holding registers (function code 0x03)
+    /// Read holding registers (function code 0x03).
+    ///
+    /// Reads the contents of a contiguous block of holding registers.
+    /// This is the most commonly used function for reading process data.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting register address (0-65535)
+    /// * `quantity` - Number of registers to read (1-125)
+    ///
+    /// # Returns
+    ///
+    /// A vector of 16-bit register values.
     async fn read_03(
         &mut self,
         slave_id: SlaveId,
@@ -50,7 +146,16 @@ pub trait ModbusClient: Send + Sync {
         quantity: u16,
     ) -> ModbusResult<Vec<u16>>;
 
-    /// Read input registers (function code 0x04)
+    /// Read input registers (function code 0x04).
+    ///
+    /// Reads the contents of a contiguous block of input registers.
+    /// Input registers are typically read-only analog inputs.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting register address (0-65535)
+    /// * `quantity` - Number of registers to read (1-125)
     async fn read_04(
         &mut self,
         slave_id: SlaveId,
@@ -58,13 +163,37 @@ pub trait ModbusClient: Send + Sync {
         quantity: u16,
     ) -> ModbusResult<Vec<u16>>;
 
-    /// Write single coil (function code 0x05)
+    /// Write single coil (function code 0x05).
+    ///
+    /// Writes a single coil to either ON or OFF in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Coil address (0-65535)
+    /// * `value` - `true` for ON (0xFF00), `false` for OFF (0x0000)
     async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()>;
 
-    /// Write single register (function code 0x06)
+    /// Write single register (function code 0x06).
+    ///
+    /// Writes a single holding register in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Register address (0-65535)
+    /// * `value` - 16-bit value to write
     async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()>;
 
-    /// Write multiple coils (function code 0x0F)
+    /// Write multiple coils (function code 0x0F).
+    ///
+    /// Writes a sequence of coils to either ON or OFF in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting coil address (0-65535)
+    /// * `values` - Slice of boolean values (1-1968 coils)
     async fn write_0f(
         &mut self,
         slave_id: SlaveId,
@@ -72,7 +201,15 @@ pub trait ModbusClient: Send + Sync {
         values: &[bool],
     ) -> ModbusResult<()>;
 
-    /// Write multiple registers (function code 0x10)
+    /// Write multiple registers (function code 0x10).
+    ///
+    /// Writes a block of contiguous registers in a remote device.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting register address (0-65535)
+    /// * `values` - Slice of 16-bit values to write (1-123 registers)
     async fn write_10(
         &mut self,
         slave_id: SlaveId,
@@ -80,13 +217,19 @@ pub trait ModbusClient: Send + Sync {
         values: &[u16],
     ) -> ModbusResult<()>;
 
-    /// Check if client is connected
+    /// Check if the client is connected.
+    ///
+    /// Returns `true` if the underlying transport is connected and ready.
     fn is_connected(&self) -> bool;
 
-    /// Close the client connection
+    /// Close the client connection.
+    ///
+    /// Gracefully closes the underlying transport connection.
     async fn close(&mut self) -> ModbusResult<()>;
 
-    /// Get transport statistics
+    /// Get transport statistics.
+    ///
+    /// Returns statistics about requests sent and responses received.
     fn get_stats(&self) -> TransportStats;
 
     // ===== Semantic name aliases (for readability) =====
@@ -635,7 +778,7 @@ impl ModbusRtuClient {
         logger: Option<CallbackLogger>,
     ) -> ModbusResult<Self> {
         let transport = RtuTransport::new(port, baud_rate)?;
-        let logger = logger.unwrap_or_else(CallbackLogger::default);
+        let logger = logger.unwrap_or_default();
         Ok(Self {
             inner: GenericModbusClient::with_logger(transport, logger),
         })
@@ -653,7 +796,7 @@ impl ModbusRtuClient {
     ) -> ModbusResult<Self> {
         let transport =
             RtuTransport::new_with_config(port, baud_rate, data_bits, stop_bits, parity, timeout)?;
-        let logger = logger.unwrap_or_else(CallbackLogger::default);
+        let logger = logger.unwrap_or_default();
         Ok(Self {
             inner: GenericModbusClient::with_logger(transport, logger),
         })

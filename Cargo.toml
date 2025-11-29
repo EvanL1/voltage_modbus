@@ -1,7 +1,7 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
 description = "A high-performance industrial Modbus library for Rust with TCP and RTU support"
@@ -15,7 +15,6 @@ categories = ["network-programming", "embedded"]
 exclude = [
     ".github/*",
     "tests/*",
-    "examples/*",
     "docs/*",
     "target/*",
     "Cargo.lock",
@@ -52,6 +51,22 @@ tokio-test = "0.4"
 [features]
 default = []
 rtu = ["dep:tokio-serial"]
+
+[[example]]
+name = "tcp_client"
+path = "examples/tcp_client.rs"
+
+[[example]]
+name = "read_meter"
+path = "examples/read_meter.rs"
+
+[[example]]
+name = "batch_read"
+path = "examples/batch_read.rs"
+
+[[example]]
+name = "data_types"
+path = "examples/data_types.rs"
 
 [profile.release]
 opt-level = 3

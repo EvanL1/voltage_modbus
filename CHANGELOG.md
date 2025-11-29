@@ -5,6 +5,55 @@ All notable changes to Voltage Modbus library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] - 2024-11-29
+
+### Added
+- **Examples**: New example programs demonstrating real-world usage:
+  - `tcp_client.rs` - Basic TCP client operations
+  - `read_meter.rs` - Energy meter reading scenario
+  - `batch_read.rs` - Batch reading with `DeviceLimits`
+  - `data_types.rs` - Industrial data type handling
+- **Documentation**: Enhanced API documentation with examples and protocol limits
+
+### Changed
+- Improved module-level documentation for `client.rs`, `value.rs`, and `bytes.rs`
+- Examples are now included in the crate distribution
+
+## [0.4.2] - 2024-11-29
+
+### Changed
+- **Dual-track API**: Function code names (`read_01`, `write_06`) as primary API, semantic names (`read_coils`, `write_single_register`) as aliases
+- **Tightened API surface**: Internal utility functions hidden with `#[doc(hidden)]`
+- **Re-exported tokio**: Users can use `voltage_modbus::tokio` directly
+
+### Fixed
+- **CI**: Fixed Windows RTU compilation issue (tokio-serial `Sync` trait)
+- **CI**: Upgraded GitHub Actions to latest versions (checkout@v4, cache@v4, etc.)
+
+## [0.4.1] - 2024-11-27
+
+### Added
+- Initial release to crates.io
+
+## [0.4.0] - 2024-11-27
+
+### Added
+- **Industrial Data Types**: New `ModbusValue` enum supporting U16/I16/U32/I32/F32/F64/Bool
+- **Byte Order Support**: `ByteOrder` with BigEndian/LittleEndian/BigEndianSwap/LittleEndianSwap
+- **ModbusCodec**: Unified encoding/decoding for all industrial data types
+- **CommandBatcher**: Write command batching for optimized communication
+- **DeviceLimits**: Configurable protocol limits per device
+- **Stack-allocated PDU**: Fixed 253-byte array with zero heap allocation
+- **CallbackLogger**: Flexible logging system with callback support
+- **PerformanceMetrics**: Built-in performance monitoring
+
+### Changed
+- Simplified API using function code naming (`read_03`, `write_06`, etc.)
+- Generic client architecture for code reuse between TCP and RTU
+
+### Removed
+- Server functionality (planned for future release)
+
 ## [0.2.0] - 2024-06-04
 
 ### Added
