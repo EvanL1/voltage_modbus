@@ -26,6 +26,21 @@ A comprehensive, high-performance Modbus TCP/RTU/ASCII implementation in pure Ru
 - **🎯 Smart Architecture**: Generic client design eliminates code duplication
 - **🧩 Modular Design**: Clean separation of transport and application layers
 
+## 🏭 Use Cases
+
+This library is being used in production for:
+
+| Category | Examples |
+|----------|----------|
+| **Energy Monitoring** | Smart electricity meters, power analyzers, energy management systems |
+| **Solar/PV Systems** | Inverter monitoring, MPPT controllers, solar charge controllers |
+| **Battery Systems** | BMS monitoring (SOC, temperature, cell voltages), UPS systems |
+| **Industrial Control** | PLCs (Siemens, Allen-Bradley, Schneider), VFDs, motor controllers |
+| **HVAC & Building** | Chillers, air handlers, environmental sensors, lighting control |
+| **Utilities** | Water treatment plants, pump stations, flow meters, tank level monitoring |
+
+> 💡 *Using voltage_modbus in your project? [Share your use case](https://github.com/EvanL1/voltage_modbus/discussions) - we'd love to hear from you!*
+
 ## 📋 Supported Function Codes
 
 | Code | Function                 | Client | Server |

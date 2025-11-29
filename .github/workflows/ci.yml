@@ -45,7 +45,7 @@ jobs:
           toolchain: ${{ matrix.rust }}
           
       - name: Cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -54,12 +54,23 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.rust }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.rust }}-cargo-
-      
-      - name: Build
+
+      # RTU feature uses tokio-serial which doesn't support Windows (Sync trait issue)
+      - name: Build (Linux/macOS - all features)
+        if: runner.os != 'Windows'
         run: cargo build --all-features --verbose
-        
-      - name: Run tests
+
+      - name: Build (Windows - no RTU)
+        if: runner.os == 'Windows'
+        run: cargo build --verbose
+
+      - name: Run tests (Linux/macOS - all features)
+        if: runner.os != 'Windows'
         run: cargo test --all-features --verbose
+
+      - name: Run tests (Windows - no RTU)
+        if: runner.os == 'Windows'
+        run: cargo test --verbose
 
   fmt:
     name: Rustfmt
@@ -89,7 +100,7 @@ jobs:
           components: clippy
           
       - name: Cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -98,7 +109,7 @@ jobs:
           key: ${{ runner.os }}-clippy-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-clippy-cargo-
-      
+
       - name: Run clippy
         run: cargo clippy --all-features -- -D warnings
 
@@ -113,7 +124,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         
       - name: Cache cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
@@ -122,6 +133,6 @@ jobs:
           key: ${{ runner.os }}-docs-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-docs-cargo-
-      
+
       - name: Check documentation
         run: cargo doc --no-deps --all-features --document-private-items 
