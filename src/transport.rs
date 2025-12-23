@@ -115,7 +115,6 @@
 //! # }
 //! ```
 
-use async_trait::async_trait;
 #[cfg(feature = "rtu")]
 use crc::{Crc, CRC_16_MODBUS};
 /// Modbus transport layer implementations
@@ -202,7 +201,6 @@ fn log_packet(direction: &str, data: &[u8], protocol: &str, slave_id: Option<u8>
 ///     Ok(registers)
 /// }
 /// ```
-#[async_trait]
 pub trait ModbusTransport: Send + Sync {
     /// Send a Modbus request and wait for response
     ///
@@ -258,7 +256,7 @@ pub trait ModbusTransport: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse>;
+    fn request(&mut self, request: &ModbusRequest) -> impl std::future::Future<Output = ModbusResult<ModbusResponse>> + Send;
 
     /// Check if the transport connection is active
     ///
@@ -311,7 +309,7 @@ pub trait ModbusTransport: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    async fn close(&mut self) -> ModbusResult<()>;
+    fn close(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Get communication statistics and performance metrics
     ///
@@ -542,7 +540,6 @@ impl TcpTransport {
     }
 }
 
-#[async_trait]
 impl ModbusTransport for TcpTransport {
     async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         // Validate request
@@ -952,7 +949,6 @@ impl RtuTransport {
 }
 
 #[cfg(feature = "rtu")]
-#[async_trait]
 impl ModbusTransport for RtuTransport {
     async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         // Validate request
@@ -1517,7 +1513,6 @@ impl AsciiTransport {
 }
 
 #[cfg(feature = "rtu")]
-#[async_trait]
 impl ModbusTransport for AsciiTransport {
     async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         // Validate request

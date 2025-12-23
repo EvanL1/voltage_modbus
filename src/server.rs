@@ -2,7 +2,6 @@
 /// 
 /// This module provides complete server-side implementations for both TCP and RTU protocols.
 
-use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,13 +24,12 @@ const MAX_TCP_FRAME_SIZE: usize = 260;
 const MBAP_HEADER_SIZE: usize = 6;
 
 /// Modbus server trait
-#[async_trait]
 pub trait ModbusServer: Send + Sync {
     /// Start the server
-    async fn start(&mut self) -> ModbusResult<()>;
-    
+    fn start(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
+
     /// Stop the server
-    async fn stop(&mut self) -> ModbusResult<()>;
+    fn stop(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
     
     /// Check if server is running
     fn is_running(&self) -> bool;
@@ -450,7 +448,6 @@ impl ModbusTcpServer {
     }
 }
 
-#[async_trait]
 impl ModbusServer for ModbusTcpServer {
     async fn start(&mut self) -> ModbusResult<()> {
         if self.is_running.load(Ordering::Relaxed) {
@@ -828,7 +825,6 @@ impl ModbusRtuServer {
 /// Modbus RTU server implementation
 /// 
 /// Note: This is a placeholder for future implementation
-#[async_trait]
 impl ModbusServer for ModbusRtuServer {
     async fn start(&mut self) -> ModbusResult<()> {
         if self.is_running.load(Ordering::Relaxed) {

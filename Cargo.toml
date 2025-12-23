@@ -3,6 +3,7 @@
 name = "voltage_modbus"
 version = "0.4.3"
 edition = "2021"
+rust-version = "1.92.0"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
 description = "A high-performance industrial Modbus library for Rust with TCP and RTU support"
 license = "MIT"
@@ -39,11 +40,14 @@ tracing = "0.1"
 bytes = "1.4"
 crc = "3.0"
 
-# Async utilities
-async-trait = "0.1"
+# Time
+chrono = "0.4"
 
 # RTU serial support (optional)
 tokio-serial = { version = "5.4", optional = true }
+
+# IGW integration (optional)
+igw = { path = "../igw", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -51,6 +55,7 @@ tokio-test = "0.4"
 [features]
 default = []
 rtu = ["dep:tokio-serial"]
+igw = ["dep:igw"]
 
 [[example]]
 name = "tcp_client"

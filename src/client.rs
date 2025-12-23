@@ -87,7 +87,6 @@ use crate::transport::RtuTransport;
 /// | Read Input Registers (0x04) | 125 registers |
 /// | Write Multiple Coils (0x0F) | 1968 coils |
 /// | Write Multiple Registers (0x10) | 123 registers |
-#[async_trait::async_trait]
 pub trait ModbusClient: Send + Sync {
     /// Read coils (function code 0x01).
     ///
@@ -102,12 +101,12 @@ pub trait ModbusClient: Send + Sync {
     /// # Returns
     ///
     /// A vector of boolean values representing coil states.
-    async fn read_01(
+    fn read_01(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<bool>>;
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send;
 
     /// Read discrete inputs (function code 0x02).
     ///
@@ -118,12 +117,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Starting input address (0-65535)
     /// * `quantity` - Number of inputs to read (1-2000)
-    async fn read_02(
+    fn read_02(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<bool>>;
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send;
 
     /// Read holding registers (function code 0x03).
     ///
@@ -139,12 +138,12 @@ pub trait ModbusClient: Send + Sync {
     /// # Returns
     ///
     /// A vector of 16-bit register values.
-    async fn read_03(
+    fn read_03(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<u16>>;
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send;
 
     /// Read input registers (function code 0x04).
     ///
@@ -156,12 +155,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Starting register address (0-65535)
     /// * `quantity` - Number of registers to read (1-125)
-    async fn read_04(
+    fn read_04(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<u16>>;
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send;
 
     /// Write single coil (function code 0x05).
     ///
@@ -172,7 +171,7 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Coil address (0-65535)
     /// * `value` - `true` for ON (0xFF00), `false` for OFF (0x0000)
-    async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()>;
+    fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Write single register (function code 0x06).
     ///
@@ -183,7 +182,7 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Register address (0-65535)
     /// * `value` - 16-bit value to write
-    async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()>;
+    fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Write multiple coils (function code 0x0F).
     ///
@@ -194,12 +193,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Starting coil address (0-65535)
     /// * `values` - Slice of boolean values (1-1968 coils)
-    async fn write_0f(
+    fn write_0f(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         values: &[bool],
-    ) -> ModbusResult<()>;
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Write multiple registers (function code 0x10).
     ///
@@ -210,12 +209,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Starting register address (0-65535)
     /// * `values` - Slice of 16-bit values to write (1-123 registers)
-    async fn write_10(
+    fn write_10(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         values: &[u16],
-    ) -> ModbusResult<()>;
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Check if the client is connected.
     ///
@@ -225,7 +224,7 @@ pub trait ModbusClient: Send + Sync {
     /// Close the client connection.
     ///
     /// Gracefully closes the underlying transport connection.
-    async fn close(&mut self) -> ModbusResult<()>;
+    fn close(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Get transport statistics.
     ///
@@ -235,83 +234,91 @@ pub trait ModbusClient: Send + Sync {
     // ===== Semantic name aliases (for readability) =====
 
     /// Alias for `read_01` - Read coils
-    async fn read_coils(
+    #[inline]
+    fn read_coils(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<bool>> {
-        self.read_01(slave_id, address, quantity).await
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send {
+        self.read_01(slave_id, address, quantity)
     }
 
     /// Alias for `read_02` - Read discrete inputs
-    async fn read_discrete_inputs(
+    #[inline]
+    fn read_discrete_inputs(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<bool>> {
-        self.read_02(slave_id, address, quantity).await
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send {
+        self.read_02(slave_id, address, quantity)
     }
 
     /// Alias for `read_03` - Read holding registers
-    async fn read_holding_registers(
+    #[inline]
+    fn read_holding_registers(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<u16>> {
-        self.read_03(slave_id, address, quantity).await
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send {
+        self.read_03(slave_id, address, quantity)
     }
 
     /// Alias for `read_04` - Read input registers
-    async fn read_input_registers(
+    #[inline]
+    fn read_input_registers(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         quantity: u16,
-    ) -> ModbusResult<Vec<u16>> {
-        self.read_04(slave_id, address, quantity).await
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send {
+        self.read_04(slave_id, address, quantity)
     }
 
     /// Alias for `write_05` - Write single coil
-    async fn write_single_coil(
+    #[inline]
+    fn write_single_coil(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         value: bool,
-    ) -> ModbusResult<()> {
-        self.write_05(slave_id, address, value).await
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
+        self.write_05(slave_id, address, value)
     }
 
     /// Alias for `write_06` - Write single register
-    async fn write_single_register(
+    #[inline]
+    fn write_single_register(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         value: u16,
-    ) -> ModbusResult<()> {
-        self.write_06(slave_id, address, value).await
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
+        self.write_06(slave_id, address, value)
     }
 
     /// Alias for `write_0f` - Write multiple coils
-    async fn write_multiple_coils(
+    #[inline]
+    fn write_multiple_coils(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         values: &[bool],
-    ) -> ModbusResult<()> {
-        self.write_0f(slave_id, address, values).await
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
+        self.write_0f(slave_id, address, values)
     }
 
     /// Alias for `write_10` - Write multiple registers
-    async fn write_multiple_registers(
+    #[inline]
+    fn write_multiple_registers(
         &mut self,
         slave_id: SlaveId,
         address: u16,
         values: &[u16],
-    ) -> ModbusResult<()> {
-        self.write_10(slave_id, address, values).await
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
+        self.write_10(slave_id, address, values)
     }
 }
 
@@ -379,7 +386,6 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
     }
 }
 
-#[async_trait::async_trait]
 impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
     async fn read_01(
         &mut self,
@@ -678,7 +684,6 @@ impl ModbusTcpClient {
     }
 }
 
-#[async_trait::async_trait]
 impl ModbusClient for ModbusTcpClient {
     async fn read_01(
         &mut self,
@@ -829,7 +834,6 @@ impl ModbusRtuClient {
 }
 
 #[cfg(feature = "rtu")]
-#[async_trait::async_trait]
 impl ModbusClient for ModbusRtuClient {
     async fn read_01(
         &mut self,
