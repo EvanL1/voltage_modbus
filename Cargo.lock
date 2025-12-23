@@ -325,6 +325,8 @@ dependencies = [
 [[package]]
 name = "igw"
 version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06b8d3b6e5bdc00229ce8cdd54eff2f3fbdcfbe7045abca688fee91e33f40624"
 dependencies = [
  "async-trait",
  "bytes",
@@ -833,7 +835,7 @@ checksum = "5a5f39404a5da50712a4c1eecf25e90dd62b613502b7e925fd4e4d19b5c96512"
 
 [[package]]
 name = "voltage_modbus"
-version = "0.4.3"
+version = "0.4.4"
 dependencies = [
  "bytes",
  "chrono",
