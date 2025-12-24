@@ -1,7 +1,7 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 rust-version = "1.85.0"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]

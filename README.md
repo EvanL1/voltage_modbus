@@ -54,10 +54,23 @@ async fn main() -> ModbusResult<()> {
 
 ```rust
 use voltage_modbus::{ModbusRtuClient, ModbusClient, ModbusResult};
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> ModbusResult<()> {
+    // Simple: default 8N1 configuration
     let mut client = ModbusRtuClient::new("/dev/ttyUSB0", 9600)?;
+
+    // Or with full configuration (data bits, stop bits, parity, timeout)
+    let mut client = ModbusRtuClient::with_config_and_logging(
+        "/dev/ttyUSB0",
+        9600,
+        tokio_serial::DataBits::Eight,
+        tokio_serial::StopBits::One,
+        tokio_serial::Parity::Even,  // Even parity
+        Duration::from_secs(1),
+        None,
+    )?;
 
     let coils = client.read_01(1, 0, 8).await?;
     println!("Coils: {:?}", coils);
@@ -84,7 +97,7 @@ async fn main() -> ModbusResult<()> {
 
 ```
 ┌─────────────────────────────────────────────────┐
-│              Application Layer                   │
+│              Application Layer                  │
 │  ┌─────────────────┐    ┌─────────────────┐     │
 │  │ ModbusTcpClient │    │ ModbusRtuClient │     │
 │  └────────┬────────┘    └────────┬────────┘     │
@@ -95,7 +108,7 @@ async fn main() -> ModbusResult<()> {
 │           └──────────────────────┘              │
 └─────────────────────────────────────────────────┘
 ┌─────────────────────────────────────────────────┐
-│               Transport Layer                    │
+│               Transport Layer                   │
 │  ┌─────────────────┐    ┌─────────────────┐     │
 │  │  TcpTransport   │    │  RtuTransport   │     │
 │  └─────────────────┘    └─────────────────┘     │
