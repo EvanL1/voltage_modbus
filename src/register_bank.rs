@@ -40,6 +40,43 @@ impl ModbusRegisterBank {
             input_registers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
+
+    /// Create a new register bank with pre-allocated capacity
+    ///
+    /// This avoids HashMap reallocations when populating the register bank.
+    /// Use this when you know the approximate number of registers you'll need.
+    ///
+    /// # Arguments
+    /// * `coils_cap` - Expected number of coils
+    /// * `discrete_inputs_cap` - Expected number of discrete inputs
+    /// * `holding_registers_cap` - Expected number of holding registers
+    /// * `input_registers_cap` - Expected number of input registers
+    pub fn with_capacity(
+        coils_cap: usize,
+        discrete_inputs_cap: usize,
+        holding_registers_cap: usize,
+        input_registers_cap: usize,
+    ) -> Self {
+        Self {
+            coils: Arc::new(RwLock::new(HashMap::with_capacity(coils_cap))),
+            discrete_inputs: Arc::new(RwLock::new(HashMap::with_capacity(discrete_inputs_cap))),
+            holding_registers: Arc::new(RwLock::new(HashMap::with_capacity(holding_registers_cap))),
+            input_registers: Arc::new(RwLock::new(HashMap::with_capacity(input_registers_cap))),
+        }
+    }
+
+    /// Create a new register bank with default capacity
+    ///
+    /// Uses the default sizes: 10000 for each register type.
+    /// This is suitable for typical industrial applications.
+    pub fn with_default_capacity() -> Self {
+        Self::with_capacity(
+            DEFAULT_COILS_SIZE,
+            DEFAULT_DISCRETE_INPUTS_SIZE,
+            DEFAULT_HOLDING_REGISTERS_SIZE,
+            DEFAULT_INPUT_REGISTERS_SIZE,
+        )
+    }
     
     /// Read coils starting at address (function code 0x01)
     pub fn read_coils(&self, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {

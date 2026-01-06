@@ -121,7 +121,7 @@ impl ModbusTcpServer {
     
     /// Handle client connection
     async fn handle_client(
-        stream: TcpStream,
+        mut stream: TcpStream,
         register_bank: Arc<ModbusRegisterBank>,
         stats: Arc<Mutex<ServerStats>>,
         mut shutdown_rx: broadcast::Receiver<()>,
@@ -129,14 +129,13 @@ impl ModbusTcpServer {
     ) {
         let peer_addr = stream.peer_addr().unwrap_or_else(|_| "unknown".parse().unwrap());
         info!("📡 New client connected: {}", peer_addr);
-        
+
         // Update connection count
         {
             let mut stats = stats.lock().await;
             stats.connections_count += 1;
         }
-        
-        let mut stream = stream;
+
         let mut buffer = vec![0u8; MAX_TCP_FRAME_SIZE];
         
         loop {
@@ -244,8 +243,11 @@ impl ModbusTcpServer {
         let coils = register_bank.read_01(address, quantity)?;
 
         // Pack coils into bytes
-        let byte_count = (quantity + 7) / 8;
-        let mut response = vec![0x01, byte_count as u8];
+        let byte_count = ((quantity + 7) / 8) as usize;
+        // Pre-allocate: function_code(1) + byte_count(1) + data(byte_count)
+        let mut response = Vec::with_capacity(2 + byte_count);
+        response.push(0x01);
+        response.push(byte_count as u8);
 
         for chunk in coils.chunks(8) {
             let mut byte = 0u8;
@@ -259,7 +261,7 @@ impl ModbusTcpServer {
 
         Ok(response)
     }
-    
+
     /// Handle read discrete inputs (0x02)
     async fn handle_read_02(data: &[u8], register_bank: &Arc<ModbusRegisterBank>) -> ModbusResult<Vec<u8>> {
         if data.len() < 4 {
@@ -272,8 +274,11 @@ impl ModbusTcpServer {
         let inputs = register_bank.read_02(address, quantity)?;
 
         // Pack inputs into bytes
-        let byte_count = (quantity + 7) / 8;
-        let mut response = vec![0x02, byte_count as u8];
+        let byte_count = ((quantity + 7) / 8) as usize;
+        // Pre-allocate: function_code(1) + byte_count(1) + data(byte_count)
+        let mut response = Vec::with_capacity(2 + byte_count);
+        response.push(0x02);
+        response.push(byte_count as u8);
 
         for chunk in inputs.chunks(8) {
             let mut byte = 0u8;
@@ -287,7 +292,7 @@ impl ModbusTcpServer {
 
         Ok(response)
     }
-    
+
     /// Handle read holding registers (0x03)
     async fn handle_read_03(data: &[u8], register_bank: &Arc<ModbusRegisterBank>) -> ModbusResult<Vec<u8>> {
         if data.len() < 4 {
@@ -299,14 +304,18 @@ impl ModbusTcpServer {
 
         let registers = register_bank.read_03(address, quantity)?;
 
-        let mut response = vec![0x03, (quantity * 2) as u8];
+        // Pre-allocate: function_code(1) + byte_count(1) + data(quantity*2)
+        let data_len = (quantity as usize) * 2;
+        let mut response = Vec::with_capacity(2 + data_len);
+        response.push(0x03);
+        response.push(data_len as u8);
         for &register in &registers {
             response.extend_from_slice(&register.to_be_bytes());
         }
 
         Ok(response)
     }
-    
+
     /// Handle read input registers (0x04)
     async fn handle_read_04(data: &[u8], register_bank: &Arc<ModbusRegisterBank>) -> ModbusResult<Vec<u8>> {
         if data.len() < 4 {
@@ -318,7 +327,11 @@ impl ModbusTcpServer {
 
         let registers = register_bank.read_04(address, quantity)?;
 
-        let mut response = vec![0x04, (quantity * 2) as u8];
+        // Pre-allocate: function_code(1) + byte_count(1) + data(quantity*2)
+        let data_len = (quantity as usize) * 2;
+        let mut response = Vec::with_capacity(2 + data_len);
+        response.push(0x04);
+        response.push(data_len as u8);
         for &register in &registers {
             response.extend_from_slice(&register.to_be_bytes());
         }
@@ -375,7 +388,8 @@ impl ModbusTcpServer {
             return Err(ModbusError::InvalidFrame);
         }
 
-        let mut coils = Vec::new();
+        // Pre-allocate coils vector
+        let mut coils = Vec::with_capacity(quantity as usize);
         for i in 0..quantity {
             let byte_index = 5 + (i / 8) as usize;
             let bit_index = i % 8;
@@ -385,12 +399,14 @@ impl ModbusTcpServer {
 
         register_bank.write_0f(address, &coils)?;
 
-        let mut response = vec![0x0F];
+        // Pre-allocate response: function_code(1) + address(2) + quantity(2) = 5
+        let mut response = Vec::with_capacity(5);
+        response.push(0x0F);
         response.extend_from_slice(&address.to_be_bytes());
         response.extend_from_slice(&quantity.to_be_bytes());
         Ok(response)
     }
-    
+
     /// Handle write multiple registers (0x10)
     async fn handle_write_10(data: &[u8], register_bank: &Arc<ModbusRegisterBank>) -> ModbusResult<Vec<u8>> {
         if data.len() < 5 {
@@ -405,7 +421,8 @@ impl ModbusTcpServer {
             return Err(ModbusError::InvalidFrame);
         }
 
-        let mut registers = Vec::new();
+        // Pre-allocate registers vector
+        let mut registers = Vec::with_capacity(quantity as usize);
         for i in 0..quantity {
             let byte_offset = 5 + (i as usize * 2);
             let value = u16::from_be_bytes([data[byte_offset], data[byte_offset + 1]]);
@@ -414,7 +431,9 @@ impl ModbusTcpServer {
 
         register_bank.write_10(address, &registers)?;
 
-        let mut response = vec![0x10];
+        // Pre-allocate response: function_code(1) + address(2) + quantity(2) = 5
+        let mut response = Vec::with_capacity(5);
+        response.push(0x10);
         response.extend_from_slice(&address.to_be_bytes());
         response.extend_from_slice(&quantity.to_be_bytes());
         Ok(response)

@@ -27,7 +27,7 @@
 //!     slave_id: 1,
 //!     function_code: 6,
 //!     register_address: 100,
-//!     data_type: "uint16".to_string(),
+//!     data_type: "uint16",
 //!     byte_order: ByteOrder::BigEndian,
 //! });
 //!
@@ -65,7 +65,8 @@ pub struct BatchCommand {
     /// Starting register address.
     pub register_address: u16,
     /// Data type string (e.g., "uint16", "float32").
-    pub data_type: String,
+    /// Uses `&'static str` to avoid heap allocation since all type names are static.
+    pub data_type: &'static str,
     /// Byte order for multi-register types.
     pub byte_order: ByteOrder,
 }
@@ -162,17 +163,18 @@ impl CommandBatcher {
             return false;
         }
 
-        let mut sorted = commands.to_vec();
-        sorted.sort_by_key(|c| c.register_address);
+        // Use index sorting to avoid cloning the entire command slice
+        let mut indices: Vec<usize> = (0..commands.len()).collect();
+        indices.sort_by_key(|&i| commands[i].register_address);
 
-        let mut expected_addr = sorted[0].register_address;
+        let mut expected_addr = commands[indices[0]].register_address;
 
-        for cmd in &sorted {
-            if cmd.register_address != expected_addr {
+        for &idx in &indices {
+            if commands[idx].register_address != expected_addr {
                 return false;
             }
             // Calculate registers used by this data type
-            expected_addr += Self::get_register_count(&cmd.data_type);
+            expected_addr += Self::get_register_count(commands[idx].data_type);
         }
         true
     }
@@ -215,7 +217,7 @@ mod tests {
         slave_id: u8,
         function_code: u8,
         register_address: u16,
-        data_type: &str,
+        data_type: &'static str,
     ) -> BatchCommand {
         BatchCommand {
             point_id,
@@ -223,7 +225,7 @@ mod tests {
             slave_id,
             function_code,
             register_address,
-            data_type: data_type.to_string(),
+            data_type,
             byte_order: ByteOrder::BigEndian,
         }
     }

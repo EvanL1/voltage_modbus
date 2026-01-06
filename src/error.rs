@@ -275,7 +275,8 @@ pub enum ModbusError {
     Exception {
         function: u8,
         code: u8,
-        message: String,
+        /// Uses `&'static str` since all exception messages are static strings
+        message: &'static str,
     },
 
     /// Frame parsing errors
@@ -485,7 +486,7 @@ impl ModbusError {
     ///
     /// New `ModbusError::Exception` variant with appropriate message
     pub fn exception(function: u8, code: u8) -> Self {
-        let message = match code {
+        let message: &'static str = match code {
             0x01 => "Illegal Function",
             0x02 => "Illegal Data Address",
             0x03 => "Illegal Data Value",
@@ -496,8 +497,7 @@ impl ModbusError {
             0x0A => "Gateway Path Unavailable",
             0x0B => "Gateway Target Device Failed to Respond",
             _ => "Unknown Exception",
-        }
-        .to_string();
+        };
 
         Self::Exception {
             function,

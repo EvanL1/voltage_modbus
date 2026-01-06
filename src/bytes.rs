@@ -88,7 +88,12 @@ impl ByteOrder {
     /// - "BA" → LittleEndian16
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
-        let normalized = s.to_uppercase().replace('-', "");
+        // Normalize in single pass: uppercase + remove hyphens/underscores
+        let normalized: String = s
+            .chars()
+            .filter(|c| *c != '-' && *c != '_')
+            .map(|c| c.to_ascii_uppercase())
+            .collect();
         match normalized.as_str() {
             // 32/64-bit patterns
             "ABCD" | "BE" | "BIG_ENDIAN" | "BIGENDIAN" | "ABCDEFGH" => Some(Self::BigEndian),

@@ -341,21 +341,64 @@ impl ModbusRequest {
 }
 
 /// Modbus response structure
+///
+/// Uses internal buffer with offset/length tracking to enable zero-copy
+/// parsing when receiving responses from transport layer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModbusResponse {
     pub slave_id: SlaveId,
     pub function: ModbusFunction,
-    pub data: Vec<u8>,
+    /// Internal buffer storage (may be payload-only or complete frame)
+    buffer: Vec<u8>,
+    /// Offset where payload data starts within buffer
+    data_offset: usize,
+    /// Length of payload data
+    data_len: usize,
     pub exception: Option<ModbusException>,
 }
 
 impl ModbusResponse {
-    /// Create a successful response
+    /// Create a successful response with payload data
+    ///
+    /// The data is stored directly with zero offset. For zero-copy parsing
+    /// from TCP/RTU frames, use `new_from_tcp_frame` or `new_from_rtu_frame`.
     pub fn new_success(slave_id: SlaveId, function: ModbusFunction, data: Vec<u8>) -> Self {
+        let data_len = data.len();
         Self {
             slave_id,
             function,
-            data,
+            buffer: data,
+            data_offset: 0,
+            data_len,
+            exception: None,
+        }
+    }
+
+    /// Create a response from a complete TCP frame (zero-copy)
+    ///
+    /// Takes ownership of the frame buffer and calculates payload offsets
+    /// without copying the data portion.
+    ///
+    /// # Arguments
+    /// * `frame` - Complete TCP frame including MBAP header
+    /// * `slave_id` - Parsed slave ID
+    /// * `function` - Parsed function code
+    /// * `data_start` - Byte offset where payload data begins
+    /// * `data_len` - Length of payload data
+    #[inline]
+    pub fn new_from_frame(
+        frame: Vec<u8>,
+        slave_id: SlaveId,
+        function: ModbusFunction,
+        data_start: usize,
+        data_len: usize,
+    ) -> Self {
+        Self {
+            slave_id,
+            function,
+            buffer: frame,
+            data_offset: data_start,
+            data_len,
             exception: None,
         }
     }
@@ -366,12 +409,30 @@ impl ModbusResponse {
         Self {
             slave_id,
             function,
-            data: Vec::new(),
+            buffer: Vec::new(),
+            data_offset: 0,
+            data_len: 0,
             exception,
         }
     }
 
+    /// Get payload data as a slice
+    ///
+    /// Returns the response payload without the function code or byte count prefix.
+    /// For read responses, this includes the byte count byte followed by actual data.
+    #[inline]
+    pub fn data(&self) -> &[u8] {
+        &self.buffer[self.data_offset..self.data_offset + self.data_len]
+    }
+
+    /// Get the length of payload data
+    #[inline]
+    pub fn data_len(&self) -> usize {
+        self.data_len
+    }
+
     /// Check if this is an exception response
+    #[inline]
     pub fn is_exception(&self) -> bool {
         self.exception.is_some()
     }
@@ -388,12 +449,13 @@ impl ModbusResponse {
             return Err(self.get_exception().unwrap());
         }
 
-        if self.data.is_empty() {
+        let data = self.data();
+        if data.is_empty() {
             return Err(ModbusError::frame("Empty response data"));
         }
 
-        let byte_count = self.data[0] as usize;
-        if self.data.len() < 1 + byte_count {
+        let byte_count = data[0] as usize;
+        if data.len() < 1 + byte_count {
             return Err(ModbusError::frame("Incomplete register data"));
         }
 
@@ -401,9 +463,9 @@ impl ModbusResponse {
             return Err(ModbusError::frame("Invalid register data length"));
         }
 
-        let mut registers = Vec::new();
+        let mut registers = Vec::with_capacity(byte_count / 2);
         for i in (1..1 + byte_count).step_by(2) {
-            let value = u16::from_be_bytes([self.data[i], self.data[i + 1]]);
+            let value = u16::from_be_bytes([data[i], data[i + 1]]);
             registers.push(value);
         }
 
@@ -416,18 +478,19 @@ impl ModbusResponse {
             return Err(self.get_exception().unwrap());
         }
 
-        if self.data.is_empty() {
+        let data = self.data();
+        if data.is_empty() {
             return Err(ModbusError::frame("Empty response data"));
         }
 
-        let byte_count = self.data[0] as usize;
-        if self.data.len() < 1 + byte_count {
+        let byte_count = data[0] as usize;
+        if data.len() < 1 + byte_count {
             return Err(ModbusError::frame("Incomplete bit data"));
         }
 
-        let mut bits = Vec::new();
+        let mut bits = Vec::with_capacity(byte_count * 8);
         for i in 1..1 + byte_count {
-            let byte_value = self.data[i];
+            let byte_value = data[i];
             for bit_pos in 0..8 {
                 bits.push((byte_value & (1 << bit_pos)) != 0);
             }

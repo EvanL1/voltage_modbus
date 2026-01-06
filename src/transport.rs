@@ -149,11 +149,22 @@ const MAX_RTU_FRAME_SIZE: usize = 256;
 const CRC_MODBUS: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
 
 /// Format raw bytes as hex string for packet logging
+///
+/// Uses direct string writing for efficiency (avoids intermediate allocations).
 fn format_hex_packet(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{:02X}", b))
-        .collect::<Vec<_>>()
-        .join(" ")
+    use std::fmt::Write;
+    if data.is_empty() {
+        return String::new();
+    }
+    // Pre-allocate: 2 hex chars + 1 space per byte, minus trailing space
+    let mut result = String::with_capacity(data.len() * 3 - 1);
+    for (i, b) in data.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        let _ = write!(result, "{:02X}", b);
+    }
+    result
 }
 
 /// Log packet with direction and format
@@ -346,7 +357,7 @@ pub trait ModbusTransport: Send + Sync {
 }
 
 /// Transport layer statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TransportStats {
     pub requests_sent: u64,
     pub responses_received: u64,
@@ -498,8 +509,10 @@ impl TcpTransport {
         frame
     }
 
-    /// Decode response from TCP frame
-    fn decode_response(&self, frame: &[u8]) -> ModbusResult<ModbusResponse> {
+    /// Decode response from TCP frame (zero-copy)
+    ///
+    /// Takes ownership of the frame buffer to avoid copying payload data.
+    fn decode_response(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
         if frame.len() < MBAP_HEADER_SIZE + 2 {
             return Err(ModbusError::frame("Frame too short"));
         }
@@ -534,9 +547,17 @@ impl TcpTransport {
         }
 
         let function = ModbusFunction::from_u8(function_code)?;
-        let data = frame[MBAP_HEADER_SIZE + 2..MBAP_HEADER_SIZE + length as usize].to_vec();
+        // Zero-copy: pass frame ownership with offset/length instead of to_vec()
+        let data_start = MBAP_HEADER_SIZE + 2;
+        let data_len = (length as usize).saturating_sub(2); // length includes slave_id + function
 
-        Ok(ModbusResponse::new_success(slave_id, function, data))
+        Ok(ModbusResponse::new_from_frame(
+            frame,
+            slave_id,
+            function,
+            data_start,
+            data_len,
+        ))
     }
 }
 
@@ -625,8 +646,8 @@ impl ModbusTransport for TcpTransport {
             log_packet("receive", &response_buf, "TCP", Some(request.slave_id));
         }
 
-        // Decode response
-        let response = self.decode_response(&response_buf)?;
+        // Decode response (takes ownership of buffer for zero-copy)
+        let response = self.decode_response(response_buf)?;
 
         // Check for exception
         if let Some(error) = response.get_exception() {
@@ -649,7 +670,7 @@ impl ModbusTransport for TcpTransport {
     }
 
     fn get_stats(&self) -> TransportStats {
-        self.stats.clone()
+        self.stats
     }
 }
 
@@ -851,16 +872,18 @@ impl RtuTransport {
         Ok(frame)
     }
 
-    /// Decode response from RTU frame
-    fn decode_response(&self, frame: &[u8]) -> ModbusResult<ModbusResponse> {
+    /// Decode response from RTU frame (zero-copy)
+    ///
+    /// Takes ownership of the frame buffer to avoid copying payload data.
+    fn decode_response(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
         if frame.len() < 4 {
             return Err(ModbusError::frame("RTU frame too short"));
         }
 
-        // Verify CRC
-        let data_len = frame.len() - 2;
-        let received_crc = u16::from_le_bytes([frame[data_len], frame[data_len + 1]]);
-        let calculated_crc = Self::calculate_crc(&frame[..data_len]);
+        // Verify CRC (frame length minus 2 CRC bytes)
+        let pdu_len = frame.len() - 2;
+        let received_crc = u16::from_le_bytes([frame[pdu_len], frame[pdu_len + 1]]);
+        let calculated_crc = Self::calculate_crc(&frame[..pdu_len]);
 
         if received_crc != calculated_crc {
             return Err(ModbusError::frame(format!(
@@ -889,13 +912,18 @@ impl RtuTransport {
         }
 
         let function = ModbusFunction::from_u8(function_code)?;
-        let data = if frame.len() > 4 {
-            frame[2..data_len].to_vec()
-        } else {
-            Vec::new()
-        };
+        // Zero-copy: pass frame ownership with offset/length
+        // RTU frame: [slave_id(1), function(1), data..., CRC(2)]
+        let data_start = 2;
+        let data_len = pdu_len.saturating_sub(2); // pdu_len = frame - CRC, minus slave_id and function
 
-        Ok(ModbusResponse::new_success(slave_id, function, data))
+        Ok(ModbusResponse::new_from_frame(
+            frame,
+            slave_id,
+            function,
+            data_start,
+            data_len,
+        ))
     }
 
     /// Wait for frame gap before sending next frame
@@ -1023,8 +1051,8 @@ impl ModbusTransport for RtuTransport {
             log_packet("receive", &response_frame, "RTU", Some(request.slave_id));
         }
 
-        // Decode response
-        let response = self.decode_response(&response_frame)?;
+        // Decode response (takes ownership of buffer for zero-copy)
+        let response = self.decode_response(response_frame)?;
 
         // Check if response is for the correct slave
         if response.slave_id != request.slave_id {
@@ -1056,7 +1084,7 @@ impl ModbusTransport for RtuTransport {
     }
 
     fn get_stats(&self) -> TransportStats {
-        self.stats.clone()
+        self.stats
     }
 }
 
@@ -1372,8 +1400,11 @@ impl AsciiTransport {
         Ok(frame)
     }
 
-    /// Decode response from ASCII frame
-    fn decode_response(&self, frame: &[u8]) -> ModbusResult<ModbusResponse> {
+    /// Decode response from ASCII frame (zero-copy where possible)
+    ///
+    /// Note: ASCII frames require ASCII->binary conversion, so the original frame
+    /// is not used directly. However, the decoded raw_data buffer is used zero-copy.
+    fn decode_response(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
         // Minimum frame: ":AAFFLLCRLF" = 11 characters
         if frame.len() < 11 {
             return Err(ModbusError::frame("ASCII frame too short"));
@@ -1398,8 +1429,8 @@ impl AsciiTransport {
             return Err(ModbusError::frame("Invalid ASCII frame length"));
         }
 
-        // Convert ASCII to raw bytes
-        let mut raw_data = Vec::new();
+        // Convert ASCII to raw bytes with pre-allocated capacity
+        let mut raw_data = Vec::with_capacity(ascii_data.len() / 2);
         for chunk in ascii_data.chunks(2) {
             let byte = Self::ascii_hex_to_byte(chunk)?;
             raw_data.push(byte);
@@ -1410,7 +1441,7 @@ impl AsciiTransport {
             return Err(ModbusError::frame("ASCII frame too short after decoding"));
         }
 
-        // Extract LRC and data
+        // Extract LRC (pop removes last element)
         let received_lrc = raw_data.pop().unwrap();
         let calculated_lrc = Self::calculate_lrc(&raw_data);
 
@@ -1442,13 +1473,18 @@ impl AsciiTransport {
         }
 
         let function = ModbusFunction::from_u8(function_code)?;
-        let data = if raw_data.len() > 2 {
-            raw_data[2..].to_vec()
-        } else {
-            Vec::new()
-        };
+        // Zero-copy: use raw_data buffer with offset (after LRC was popped)
+        // raw_data: [slave_id, function, payload...]
+        let data_start = 2;
+        let data_len = raw_data.len().saturating_sub(2);
 
-        Ok(ModbusResponse::new_success(slave_id, function, data))
+        Ok(ModbusResponse::new_from_frame(
+            raw_data,
+            slave_id,
+            function,
+            data_start,
+            data_len,
+        ))
     }
 
     /// Read ASCII frame from serial port
@@ -1577,8 +1613,8 @@ impl ModbusTransport for AsciiTransport {
         self.stats.responses_received += 1;
         self.stats.bytes_received += response_frame.len() as u64;
 
-        // Decode response
-        let response = self.decode_response(&response_frame)?;
+        // Decode response (takes ownership for zero-copy)
+        let response = self.decode_response(response_frame)?;
 
         // Check if response is for the correct slave
         if response.slave_id != request.slave_id {
@@ -1610,7 +1646,7 @@ impl ModbusTransport for AsciiTransport {
     }
 
     fn get_stats(&self) -> TransportStats {
-        self.stats.clone()
+        self.stats
     }
 }
 
@@ -1717,7 +1753,9 @@ mod rtu_tests {
         let lrc = (-(sum as i16)) as u8;
 
         let frame = format!(":01030400AB00CD{:02X}\r\n", lrc);
-        let response = transport.decode_response(frame.as_bytes()).unwrap();
+        let response = transport
+            .decode_response(frame.as_bytes().to_vec())
+            .unwrap();
 
         assert_eq!(response.slave_id, 0x01);
         assert_eq!(response.function, ModbusFunction::ReadHoldingRegisters);
@@ -1731,7 +1769,7 @@ mod rtu_tests {
 
         let exception_frame = format!(":018302{:02X}\r\n", exc_lrc);
         let exception_response = transport
-            .decode_response(exception_frame.as_bytes())
+            .decode_response(exception_frame.as_bytes().to_vec())
             .unwrap();
 
         assert_eq!(exception_response.slave_id, 0x01);
@@ -1743,19 +1781,19 @@ mod rtu_tests {
         let transport = create_mock_ascii_transport();
 
         // Test invalid start character
-        let invalid_start = b"X010300000002C5\r\n";
+        let invalid_start = b"X010300000002C5\r\n".to_vec();
         assert!(transport.decode_response(invalid_start).is_err());
 
         // Test invalid end characters
-        let invalid_end = b":010300000002C5\r\r";
+        let invalid_end = b":010300000002C5\r\r".to_vec();
         assert!(transport.decode_response(invalid_end).is_err());
 
         // Test odd length (invalid ASCII hex)
-        let odd_length = b":01030000002C5\r\n";
+        let odd_length = b":01030000002C5\r\n".to_vec();
         assert!(transport.decode_response(odd_length).is_err());
 
         // Test LRC mismatch
-        let wrong_lrc = b":010300000002FF\r\n";
+        let wrong_lrc = b":010300000002FF\r\n".to_vec();
         assert!(transport.decode_response(wrong_lrc).is_err());
     }
 

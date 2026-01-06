@@ -171,23 +171,44 @@ pub mod validation {
 /// Formatting and display utilities
 pub mod format {
     use super::*;
+    use std::fmt::Write;
 
     /// Format byte array as hex string
+    ///
+    /// Uses direct string writing instead of collect/join for efficiency.
+    /// Pre-allocates capacity: each byte = 2 hex chars + 1 space (except last).
     pub fn bytes_to_hex(bytes: &[u8]) -> String {
-        bytes
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ")
+        if bytes.is_empty() {
+            return String::new();
+        }
+        // Pre-allocate: 2 hex chars + 1 space per byte, minus trailing space
+        let mut result = String::with_capacity(bytes.len() * 3 - 1);
+        for (i, b) in bytes.iter().enumerate() {
+            if i > 0 {
+                result.push(' ');
+            }
+            // write! to String is infallible
+            let _ = write!(result, "{:02X}", b);
+        }
+        result
     }
 
     /// Format register values as hex
+    ///
+    /// Uses direct string writing for efficiency.
     pub fn registers_to_hex(registers: &[u16]) -> String {
-        registers
-            .iter()
-            .map(|r| format!("{:04X}", r))
-            .collect::<Vec<_>>()
-            .join(" ")
+        if registers.is_empty() {
+            return String::new();
+        }
+        // Pre-allocate: 4 hex chars + 1 space per register, minus trailing space
+        let mut result = String::with_capacity(registers.len() * 5 - 1);
+        for (i, r) in registers.iter().enumerate() {
+            if i > 0 {
+                result.push(' ');
+            }
+            let _ = write!(result, "{:04X}", r);
+        }
+        result
     }
 
     /// Format duration in a human-readable way

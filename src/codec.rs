@@ -215,7 +215,7 @@ pub fn clamp_to_data_type(value: f64, data_type: &str) -> f64 {
 pub fn parse_read_response(
     pdu: &ModbusPdu,
     function_code: u8,
-    expected_count: u16,
+    _expected_count: u16,
 ) -> ModbusResult<Vec<u16>> {
     let pdu_data = pdu.as_slice();
 
@@ -241,8 +241,8 @@ pub fn parse_read_response(
     match function_code {
         1 | 2 => {
             // FC 01/02: coils/discrete inputs
-            let _expected_bytes = expected_count.div_ceil(8) as usize;
-            let mut registers = Vec::new();
+            // Pre-allocate capacity to avoid reallocations
+            let mut registers = Vec::with_capacity(actual_byte_count);
             for &byte in &pdu_data[2..2 + actual_byte_count] {
                 registers.push(u16::from(byte));
             }
@@ -250,8 +250,9 @@ pub fn parse_read_response(
         }
         3 | 4 => {
             // FC 03/04: holding/input registers
-            let mut registers = Vec::new();
             let complete_pairs = actual_byte_count / 2;
+            // Pre-allocate capacity to avoid reallocations
+            let mut registers = Vec::with_capacity(complete_pairs);
 
             for i in 0..complete_pairs {
                 let offset = 2 + i * 2;
@@ -490,11 +491,7 @@ impl ModbusCodec {
         // Check for exception response
         if data[0] & 0x80 != 0 {
             let exception_code = if data.len() > 1 { data[1] } else { 0 };
-            return Err(ModbusError::Exception {
-                function: data[0] & 0x7F,
-                code: exception_code,
-                message: format!("Exception code {:02X}", exception_code),
-            });
+            return Err(ModbusError::exception(data[0] & 0x7F, exception_code));
         }
 
         // Verify function code

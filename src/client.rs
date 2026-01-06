@@ -379,7 +379,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
 
         // Log response if logger is available
         if let Some(ref logger) = self.logger {
-            logger.log_response(response.slave_id, response.function.to_u8(), &response.data);
+            logger.log_response(response.slave_id, response.function.to_u8(), response.data());
         }
 
         Ok(response)
@@ -407,7 +407,7 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         Ok(response
-            .data
+            .data()
             .chunks(8)
             .flat_map(|byte_data| {
                 if let Some(&byte) = byte_data.first() {
@@ -442,7 +442,7 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         Ok(response
-            .data
+            .data()
             .chunks(8)
             .flat_map(|byte_data| {
                 if let Some(&byte) = byte_data.first() {
@@ -477,7 +477,7 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         Ok(response
-            .data
+            .data()
             .chunks(2)
             .map(|chunk| {
                 if chunk.len() >= 2 {
@@ -510,7 +510,7 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         Ok(response
-            .data
+            .data()
             .chunks(2)
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect())
@@ -556,7 +556,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         }
 
         let byte_count = (values.len() + 7) / 8;
-        let mut data = vec![byte_count as u8];
+        // Pre-allocate: byte_count_field(1) + coil_data(byte_count)
+        let mut data = Vec::with_capacity(1 + byte_count);
+        data.push(byte_count as u8);
 
         for chunk in values.chunks(8) {
             let mut byte = 0u8;
@@ -590,7 +592,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
             return Err(ModbusError::invalid_data("Invalid quantity"));
         }
 
-        let mut data = vec![values.len() as u8 * 2];
+        // Pre-allocate: byte_count_field(1) + register_data(values.len() * 2)
+        let mut data = Vec::with_capacity(1 + values.len() * 2);
+        data.push((values.len() * 2) as u8);
         for &value in values {
             data.extend_from_slice(&value.to_be_bytes());
         }

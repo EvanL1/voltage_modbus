@@ -1,4 +1,23 @@
+use std::fmt::Write;
 use std::sync::Arc;
+
+/// Format bytes as hex string efficiently
+///
+/// Uses direct string writing for better performance than collect/join.
+#[inline]
+fn format_hex(data: &[u8]) -> String {
+    if data.is_empty() {
+        return String::new();
+    }
+    let mut result = String::with_capacity(data.len() * 3 - 1);
+    for (i, b) in data.iter().enumerate() {
+        if i > 0 {
+            result.push(' ');
+        }
+        let _ = write!(result, "{:02X}", b);
+    }
+    result
+}
 
 /// Log levels for the callback logging system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,12 +165,7 @@ impl CallbackLogger {
             return;
         }
 
-        let hex_data = data
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-
+        let hex_data = format_hex(data);
         let message = format!("{} packet ({} bytes): {}", direction, data.len(), hex_data);
         self.log(level, &message);
     }
@@ -169,11 +183,7 @@ impl CallbackLogger {
             LoggingMode::Raw => {
                 let raw_packet =
                     self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
-                let hex_data = raw_packet
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let hex_data = format_hex(&raw_packet);
                 let message = format!("Modbus Request -> Raw: {}", hex_data);
                 self.info(&message);
             }
@@ -197,11 +207,7 @@ impl CallbackLogger {
                 // Then log raw
                 let raw_packet =
                     self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
-                let hex_data = raw_packet
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let hex_data = format_hex(&raw_packet);
                 let raw_message = format!("Modbus Request -> Raw: {}", hex_data);
                 self.debug(&raw_message);
             }
@@ -213,11 +219,7 @@ impl CallbackLogger {
         match self.mode {
             LoggingMode::Raw => {
                 let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
-                let hex_data = raw_packet
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let hex_data = format_hex(&raw_packet);
                 let message = format!("Modbus Response <- Raw: {}", hex_data);
                 self.info(&message);
             }
@@ -242,11 +244,7 @@ impl CallbackLogger {
 
                 // Then log raw
                 let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
-                let hex_data = raw_packet
-                    .iter()
-                    .map(|b| format!("{:02X}", b))
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let hex_data = format_hex(&raw_packet);
                 let raw_message = format!("Modbus Response <- Raw: {}", hex_data);
                 self.debug(&raw_message);
             }
@@ -288,12 +286,14 @@ impl CallbackLogger {
         packet
     }
 
-    /// Simple hex encoding helper
+    /// Simple hex encoding helper (no spaces between bytes)
     fn hex_encode(data: &[u8]) -> String {
-        data.iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join("")
+        // Pre-allocate: 2 hex chars per byte
+        let mut result = String::with_capacity(data.len() * 2);
+        for b in data {
+            let _ = write!(result, "{:02X}", b);
+        }
+        result
     }
 
     /// Get human-readable function name

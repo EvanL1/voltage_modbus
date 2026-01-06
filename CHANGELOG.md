@@ -5,6 +5,36 @@ All notable changes to Voltage Modbus library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-01-06
+
+### Changed
+- **BREAKING**: `ModbusResponse.data` 从公开字段改为方法 `data() -> &[u8]`
+  - 迁移: `response.data` → `response.data()`
+- 优化响应解析的内存分配（零拷贝设计）
+- 优化 hex 日志格式化，减少临时分配
+- 优化 `Vec` 预分配策略，避免多次扩容
+- 优化字符串归一化，单次迭代替代多次分配
+
+### Fixed
+- 移除 `server.rs` 中多余的变量遮蔽
+
+## [0.4.6] - 2025-01-05
+
+### Added
+- RTU 完整配置示例（含校验位）
+
+## [0.4.5] - 2025-01-04
+
+### Changed
+- 更新 MSRV 至 1.85.0
+- 简化 README
+
+## [0.4.4] - 2025-01-03
+
+### Changed
+- 使用 crates.io 的 igw 依赖
+- 使用原生 AFIT 替代 async-trait（零成本异步 trait）
+
 ## [0.4.3] - 2024-11-29
 
 ### Added
