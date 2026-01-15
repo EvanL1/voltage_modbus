@@ -56,6 +56,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::device_limits::DeviceLimits;
 use crate::error::{ModbusError, ModbusResult};
 use crate::logging::CallbackLogger;
 use crate::protocol::{ModbusFunction, ModbusRequest, ModbusResponse, SlaveId};
@@ -216,6 +217,244 @@ pub trait ModbusClient: Send + Sync {
         values: &[u16],
     ) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
+    // ===== Batch read operations =====
+
+    /// Batch read coils (function code 0x01) with automatic chunking.
+    ///
+    /// Reads a large range of coils by automatically splitting the request
+    /// into smaller chunks according to device limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting coil address (0-65535)
+    /// * `quantity` - Total number of coils to read (can exceed 2000)
+    /// * `limits` - Device-specific limits configuration
+    ///
+    /// # Returns
+    ///
+    /// A vector of boolean values representing all coil states.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::{ModbusTcpClient, ModbusClient, DeviceLimits};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> voltage_modbus::ModbusResult<()> {
+    /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+    /// let limits = DeviceLimits::new();
+    ///
+    /// // Read 5000 coils (automatically split into 3 requests)
+    /// let coils = client.read_01_batch(1, 0, 5000, &limits).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn read_01_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send
+    where
+        Self: Sized,
+    {
+        let max_read_coils = limits.max_read_coils;
+        let inter_request_delay_ms = limits.inter_request_delay_ms;
+        async move {
+            if quantity == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut result = Vec::with_capacity(quantity as usize);
+            let mut current_address = address;
+            let mut remaining = quantity;
+
+            while remaining > 0 {
+                let count = remaining.min(max_read_coils);
+                let chunk = self.read_01(slave_id, current_address, count).await?;
+                result.extend_from_slice(&chunk);
+
+                current_address = current_address.saturating_add(count);
+                remaining -= count;
+
+                if inter_request_delay_ms > 0 && remaining > 0 {
+                    tokio::time::sleep(Duration::from_millis(inter_request_delay_ms)).await;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
+    /// Batch read discrete inputs (function code 0x02) with automatic chunking.
+    ///
+    /// Reads a large range of discrete inputs by automatically splitting the request
+    /// into smaller chunks according to device limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting input address (0-65535)
+    /// * `quantity` - Total number of inputs to read (can exceed 2000)
+    /// * `limits` - Device-specific limits configuration
+    fn read_02_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send
+    where
+        Self: Sized,
+    {
+        let max_read_coils = limits.max_read_coils;
+        let inter_request_delay_ms = limits.inter_request_delay_ms;
+        async move {
+            if quantity == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut result = Vec::with_capacity(quantity as usize);
+            let mut current_address = address;
+            let mut remaining = quantity;
+
+            while remaining > 0 {
+                let count = remaining.min(max_read_coils);
+                let chunk = self.read_02(slave_id, current_address, count).await?;
+                result.extend_from_slice(&chunk);
+
+                current_address = current_address.saturating_add(count);
+                remaining -= count;
+
+                if inter_request_delay_ms > 0 && remaining > 0 {
+                    tokio::time::sleep(Duration::from_millis(inter_request_delay_ms)).await;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
+    /// Batch read holding registers (function code 0x03) with automatic chunking.
+    ///
+    /// Reads a large range of holding registers by automatically splitting the request
+    /// into smaller chunks according to device limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting register address (0-65535)
+    /// * `quantity` - Total number of registers to read (can exceed 125)
+    /// * `limits` - Device-specific limits configuration
+    ///
+    /// # Returns
+    ///
+    /// A vector of 16-bit register values.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::{ModbusTcpClient, ModbusClient, DeviceLimits};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> voltage_modbus::ModbusResult<()> {
+    /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+    /// let limits = DeviceLimits::new();
+    ///
+    /// // Read 500 registers (automatically split into 4 requests of 125 each)
+    /// let registers = client.read_03_batch(1, 0, 500, &limits).await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn read_03_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send
+    where
+        Self: Sized,
+    {
+        let max_read_registers = limits.max_read_registers;
+        let inter_request_delay_ms = limits.inter_request_delay_ms;
+        async move {
+            if quantity == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut result = Vec::with_capacity(quantity as usize);
+            let mut current_address = address;
+            let mut remaining = quantity;
+
+            while remaining > 0 {
+                let count = remaining.min(max_read_registers);
+                let chunk = self.read_03(slave_id, current_address, count).await?;
+                result.extend_from_slice(&chunk);
+
+                current_address = current_address.saturating_add(count);
+                remaining -= count;
+
+                if inter_request_delay_ms > 0 && remaining > 0 {
+                    tokio::time::sleep(Duration::from_millis(inter_request_delay_ms)).await;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
+    /// Batch read input registers (function code 0x04) with automatic chunking.
+    ///
+    /// Reads a large range of input registers by automatically splitting the request
+    /// into smaller chunks according to device limits.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - The Modbus slave/unit ID (1-247)
+    /// * `address` - Starting register address (0-65535)
+    /// * `quantity` - Total number of registers to read (can exceed 125)
+    /// * `limits` - Device-specific limits configuration
+    fn read_04_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send
+    where
+        Self: Sized,
+    {
+        let max_read_registers = limits.max_read_registers;
+        let inter_request_delay_ms = limits.inter_request_delay_ms;
+        async move {
+            if quantity == 0 {
+                return Ok(Vec::new());
+            }
+
+            let mut result = Vec::with_capacity(quantity as usize);
+            let mut current_address = address;
+            let mut remaining = quantity;
+
+            while remaining > 0 {
+                let count = remaining.min(max_read_registers);
+                let chunk = self.read_04(slave_id, current_address, count).await?;
+                result.extend_from_slice(&chunk);
+
+                current_address = current_address.saturating_add(count);
+                remaining -= count;
+
+                if inter_request_delay_ms > 0 && remaining > 0 {
+                    tokio::time::sleep(Duration::from_millis(inter_request_delay_ms)).await;
+                }
+            }
+
+            Ok(result)
+        }
+    }
+
     /// Check if the client is connected.
     ///
     /// Returns `true` if the underlying transport is connected and ready.
@@ -320,6 +559,68 @@ pub trait ModbusClient: Send + Sync {
     ) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
         self.write_10(slave_id, address, values)
     }
+
+    // ===== Batch read semantic aliases =====
+
+    /// Alias for `read_01_batch` - Batch read coils with automatic chunking
+    #[inline]
+    fn read_coils_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send
+    where
+        Self: Sized,
+    {
+        self.read_01_batch(slave_id, address, quantity, limits)
+    }
+
+    /// Alias for `read_02_batch` - Batch read discrete inputs with automatic chunking
+    #[inline]
+    fn read_discrete_inputs_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<bool>>> + Send
+    where
+        Self: Sized,
+    {
+        self.read_02_batch(slave_id, address, quantity, limits)
+    }
+
+    /// Alias for `read_03_batch` - Batch read holding registers with automatic chunking
+    #[inline]
+    fn read_holding_registers_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send
+    where
+        Self: Sized,
+    {
+        self.read_03_batch(slave_id, address, quantity, limits)
+    }
+
+    /// Alias for `read_04_batch` - Batch read input registers with automatic chunking
+    #[inline]
+    fn read_input_registers_batch(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+        limits: &DeviceLimits,
+    ) -> impl std::future::Future<Output = ModbusResult<Vec<u16>>> + Send
+    where
+        Self: Sized,
+    {
+        self.read_04_batch(slave_id, address, quantity, limits)
+    }
 }
 
 /// Generic Modbus client that works with any transport
@@ -406,20 +707,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         };
 
         let response = self.execute_request(request).await?;
-        Ok(response
-            .data()
-            .chunks(8)
-            .flat_map(|byte_data| {
-                if let Some(&byte) = byte_data.first() {
-                    (0..8)
-                        .map(move |i| (byte & (1 << i)) != 0)
-                        .collect::<Vec<bool>>()
-                } else {
-                    vec![]
-                }
-            })
-            .take(quantity as usize)
-            .collect())
+        // Use parse_bits() which correctly skips byte_count prefix
+        let bits = response.parse_bits()?;
+        Ok(bits.into_iter().take(quantity as usize).collect())
     }
 
     async fn read_02(
@@ -441,20 +731,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         };
 
         let response = self.execute_request(request).await?;
-        Ok(response
-            .data()
-            .chunks(8)
-            .flat_map(|byte_data| {
-                if let Some(&byte) = byte_data.first() {
-                    (0..8)
-                        .map(move |i| (byte & (1 << i)) != 0)
-                        .collect::<Vec<bool>>()
-                } else {
-                    vec![]
-                }
-            })
-            .take(quantity as usize)
-            .collect())
+        // Use parse_bits() which correctly skips byte_count prefix
+        let bits = response.parse_bits()?;
+        Ok(bits.into_iter().take(quantity as usize).collect())
     }
 
     async fn read_03(
@@ -476,18 +755,8 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         };
 
         let response = self.execute_request(request).await?;
-        Ok(response
-            .data()
-            .chunks(2)
-            .map(|chunk| {
-                if chunk.len() >= 2 {
-                    u16::from_be_bytes([chunk[0], chunk[1]])
-                } else {
-                    // Handle odd-length data by padding with zero
-                    u16::from_be_bytes([chunk[0], 0])
-                }
-            })
-            .collect())
+        // Use parse_registers() which correctly skips byte_count prefix
+        response.parse_registers()
     }
 
     async fn read_04(
@@ -509,11 +778,8 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         };
 
         let response = self.execute_request(request).await?;
-        Ok(response
-            .data()
-            .chunks(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
-            .collect())
+        // Use parse_registers() which correctly skips byte_count prefix
+        response.parse_registers()
     }
 
     async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
@@ -556,9 +822,8 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
         }
 
         let byte_count = (values.len() + 7) / 8;
-        // Pre-allocate: byte_count_field(1) + coil_data(byte_count)
-        let mut data = Vec::with_capacity(1 + byte_count);
-        data.push(byte_count as u8);
+        // Note: byte_count is added by transport layer, we only send the coil data
+        let mut data = Vec::with_capacity(byte_count);
 
         for chunk in values.chunks(8) {
             let mut byte = 0u8;
@@ -592,9 +857,8 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
             return Err(ModbusError::invalid_data("Invalid quantity"));
         }
 
-        // Pre-allocate: byte_count_field(1) + register_data(values.len() * 2)
-        let mut data = Vec::with_capacity(1 + values.len() * 2);
-        data.push((values.len() * 2) as u8);
+        // Note: byte_count is added by transport layer, we only send the register data
+        let mut data = Vec::with_capacity(values.len() * 2);
         for &value in values {
             data.extend_from_slice(&value.to_be_bytes());
         }
@@ -1036,6 +1300,256 @@ mod tests {
         let result = ModbusTcpClient::from_address("127.0.0.1:9999", Duration::from_secs(1)).await;
         // This might fail due to connection refused, which is expected
         println!("TCP client creation result: {:?}", result.is_ok());
+    }
+
+    // =========================================================================
+    // MockTransport for batch read tests
+    // =========================================================================
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    /// Mock transport for testing batch read methods
+    struct MockTransport {
+        /// Records all requests received
+        requests: Mutex<Vec<ModbusRequest>>,
+        /// Pre-configured responses (FIFO queue)
+        responses: Mutex<VecDeque<ModbusResult<ModbusResponse>>>,
+        /// Connection state
+        connected: Mutex<bool>,
+    }
+
+    impl MockTransport {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                responses: Mutex::new(VecDeque::new()),
+                connected: Mutex::new(true),
+            }
+        }
+
+        /// Add a response to the queue
+        fn add_response(&self, response: ModbusResult<ModbusResponse>) {
+            self.responses.lock().unwrap().push_back(response);
+        }
+
+        /// Get recorded requests for verification
+        fn get_requests(&self) -> Vec<ModbusRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl ModbusTransport for MockTransport {
+        fn request(
+            &mut self,
+            request: &ModbusRequest,
+        ) -> impl std::future::Future<Output = ModbusResult<ModbusResponse>> + Send {
+            // Record the request
+            self.requests.lock().unwrap().push(request.clone());
+
+            // Get the next response from queue
+            let response = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| Err(ModbusError::connection("No response prepared in mock")));
+
+            async move { response }
+        }
+
+        fn is_connected(&self) -> bool {
+            *self.connected.lock().unwrap()
+        }
+
+        fn close(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send {
+            *self.connected.lock().unwrap() = false;
+            async { Ok(()) }
+        }
+
+        fn get_stats(&self) -> TransportStats {
+            TransportStats::default()
+        }
+    }
+
+    // =========================================================================
+    // Helper functions for creating mock responses
+    // =========================================================================
+
+    /// Create a FC03/FC04 (read registers) response with byte_count prefix
+    fn create_register_response(slave_id: SlaveId, values: &[u16]) -> ModbusResponse {
+        let byte_count = (values.len() * 2) as u8;
+        let mut data = Vec::with_capacity(1 + values.len() * 2);
+        data.push(byte_count);
+        for &val in values {
+            data.extend_from_slice(&val.to_be_bytes());
+        }
+        ModbusResponse::new_success(slave_id, ModbusFunction::ReadHoldingRegisters, data)
+    }
+
+    /// Create a FC01/FC02 (read coils/discrete inputs) response with byte_count prefix
+    fn create_coil_response(slave_id: SlaveId, coils: &[bool]) -> ModbusResponse {
+        let byte_count = ((coils.len() + 7) / 8) as u8;
+        let mut data = Vec::with_capacity(1 + byte_count as usize);
+        data.push(byte_count);
+
+        // Pack bits into bytes (LSB first within each byte)
+        let mut byte = 0u8;
+        for (i, &coil) in coils.iter().enumerate() {
+            if coil {
+                byte |= 1 << (i % 8);
+            }
+            if (i + 1) % 8 == 0 || i == coils.len() - 1 {
+                data.push(byte);
+                byte = 0;
+            }
+        }
+        ModbusResponse::new_success(slave_id, ModbusFunction::ReadCoils, data)
+    }
+
+    // =========================================================================
+    // Batch read tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_read_03_batch_single_chunk() {
+        // When quantity <= max_read_registers, only one request should be made
+        let mock = MockTransport::new();
+
+        // Prepare response for 10 registers
+        let values: Vec<u16> = (1..=10).collect();
+        mock.add_response(Ok(create_register_response(1, &values)));
+
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new().with_max_read_registers(50);
+
+        let result = client.read_03_batch(1, 0, 10, &limits).await.unwrap();
+
+        assert_eq!(result, values);
+        assert_eq!(client.transport().get_requests().len(), 1);
+
+        let req = &client.transport().get_requests()[0];
+        assert_eq!(req.address, 0);
+        assert_eq!(req.quantity, 10);
+    }
+
+    #[tokio::test]
+    async fn test_read_03_batch_multiple_chunks() {
+        // When quantity > max_read_registers, multiple requests should be made
+        let mock = MockTransport::new();
+
+        // Prepare responses for 3 chunks: 50 + 50 + 20 = 120 registers
+        let chunk1: Vec<u16> = (1..=50).collect();
+        let chunk2: Vec<u16> = (51..=100).collect();
+        let chunk3: Vec<u16> = (101..=120).collect();
+
+        mock.add_response(Ok(create_register_response(1, &chunk1)));
+        mock.add_response(Ok(create_register_response(1, &chunk2)));
+        mock.add_response(Ok(create_register_response(1, &chunk3)));
+
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new().with_max_read_registers(50);
+
+        let result = client.read_03_batch(1, 0, 120, &limits).await.unwrap();
+
+        // Verify result contains all values
+        let expected: Vec<u16> = (1..=120).collect();
+        assert_eq!(result, expected);
+
+        // Verify 3 requests were made
+        let requests = client.transport().get_requests();
+        assert_eq!(requests.len(), 3);
+
+        // Verify addresses and quantities
+        assert_eq!(requests[0].address, 0);
+        assert_eq!(requests[0].quantity, 50);
+        assert_eq!(requests[1].address, 50);
+        assert_eq!(requests[1].quantity, 50);
+        assert_eq!(requests[2].address, 100);
+        assert_eq!(requests[2].quantity, 20);
+    }
+
+    #[tokio::test]
+    async fn test_read_03_batch_exact_boundary() {
+        // When quantity == max_read_registers, only one request
+        let mock = MockTransport::new();
+
+        let values: Vec<u16> = (1..=50).collect();
+        mock.add_response(Ok(create_register_response(1, &values)));
+
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new().with_max_read_registers(50);
+
+        let result = client.read_03_batch(1, 100, 50, &limits).await.unwrap();
+
+        assert_eq!(result, values);
+        assert_eq!(client.transport().get_requests().len(), 1);
+
+        let req = &client.transport().get_requests()[0];
+        assert_eq!(req.address, 100);
+        assert_eq!(req.quantity, 50);
+    }
+
+    #[tokio::test]
+    async fn test_read_03_batch_empty() {
+        // When quantity == 0, return empty Vec immediately without any requests
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new();
+
+        let result = client.read_03_batch(1, 0, 0, &limits).await.unwrap();
+
+        assert!(result.is_empty());
+        assert_eq!(client.transport().get_requests().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_read_03_batch_error_propagation() {
+        // When a request fails mid-batch, error should be propagated
+        let mock = MockTransport::new();
+
+        // First chunk succeeds
+        let chunk1: Vec<u16> = (1..=50).collect();
+        mock.add_response(Ok(create_register_response(1, &chunk1)));
+
+        // Second chunk fails
+        mock.add_response(Err(ModbusError::timeout("Simulated timeout", 1000)));
+
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new().with_max_read_registers(50);
+
+        let result = client.read_03_batch(1, 0, 100, &limits).await;
+
+        assert!(result.is_err());
+        // Only 2 requests should have been made (second one failed)
+        assert_eq!(client.transport().get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_read_01_batch_coils() {
+        // Test batch reading coils
+        let mock = MockTransport::new();
+
+        // Prepare responses for 2 chunks: 500 + 100 = 600 coils
+        let chunk1: Vec<bool> = (0..500).map(|i| i % 2 == 0).collect();
+        let chunk2: Vec<bool> = (0..100).map(|i| i % 3 == 0).collect();
+
+        mock.add_response(Ok(create_coil_response(1, &chunk1)));
+        mock.add_response(Ok(create_coil_response(1, &chunk2)));
+
+        let mut client = GenericModbusClient::new(mock);
+        let limits = DeviceLimits::new().with_max_read_coils(500);
+
+        let result = client.read_01_batch(1, 0, 600, &limits).await.unwrap();
+
+        // Verify total count
+        assert_eq!(result.len(), 600);
+
+        // Verify requests
+        let requests = client.transport().get_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].quantity, 500);
+        assert_eq!(requests[1].quantity, 100);
     }
 }
 

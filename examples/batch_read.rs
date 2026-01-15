@@ -19,98 +19,21 @@
 //! ```bash
 //! cargo run --example batch_read
 //! ```
+//!
+//! # New Batch API
+//!
+//! The `ModbusClient` trait now provides built-in batch read methods:
+//! - `read_01_batch` / `read_coils_batch`
+//! - `read_02_batch` / `read_discrete_inputs_batch`
+//! - `read_03_batch` / `read_holding_registers_batch`
+//! - `read_04_batch` / `read_input_registers_batch`
+//!
+//! These methods automatically handle chunking based on `DeviceLimits`.
 
 use std::time::Duration;
 use voltage_modbus::{
     regs_to_f32, ByteOrder, DeviceLimits, ModbusClient, ModbusResult, ModbusTcpClient,
 };
-
-/// Read a large range of registers in batches
-///
-/// This function automatically splits the read request based on device limits
-/// and reassembles the results into a single vector.
-///
-/// # Arguments
-///
-/// * `client` - Modbus TCP client
-/// * `slave_id` - Modbus slave/unit ID
-/// * `start_address` - Starting register address
-/// * `total_count` - Total number of registers to read
-/// * `limits` - Device-specific limits configuration
-///
-/// # Returns
-///
-/// A vector containing all requested registers
-async fn batch_read_registers(
-    client: &mut ModbusTcpClient,
-    slave_id: u8,
-    start_address: u16,
-    total_count: u16,
-    limits: &DeviceLimits,
-) -> ModbusResult<Vec<u16>> {
-    let mut all_registers = Vec::with_capacity(total_count as usize);
-    let mut current_address = start_address;
-    let mut remaining = total_count;
-
-    let batch_count = limits.read_request_count(total_count);
-    println!(
-        "Reading {} registers in {} batch(es) (max {} per request)",
-        total_count, batch_count, limits.max_read_registers
-    );
-
-    let mut batch_num = 1;
-    while remaining > 0 {
-        // Calculate how many registers to read in this batch
-        let count = remaining.min(limits.max_read_registers);
-
-        println!(
-            "  Batch {}/{}: address={}, count={}",
-            batch_num, batch_count, current_address, count
-        );
-
-        let registers = client.read_03(slave_id, current_address, count).await?;
-        all_registers.extend_from_slice(&registers);
-
-        current_address += count;
-        remaining -= count;
-        batch_num += 1;
-
-        // Optional: add inter-request delay for slow devices
-        if limits.inter_request_delay_ms > 0 && remaining > 0 {
-            tokio::time::sleep(Duration::from_millis(limits.inter_request_delay_ms)).await;
-        }
-    }
-
-    Ok(all_registers)
-}
-
-/// Example: Read coils in batches
-async fn batch_read_coils(
-    client: &mut ModbusTcpClient,
-    slave_id: u8,
-    start_address: u16,
-    total_count: u16,
-    limits: &DeviceLimits,
-) -> ModbusResult<Vec<bool>> {
-    let mut all_coils = Vec::with_capacity(total_count as usize);
-    let mut current_address = start_address;
-    let mut remaining = total_count;
-
-    while remaining > 0 {
-        let count = remaining.min(limits.max_read_coils);
-        let coils = client.read_01(slave_id, current_address, count).await?;
-        all_coils.extend_from_slice(&coils);
-
-        current_address += count;
-        remaining -= count;
-
-        if limits.inter_request_delay_ms > 0 && remaining > 0 {
-            tokio::time::sleep(Duration::from_millis(limits.inter_request_delay_ms)).await;
-        }
-    }
-
-    Ok(all_coils)
-}
 
 #[tokio::main]
 async fn main() -> ModbusResult<()> {
@@ -129,7 +52,8 @@ async fn main() -> ModbusResult<()> {
         default_limits.max_read_registers, default_limits.inter_request_delay_ms
     );
 
-    let registers = batch_read_registers(&mut client, slave_id, 0, 200, &default_limits).await?;
+    // Using the new trait method: read_holding_registers_batch
+    let registers = client.read_holding_registers_batch(slave_id, 0, 200, &default_limits).await?;
     println!("Read {} registers total\n", registers.len());
 
     // =========================================================================
@@ -143,8 +67,9 @@ async fn main() -> ModbusResult<()> {
         conservative_limits.max_read_registers, conservative_limits.inter_request_delay_ms
     );
 
-    let registers =
-        batch_read_registers(&mut client, slave_id, 0, 200, &conservative_limits).await?;
+    let registers = client
+        .read_holding_registers_batch(slave_id, 0, 200, &conservative_limits)
+        .await?;
     println!("Read {} registers total\n", registers.len());
 
     // =========================================================================
@@ -161,7 +86,7 @@ async fn main() -> ModbusResult<()> {
         custom_limits.max_read_registers, custom_limits.inter_request_delay_ms
     );
 
-    let registers = batch_read_registers(&mut client, slave_id, 0, 100, &custom_limits).await?;
+    let registers = client.read_03_batch(slave_id, 0, 100, &custom_limits).await?;
     println!("Read {} registers total\n", registers.len());
 
     // =========================================================================
@@ -170,7 +95,7 @@ async fn main() -> ModbusResult<()> {
     println!("=== Example 4: Batch Read with Float Decoding ===\n");
 
     // Read 10 float values (20 registers) starting at address 1000
-    let registers = batch_read_registers(&mut client, slave_id, 1000, 20, &default_limits).await?;
+    let registers = client.read_03_batch(slave_id, 1000, 20, &default_limits).await?;
 
     println!("Decoded Float32 values (BigEndian):");
     for i in 0..10 {
@@ -192,7 +117,8 @@ async fn main() -> ModbusResult<()> {
         "Reading 1000 coils with max {} per request",
         coil_limits.max_read_coils
     );
-    let coils = batch_read_coils(&mut client, slave_id, 0, 1000, &coil_limits).await?;
+    // Using the new trait method: read_coils_batch (alias for read_01_batch)
+    let coils = client.read_coils_batch(slave_id, 0, 1000, &coil_limits).await?;
     println!("Read {} coils total", coils.len());
     println!("First 16 coils: {:?}", &coils[..coils.len().min(16)]);
 
