@@ -489,8 +489,7 @@ impl ModbusResponse {
         }
 
         let mut bits = Vec::with_capacity(byte_count * 8);
-        for i in 1..1 + byte_count {
-            let byte_value = data[i];
+        for &byte_value in data.iter().skip(1).take(byte_count) {
             for bit_pos in 0..8 {
                 bits.push((byte_value & (1 << bit_pos)) != 0);
             }

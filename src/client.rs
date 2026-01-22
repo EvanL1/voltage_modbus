@@ -172,7 +172,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Coil address (0-65535)
     /// * `value` - `true` for ON (0xFF00), `false` for OFF (0x0000)
-    fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
+    fn write_05(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        value: bool,
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Write single register (function code 0x06).
     ///
@@ -183,7 +188,12 @@ pub trait ModbusClient: Send + Sync {
     /// * `slave_id` - The Modbus slave/unit ID (1-247)
     /// * `address` - Register address (0-65535)
     /// * `value` - 16-bit value to write
-    fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
+    fn write_06(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        value: u16,
+    ) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
     /// Write multiple coils (function code 0x0F).
     ///
@@ -665,9 +675,13 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
+        // Get transaction ID for logging (TCP only, RTU returns None)
+        let transaction_id = self.transport.peek_transaction_id();
+
         // Log request if logger is available
         if let Some(ref logger) = self.logger {
             logger.log_request(
+                transaction_id,
                 request.slave_id,
                 request.function.to_u8(),
                 request.address,
@@ -680,7 +694,12 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
 
         // Log response if logger is available
         if let Some(ref logger) = self.logger {
-            logger.log_response(response.slave_id, response.function.to_u8(), response.data());
+            logger.log_response(
+                transaction_id,
+                response.slave_id,
+                response.function.to_u8(),
+                response.data(),
+            );
         }
 
         Ok(response)

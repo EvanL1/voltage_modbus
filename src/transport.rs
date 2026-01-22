@@ -267,7 +267,10 @@ pub trait ModbusTransport: Send + Sync {
     /// # Ok(())
     /// # }
     /// ```
-    fn request(&mut self, request: &ModbusRequest) -> impl std::future::Future<Output = ModbusResult<ModbusResponse>> + Send;
+    fn request(
+        &mut self,
+        request: &ModbusRequest,
+    ) -> impl std::future::Future<Output = ModbusResult<ModbusResponse>> + Send;
 
     /// Check if the transport connection is active
     ///
@@ -331,7 +334,7 @@ pub trait ModbusTransport: Send + Sync {
     ///
     /// A `TransportStats` structure containing:
     /// - Request and response counts
-    /// - Error and timeout counts  
+    /// - Error and timeout counts
     /// - Bytes sent and received
     ///
     /// # Examples
@@ -354,6 +357,24 @@ pub trait ModbusTransport: Send + Sync {
     /// # }
     /// ```
     fn get_stats(&self) -> TransportStats;
+
+    /// Peek at the next transaction ID that will be used (for TCP logging purposes)
+    ///
+    /// Returns the transaction ID that will be used for the next request.
+    /// This is useful for logging the actual transaction ID before sending.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(u16)` - For TCP transport, returns the next transaction ID
+    /// * `None` - For RTU/ASCII transports which don't use transaction IDs
+    ///
+    /// # Note
+    ///
+    /// This method does NOT increment the transaction ID counter.
+    /// The ID is only incremented when `request()` is actually called.
+    fn peek_transaction_id(&self) -> Option<u16> {
+        None // Default implementation for transports without transaction IDs
+    }
 }
 
 /// Transport layer statistics
@@ -552,11 +573,7 @@ impl TcpTransport {
         let data_len = (length as usize).saturating_sub(2); // length includes slave_id + function
 
         Ok(ModbusResponse::new_from_frame(
-            frame,
-            slave_id,
-            function,
-            data_start,
-            data_len,
+            frame, slave_id, function, data_start, data_len,
         ))
     }
 }
@@ -671,6 +688,13 @@ impl ModbusTransport for TcpTransport {
 
     fn get_stats(&self) -> TransportStats {
         self.stats
+    }
+
+    fn peek_transaction_id(&self) -> Option<u16> {
+        // Return the next transaction ID that will be used
+        // Note: wrapping_add logic matches next_transaction_id()
+        let next = self.transaction_id.wrapping_add(1);
+        Some(if next == 0 { 1 } else { next })
     }
 }
 
@@ -918,11 +942,7 @@ impl RtuTransport {
         let data_len = pdu_len.saturating_sub(2); // pdu_len = frame - CRC, minus slave_id and function
 
         Ok(ModbusResponse::new_from_frame(
-            frame,
-            slave_id,
-            function,
-            data_start,
-            data_len,
+            frame, slave_id, function, data_start, data_len,
         ))
     }
 
@@ -1479,11 +1499,7 @@ impl AsciiTransport {
         let data_len = raw_data.len().saturating_sub(2);
 
         Ok(ModbusResponse::new_from_frame(
-            raw_data,
-            slave_id,
-            function,
-            data_start,
-            data_len,
+            raw_data, slave_id, function, data_start, data_len,
         ))
     }
 

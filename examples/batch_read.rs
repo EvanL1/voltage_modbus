@@ -53,7 +53,9 @@ async fn main() -> ModbusResult<()> {
     );
 
     // Using the new trait method: read_holding_registers_batch
-    let registers = client.read_holding_registers_batch(slave_id, 0, 200, &default_limits).await?;
+    let registers = client
+        .read_holding_registers_batch(slave_id, 0, 200, &default_limits)
+        .await?;
     println!("Read {} registers total\n", registers.len());
 
     // =========================================================================
@@ -86,7 +88,9 @@ async fn main() -> ModbusResult<()> {
         custom_limits.max_read_registers, custom_limits.inter_request_delay_ms
     );
 
-    let registers = client.read_03_batch(slave_id, 0, 100, &custom_limits).await?;
+    let registers = client
+        .read_03_batch(slave_id, 0, 100, &custom_limits)
+        .await?;
     println!("Read {} registers total\n", registers.len());
 
     // =========================================================================
@@ -95,7 +99,9 @@ async fn main() -> ModbusResult<()> {
     println!("=== Example 4: Batch Read with Float Decoding ===\n");
 
     // Read 10 float values (20 registers) starting at address 1000
-    let registers = client.read_03_batch(slave_id, 1000, 20, &default_limits).await?;
+    let registers = client
+        .read_03_batch(slave_id, 1000, 20, &default_limits)
+        .await?;
 
     println!("Decoded Float32 values (BigEndian):");
     for i in 0..10 {
@@ -118,7 +124,9 @@ async fn main() -> ModbusResult<()> {
         coil_limits.max_read_coils
     );
     // Using the new trait method: read_coils_batch (alias for read_01_batch)
-    let coils = client.read_coils_batch(slave_id, 0, 1000, &coil_limits).await?;
+    let coils = client
+        .read_coils_batch(slave_id, 0, 1000, &coil_limits)
+        .await?;
     println!("Read {} coils total", coils.len());
     println!("First 16 coils: {:?}", &coils[..coils.len().min(16)]);
 

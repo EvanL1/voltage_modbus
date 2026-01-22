@@ -171,8 +171,18 @@ impl CallbackLogger {
     }
 
     /// Log a Modbus request with different modes
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - Optional transaction ID for TCP (None for RTU/ASCII)
+    /// * `slave_id` - The Modbus slave/unit ID
+    /// * `function_code` - The Modbus function code
+    /// * `address` - The starting address
+    /// * `quantity` - The quantity of registers/coils
+    /// * `data` - Additional data bytes
     pub fn log_request(
         &self,
+        transaction_id: Option<u16>,
         slave_id: u8,
         function_code: u8,
         address: u16,
@@ -181,8 +191,14 @@ impl CallbackLogger {
     ) {
         match self.mode {
             LoggingMode::Raw => {
-                let raw_packet =
-                    self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
+                let raw_packet = self.build_raw_request_packet(
+                    transaction_id.unwrap_or(1),
+                    slave_id,
+                    function_code,
+                    address,
+                    quantity,
+                    data,
+                );
                 let hex_data = format_hex(&raw_packet);
                 let message = format!("Modbus Request -> Raw: {}", hex_data);
                 self.info(&message);
@@ -205,8 +221,14 @@ impl CallbackLogger {
                 self.info(&interpreted);
 
                 // Then log raw
-                let raw_packet =
-                    self.build_raw_request_packet(slave_id, function_code, address, quantity, data);
+                let raw_packet = self.build_raw_request_packet(
+                    transaction_id.unwrap_or(1),
+                    slave_id,
+                    function_code,
+                    address,
+                    quantity,
+                    data,
+                );
                 let hex_data = format_hex(&raw_packet);
                 let raw_message = format!("Modbus Request -> Raw: {}", hex_data);
                 self.debug(&raw_message);
@@ -215,10 +237,28 @@ impl CallbackLogger {
     }
 
     /// Log a Modbus response with different modes
-    pub fn log_response(&self, slave_id: u8, function_code: u8, data: &[u8]) {
+    ///
+    /// # Arguments
+    ///
+    /// * `transaction_id` - Optional transaction ID for TCP (None for RTU/ASCII)
+    /// * `slave_id` - The Modbus slave/unit ID
+    /// * `function_code` - The Modbus function code
+    /// * `data` - Response data bytes
+    pub fn log_response(
+        &self,
+        transaction_id: Option<u16>,
+        slave_id: u8,
+        function_code: u8,
+        data: &[u8],
+    ) {
         match self.mode {
             LoggingMode::Raw => {
-                let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
+                let raw_packet = self.build_raw_response_packet(
+                    transaction_id.unwrap_or(1),
+                    slave_id,
+                    function_code,
+                    data,
+                );
                 let hex_data = format_hex(&raw_packet);
                 let message = format!("Modbus Response <- Raw: {}", hex_data);
                 self.info(&message);
@@ -243,7 +283,12 @@ impl CallbackLogger {
                 self.info(&interpreted);
 
                 // Then log raw
-                let raw_packet = self.build_raw_response_packet(slave_id, function_code, data);
+                let raw_packet = self.build_raw_response_packet(
+                    transaction_id.unwrap_or(1),
+                    slave_id,
+                    function_code,
+                    data,
+                );
                 let hex_data = format_hex(&raw_packet);
                 let raw_message = format!("Modbus Response <- Raw: {}", hex_data);
                 self.debug(&raw_message);
@@ -254,6 +299,7 @@ impl CallbackLogger {
     /// Build raw request packet for logging
     fn build_raw_request_packet(
         &self,
+        transaction_id: u16,
         slave_id: u8,
         function_code: u8,
         address: u16,
@@ -261,8 +307,8 @@ impl CallbackLogger {
         data: &[u8],
     ) -> Vec<u8> {
         let mut packet = Vec::new();
-        // TCP MBAP header (simplified for logging)
-        packet.extend_from_slice(&[0x00, 0x01]); // Transaction ID
+        // TCP MBAP header
+        packet.extend_from_slice(&transaction_id.to_be_bytes()); // Transaction ID
         packet.extend_from_slice(&[0x00, 0x00]); // Protocol ID
         packet.extend_from_slice(&[0x00, (6 + data.len()) as u8]); // Length
         packet.push(slave_id);
@@ -274,10 +320,16 @@ impl CallbackLogger {
     }
 
     /// Build raw response packet for logging
-    fn build_raw_response_packet(&self, slave_id: u8, function_code: u8, data: &[u8]) -> Vec<u8> {
+    fn build_raw_response_packet(
+        &self,
+        transaction_id: u16,
+        slave_id: u8,
+        function_code: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
         let mut packet = Vec::new();
-        // TCP MBAP header (simplified for logging)
-        packet.extend_from_slice(&[0x00, 0x01]); // Transaction ID
+        // TCP MBAP header
+        packet.extend_from_slice(&transaction_id.to_be_bytes()); // Transaction ID
         packet.extend_from_slice(&[0x00, 0x00]); // Protocol ID
         packet.extend_from_slice(&[0x00, (2 + data.len()) as u8]); // Length
         packet.push(slave_id);
