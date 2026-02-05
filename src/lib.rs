@@ -124,6 +124,9 @@ pub use device_limits::DeviceLimits;
 
 // === Monitoring ===
 pub use transport::{ModbusTransport, TcpTransport, TransportStats};
+
+// === Packet Callback (for real packet logging) ===
+pub use transport::{PacketCallback, PacketDirection};
 pub use utils::PerformanceMetrics;
 
 // === Protocol limits (commonly needed constants) ===
