@@ -675,13 +675,11 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
-        // Get transaction ID for logging (TCP only, RTU returns None)
-        let transaction_id = self.transport.peek_transaction_id();
-
         // Log request if logger is available
+        // Note: For accurate packet logging with real TID, use transport.set_packet_callback()
         if let Some(ref logger) = self.logger {
             logger.log_request(
-                transaction_id,
+                None, // TID is embedded in real packet via packet_callback
                 request.slave_id,
                 request.function.to_u8(),
                 request.address,
@@ -695,7 +693,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         // Log response if logger is available
         if let Some(ref logger) = self.logger {
             logger.log_response(
-                transaction_id,
+                None,
                 response.slave_id,
                 response.function.to_u8(),
                 response.data(),

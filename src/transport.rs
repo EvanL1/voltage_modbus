@@ -122,11 +122,12 @@ use crc::{Crc, CRC_16_MODBUS};
 /// This module provides the transport layer abstractions and implementations
 /// for both Modbus TCP and RTU protocols.
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::info;
+use tracing::{debug, info};
 
 #[cfg(feature = "rtu")]
 use tokio_serial;
@@ -134,7 +135,57 @@ use tokio_serial;
 use crate::error::{ModbusError, ModbusResult};
 use crate::protocol::{ModbusFunction, ModbusRequest, ModbusResponse};
 
+// ============================================================================
+// Packet Callback Types - For Real Packet Logging
+// ============================================================================
+
+/// Packet direction for callback logging
+///
+/// Indicates whether a packet is being sent or received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PacketDirection {
+    /// Packet is being sent to the remote device
+    Send,
+    /// Packet is being received from the remote device
+    Receive,
+}
+
+impl PacketDirection {
+    /// Get the direction as a string for logging
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PacketDirection::Send => "SEND",
+            PacketDirection::Receive => "RECV",
+        }
+    }
+}
+
+/// Callback type for receiving real packet data
+///
+/// This callback is invoked with the actual bytes sent/received on the wire,
+/// **not** reconstructed packets. This ensures logging accuracy.
+///
+/// # Arguments
+///
+/// * `direction` - Whether the packet is being sent or received
+/// * `data` - The actual raw bytes of the packet
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use voltage_modbus::transport::{PacketCallback, PacketDirection};
+/// use std::sync::Arc;
+///
+/// let callback: PacketCallback = Arc::new(|direction, data| {
+///     let hex: String = data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+///     println!("[{}] {}", direction.as_str(), hex);
+/// });
+/// ```
+pub type PacketCallback = Arc<dyn Fn(PacketDirection, &[u8]) + Send + Sync>;
+
 /// Maximum frame size for Modbus TCP (MBAP header + PDU)
+/// Note: MBAP Length field valid range is [2, 254], validated in request()
+#[allow(dead_code)]
 const MAX_TCP_FRAME_SIZE: usize = 260;
 
 /// Modbus TCP Application Protocol header size
@@ -357,24 +408,6 @@ pub trait ModbusTransport: Send + Sync {
     /// # }
     /// ```
     fn get_stats(&self) -> TransportStats;
-
-    /// Peek at the next transaction ID that will be used (for TCP logging purposes)
-    ///
-    /// Returns the transaction ID that will be used for the next request.
-    /// This is useful for logging the actual transaction ID before sending.
-    ///
-    /// # Returns
-    ///
-    /// * `Some(u16)` - For TCP transport, returns the next transaction ID
-    /// * `None` - For RTU/ASCII transports which don't use transaction IDs
-    ///
-    /// # Note
-    ///
-    /// This method does NOT increment the transaction ID counter.
-    /// The ID is only incremented when `request()` is actually called.
-    fn peek_transaction_id(&self) -> Option<u16> {
-        None // Default implementation for transports without transaction IDs
-    }
 }
 
 /// Transport layer statistics
@@ -388,15 +421,20 @@ pub struct TransportStats {
     pub bytes_received: u64,
 }
 
-/// Modbus TCP transport implementation  
+/// Modbus TCP transport implementation
 pub struct TcpTransport {
     stream: Option<TcpStream>,
     pub address: SocketAddr,
     timeout: Duration,
     transaction_id: u16,
     stats: TransportStats,
-    /// Enable packet logging for debugging
+    /// Enable packet logging for debugging (built-in tracing)
     packet_logging: bool,
+    /// Optional callback for real packet data
+    ///
+    /// When set, this callback is invoked with the actual bytes sent/received,
+    /// enabling accurate logging without packet reconstruction.
+    packet_callback: Option<PacketCallback>,
 }
 
 impl TcpTransport {
@@ -413,6 +451,7 @@ impl TcpTransport {
             transaction_id: 1,
             stats: TransportStats::default(),
             packet_logging: false,
+            packet_callback: None,
         })
     }
 
@@ -433,12 +472,51 @@ impl TcpTransport {
             transaction_id: 1,
             stats: TransportStats::default(),
             packet_logging: enable_logging,
+            packet_callback: None,
         })
     }
 
     /// Enable or disable packet logging
     pub fn set_packet_logging(&mut self, enabled: bool) {
         self.packet_logging = enabled;
+    }
+
+    /// Set a callback for real packet data
+    ///
+    /// The callback is invoked with the actual bytes sent/received on the wire,
+    /// ensuring accurate logging. This is the recommended way to capture packets
+    /// for debugging or auditing, as it provides the exact data that was transmitted.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - The callback to invoke with packet data
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::transport::{TcpTransport, PacketCallback, PacketDirection};
+    /// use std::sync::Arc;
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> voltage_modbus::ModbusResult<()> {
+    /// let mut transport = TcpTransport::new("127.0.0.1:502".parse().unwrap(), Duration::from_secs(5)).await?;
+    ///
+    /// let callback: PacketCallback = Arc::new(|direction, data| {
+    ///     let hex: String = data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+    ///     println!("[MODBUS-TCP] {} {}", direction.as_str(), hex);
+    /// });
+    ///
+    /// transport.set_packet_callback(callback);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn set_packet_callback(&mut self, callback: PacketCallback) {
+        self.packet_callback = Some(callback);
+    }
+
+    /// Clear the packet callback
+    pub fn clear_packet_callback(&mut self) {
+        self.packet_callback = None;
     }
 
     /// Reconnect to the server
@@ -539,7 +617,7 @@ impl TcpTransport {
         }
 
         // Parse MBAP header
-        let _transaction_id = u16::from_be_bytes([frame[0], frame[1]]);
+        // Note: Transaction ID validation is done in request() before calling this method
         let _protocol_id = u16::from_be_bytes([frame[2], frame[3]]);
         let length = u16::from_be_bytes([frame[4], frame[5]]);
         let slave_id = frame[6];
@@ -590,10 +668,18 @@ impl ModbusTransport for TcpTransport {
 
         // Encode and send request
         let frame = self.encode_request(request);
+        // Save the transaction ID for later verification
+        // (encode_request updates self.transaction_id via next_transaction_id())
+        let expected_transaction_id = self.transaction_id;
         self.stats.requests_sent += 1;
         self.stats.bytes_sent += frame.len() as u64;
 
-        // Log outgoing packet
+        // Callback with REAL packet data (before sending)
+        if let Some(ref callback) = self.packet_callback {
+            callback(PacketDirection::Send, &frame);
+        }
+
+        // Log outgoing packet (built-in tracing)
         if self.packet_logging {
             log_packet("send", &frame, "TCP", Some(request.slave_id));
         }
@@ -611,57 +697,110 @@ impl ModbusTransport for TcpTransport {
             ));
         }
 
-        // Read response header first
-        let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1]; // MBAP + function code
-        let read_result = timeout(self.timeout, stream.read_exact(&mut header_buf)).await;
-
-        if read_result.is_err() || read_result.unwrap().is_err() {
-            self.stats.timeouts += 1;
-            self.stats.errors += 1;
-            self.stream = None;
-            return Err(ModbusError::timeout(
-                "read response header",
-                self.timeout.as_millis() as u64,
-            ));
-        }
-
-        // Parse length from header
-        let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
-        if length > MAX_TCP_FRAME_SIZE as u16 {
-            self.stats.errors += 1;
-            return Err(ModbusError::frame("Response frame too large"));
-        }
-
-        // Read remaining data
-        let remaining_bytes = (length as usize).saturating_sub(1); // -1 for function code already read
-        let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
-        response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
-
-        if remaining_bytes > 0 {
-            let read_result = timeout(
-                self.timeout,
-                stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
-            )
-            .await;
+        // Read response with TID validation loop
+        // When multiple clients connect to the same device, responses may be interleaved.
+        // We discard responses with mismatched TID and continue reading until we find ours.
+        let response_buf = loop {
+            // Read response header first (MBAP header + function code)
+            let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
+            let read_result = timeout(self.timeout, stream.read_exact(&mut header_buf)).await;
 
             if read_result.is_err() || read_result.unwrap().is_err() {
                 self.stats.timeouts += 1;
                 self.stats.errors += 1;
                 self.stream = None;
                 return Err(ModbusError::timeout(
-                    "read response data",
+                    "read response header",
                     self.timeout.as_millis() as u64,
                 ));
             }
-        }
+
+            // L1: Validate Length field (must be in valid range [2, 254])
+            let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
+            if !(2..=254).contains(&length) {
+                self.stats.errors += 1;
+                self.stream = None;
+                return Err(ModbusError::frame(format!(
+                    "Invalid MBAP length: {} (must be 2-254)",
+                    length
+                )));
+            }
+
+            // L2: Validate Protocol ID (must be 0 for Modbus TCP)
+            let protocol_id = u16::from_be_bytes([header_buf[2], header_buf[3]]);
+            if protocol_id != 0 {
+                self.stats.errors += 1;
+                self.stream = None;
+                return Err(ModbusError::frame(format!(
+                    "Invalid protocol ID: {:04X} (expected 0000)",
+                    protocol_id
+                )));
+            }
+
+            // L3: Read remaining data
+            let remaining_bytes = (length as usize).saturating_sub(1); // -1 for function code already read
+            let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
+            response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
+
+            if remaining_bytes > 0 {
+                let read_result = timeout(
+                    self.timeout,
+                    stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
+                )
+                .await;
+
+                if read_result.is_err() || read_result.unwrap().is_err() {
+                    self.stats.timeouts += 1;
+                    self.stats.errors += 1;
+                    self.stream = None;
+                    return Err(ModbusError::timeout(
+                        "read response data",
+                        self.timeout.as_millis() as u64,
+                    ));
+                }
+            }
+
+            self.stats.bytes_received += response_buf.len() as u64;
+
+            // Callback with REAL packet data (after receiving)
+            if let Some(ref callback) = self.packet_callback {
+                callback(PacketDirection::Receive, &response_buf);
+            }
+
+            // Log incoming packet (built-in tracing)
+            if self.packet_logging {
+                log_packet("receive", &response_buf, "TCP", Some(request.slave_id));
+            }
+
+            // L4: Validate Transaction ID
+            let actual_tid = u16::from_be_bytes([response_buf[0], response_buf[1]]);
+            if actual_tid != expected_transaction_id {
+                debug!(
+                    "Discarding mismatched response: TID={:04X}, expecting {:04X}",
+                    actual_tid,
+                    expected_transaction_id
+                );
+                // Discard this response and continue reading the next one
+                continue;
+            }
+
+            // L5: Validate Unit ID (slave ID)
+            let actual_unit_id = response_buf[6];
+            if actual_unit_id != request.slave_id {
+                debug!(
+                    "Discarding mismatched response: Unit ID={}, expecting {}",
+                    actual_unit_id,
+                    request.slave_id
+                );
+                // Discard this response and continue reading the next one
+                continue;
+            }
+
+            // All validations passed, use this response
+            break response_buf;
+        };
 
         self.stats.responses_received += 1;
-        self.stats.bytes_received += response_buf.len() as u64;
-
-        // Log incoming packet
-        if self.packet_logging {
-            log_packet("receive", &response_buf, "TCP", Some(request.slave_id));
-        }
 
         // Decode response (takes ownership of buffer for zero-copy)
         let response = self.decode_response(response_buf)?;
@@ -689,13 +828,6 @@ impl ModbusTransport for TcpTransport {
     fn get_stats(&self) -> TransportStats {
         self.stats
     }
-
-    fn peek_transaction_id(&self) -> Option<u16> {
-        // Return the next transaction ID that will be used
-        // Note: wrapping_add logic matches next_transaction_id()
-        let next = self.transaction_id.wrapping_add(1);
-        Some(if next == 0 { 1 } else { next })
-    }
 }
 
 /// Modbus RTU transport implementation
@@ -719,8 +851,13 @@ pub struct RtuTransport {
     frame_gap: Duration,
     /// Transport statistics
     stats: TransportStats,
-    /// Enable packet logging for debugging
+    /// Enable packet logging for debugging (built-in tracing)
     packet_logging: bool,
+    /// Optional callback for real packet data (including CRC)
+    ///
+    /// When set, this callback is invoked with the actual bytes sent/received,
+    /// enabling accurate logging without packet reconstruction.
+    packet_callback: Option<PacketCallback>,
 }
 
 #[cfg(feature = "rtu")]
@@ -762,6 +899,7 @@ impl RtuTransport {
             frame_gap,
             stats: TransportStats::default(),
             packet_logging: false,
+            packet_callback: None,
         };
 
         // Try to connect immediately
@@ -794,6 +932,7 @@ impl RtuTransport {
             frame_gap,
             stats: TransportStats::default(),
             packet_logging: enable_logging,
+            packet_callback: None,
         };
 
         transport.connect()?;
@@ -803,6 +942,23 @@ impl RtuTransport {
     /// Enable or disable packet logging
     pub fn set_packet_logging(&mut self, enabled: bool) {
         self.packet_logging = enabled;
+    }
+
+    /// Set a callback for real packet data
+    ///
+    /// The callback is invoked with the actual bytes sent/received on the wire,
+    /// including the CRC bytes for RTU frames. This ensures accurate logging.
+    ///
+    /// # Arguments
+    ///
+    /// * `callback` - The callback to invoke with packet data
+    pub fn set_packet_callback(&mut self, callback: PacketCallback) {
+        self.packet_callback = Some(callback);
+    }
+
+    /// Clear the packet callback
+    pub fn clear_packet_callback(&mut self) {
+        self.packet_callback = None;
     }
 
     /// Connect to the serial port
@@ -1015,7 +1171,12 @@ impl ModbusTransport for RtuTransport {
         self.stats.requests_sent += 1;
         self.stats.bytes_sent += frame.len() as u64;
 
-        // Log outgoing packet
+        // Callback with REAL packet data (before sending, includes CRC)
+        if let Some(ref callback) = self.packet_callback {
+            callback(PacketDirection::Send, &frame);
+        }
+
+        // Log outgoing packet (built-in tracing)
         if self.packet_logging {
             log_packet("send", &frame, "RTU", Some(request.slave_id));
         }
@@ -1066,7 +1227,12 @@ impl ModbusTransport for RtuTransport {
         self.stats.responses_received += 1;
         self.stats.bytes_received += response_frame.len() as u64;
 
-        // Log incoming packet
+        // Callback with REAL packet data (after receiving, includes CRC)
+        if let Some(ref callback) = self.packet_callback {
+            callback(PacketDirection::Receive, &response_frame);
+        }
+
+        // Log incoming packet (built-in tracing)
         if self.packet_logging {
             log_packet("receive", &response_frame, "RTU", Some(request.slave_id));
         }
@@ -1679,6 +1845,94 @@ mod tests {
         let result = TcpTransport::new(addr, timeout).await;
         // Don't assert success since we don't have a test server
         println!("TCP transport creation result: {:?}", result.is_ok());
+    }
+
+    #[test]
+    fn test_transaction_id_mismatch_error() {
+        // Test that TransactionIdMismatch error is created correctly
+        let error = ModbusError::transaction_id_mismatch(0x1234, 0x5678);
+
+        // Verify error type
+        assert!(matches!(
+            error,
+            ModbusError::TransactionIdMismatch {
+                expected: 0x1234,
+                actual: 0x5678
+            }
+        ));
+
+        // Verify error is recoverable (retry with fresh connection may succeed)
+        assert!(error.is_recoverable());
+
+        // Verify it's classified as a protocol error
+        assert!(error.is_protocol_error());
+
+        // Verify error message format
+        let error_msg = format!("{}", error);
+        assert!(error_msg.contains("1234"));
+        assert!(error_msg.contains("5678"));
+        assert!(error_msg.contains("Transaction ID mismatch"));
+    }
+
+    #[test]
+    fn test_tcp_transaction_id_generation() {
+        // Create a mock TCP transport to test transaction ID generation
+        let mut transport = TcpTransport {
+            stream: None,
+            address: "127.0.0.1:502".parse().unwrap(),
+            timeout: Duration::from_secs(5),
+            transaction_id: 0,
+            stats: TransportStats::default(),
+            packet_logging: false,
+            packet_callback: None,
+        };
+
+        // Test transaction ID starts at 1 (after first call)
+        let id1 = transport.next_transaction_id();
+        assert_eq!(id1, 1);
+
+        // Test transaction ID increments
+        let id2 = transport.next_transaction_id();
+        assert_eq!(id2, 2);
+
+        // Test transaction ID wraps around (skip 0)
+        transport.transaction_id = u16::MAX;
+        let id_after_wrap = transport.next_transaction_id();
+        assert_eq!(id_after_wrap, 1); // Should wrap to 1, not 0
+    }
+
+    #[test]
+    fn test_tcp_encode_request_sets_transaction_id() {
+        use crate::protocol::{ModbusFunction, ModbusRequest};
+
+        let mut transport = TcpTransport {
+            stream: None,
+            address: "127.0.0.1:502".parse().unwrap(),
+            timeout: Duration::from_secs(5),
+            transaction_id: 0,
+            stats: TransportStats::default(),
+            packet_logging: false,
+            packet_callback: None,
+        };
+
+        let request = ModbusRequest::new_read(
+            1,                                    // slave_id
+            ModbusFunction::ReadHoldingRegisters, // function
+            0,                                    // address
+            10,                                   // quantity
+        );
+
+        let frame = transport.encode_request(&request);
+
+        // Transaction ID should be in first 2 bytes (big-endian)
+        let tid_in_frame = u16::from_be_bytes([frame[0], frame[1]]);
+        assert_eq!(tid_in_frame, transport.transaction_id);
+        assert_eq!(transport.transaction_id, 1);
+
+        // Second request should have incremented transaction ID
+        let frame2 = transport.encode_request(&request);
+        let tid_in_frame2 = u16::from_be_bytes([frame2[0], frame2[1]]);
+        assert_eq!(tid_in_frame2, 2);
     }
 }
 

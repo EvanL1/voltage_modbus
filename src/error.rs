@@ -315,6 +315,19 @@ pub enum ModbusError {
     #[error("Device {slave_id} not responding")]
     DeviceNotResponding { slave_id: u8 },
 
+    /// Transaction ID mismatch in TCP response
+    ///
+    /// Occurs when the response's Transaction ID doesn't match the request's.
+    /// This can happen when multiple clients connect to the same device,
+    /// causing response confusion in the TCP buffer.
+    ///
+    /// # Examples
+    /// - Two clients polling the same Modbus device simultaneously
+    /// - TCP buffer containing mixed responses from different requests
+    /// - Device queue corruption under high load
+    #[error("Transaction ID mismatch: expected={expected:04X}, actual={actual:04X}")]
+    TransactionIdMismatch { expected: u16, actual: u16 },
+
     /// Internal errors (should not occur in normal operation)
     ///
     /// Library internal errors that indicate bugs or unexpected
@@ -549,6 +562,24 @@ impl ModbusError {
         Self::DeviceNotResponding { slave_id }
     }
 
+    /// Create a transaction ID mismatch error
+    ///
+    /// This error indicates that the response's Transaction ID doesn't match
+    /// the request's, which can occur when multiple clients connect to the
+    /// same Modbus device simultaneously, causing response confusion.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected` - Expected Transaction ID (from the sent request)
+    /// * `actual` - Actual Transaction ID (from the received response)
+    ///
+    /// # Returns
+    ///
+    /// New `ModbusError::TransactionIdMismatch` variant
+    pub fn transaction_id_mismatch(expected: u16, actual: u16) -> Self {
+        Self::TransactionIdMismatch { expected, actual }
+    }
+
     /// Create an internal error
     ///
     /// # Arguments
@@ -592,6 +623,7 @@ impl ModbusError {
             Self::Connection { .. } => true,
             Self::Timeout { .. } => true,
             Self::DeviceNotResponding { .. } => true,
+            Self::TransactionIdMismatch { .. } => true, // Retrying may succeed after reconnection
             Self::Exception { code, .. } => {
                 // Some exceptions are recoverable
                 matches!(code, 0x05 | 0x06) // Acknowledge, Busy
@@ -655,6 +687,7 @@ impl ModbusError {
                 | Self::Exception { .. }
                 | Self::Frame { .. }
                 | Self::CrcMismatch { .. }
+                | Self::TransactionIdMismatch { .. }
         )
     }
 }
