@@ -1081,6 +1081,148 @@ impl ModbusTcpClient {
     ) -> ModbusResult<ModbusResponse> {
         self.inner.execute_request(request).await
     }
+
+    /// Execute multiple requests in a pipeline (concurrent send, batch receive).
+    ///
+    /// Sends all requests over the TCP connection with a single `write_all`, then
+    /// receives all responses and reorders them to match the original request order.
+    ///
+    /// Modbus TCP's MBAP Transaction ID field makes this safe: each response carries
+    /// the TID of its request, so responses can arrive in any order.
+    ///
+    /// # Arguments
+    ///
+    /// * `requests` - List of requests to send (each must have a valid slave ID)
+    /// * `pipeline_timeout` - Total timeout for the entire pipeline operation
+    ///
+    /// # Returns
+    ///
+    /// A `Vec<ModbusResult<ModbusResponse>>` in the **same order** as `requests`.
+    /// Individual entries may be `Err` if that particular request failed, while the
+    /// others remain `Ok`.
+    ///
+    /// Returns `Err` only for fatal errors (send failure, connection loss) that
+    /// prevent *any* response from being received.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::{ModbusTcpClient, ModbusResult};
+    /// use voltage_modbus::protocol::{ModbusRequest, ModbusFunction};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> ModbusResult<()> {
+    /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+    ///
+    /// let requests = vec![
+    ///     ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 10),
+    ///     ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 100, 5),
+    ///     ModbusRequest::new_read(1, ModbusFunction::ReadInputRegisters, 0, 3),
+    /// ];
+    ///
+    /// let results = client.pipeline(requests, Duration::from_secs(5)).await?;
+    /// for (i, result) in results.iter().enumerate() {
+    ///     match result {
+    ///         Ok(response) => println!("Request {}: {} bytes", i, response.data_len()),
+    ///         Err(e) => println!("Request {}: failed - {}", i, e),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn pipeline(
+        &mut self,
+        requests: Vec<ModbusRequest>,
+        pipeline_timeout: Duration,
+    ) -> ModbusResult<Vec<ModbusResult<ModbusResponse>>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let count = requests.len();
+        let transport = self.inner.transport_mut();
+
+        // Send all frames; returns the TID assigned to each request (same order)
+        let tids = transport.send_pipeline_requests(&requests).await?;
+
+        // Receive all responses indexed by TID
+        let mut response_map = transport
+            .receive_pipeline_responses(count, pipeline_timeout)
+            .await?;
+
+        // Reorder by original request order using tids
+        let results = tids
+            .into_iter()
+            .map(|tid| {
+                response_map.remove(&tid).unwrap_or_else(|| {
+                    Err(ModbusError::timeout(
+                        "pipeline response missing",
+                        pipeline_timeout.as_millis() as u64,
+                    ))
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Convenience method: pipeline multiple FC03 (read holding registers) requests.
+    ///
+    /// Each entry in `reads` is `(address, quantity)`.  Results are returned in the
+    /// same order; each entry is `Ok(Vec<u16>)` on success or `Err` on failure.
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - Modbus slave ID (1-247)
+    /// * `reads` - Slice of `(start_address, quantity)` pairs
+    /// * `pipeline_timeout` - Total timeout for the pipeline operation
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::{ModbusTcpClient, ModbusResult};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> ModbusResult<()> {
+    /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+    ///
+    /// let results = client.pipeline_reads(1, &[(0, 10), (100, 5), (200, 3)], Duration::from_secs(5)).await?;
+    /// for (i, result) in results.iter().enumerate() {
+    ///     match result {
+    ///         Ok(regs) => println!("Segment {}: {:?}", i, regs),
+    ///         Err(e) => println!("Segment {}: error - {}", i, e),
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn pipeline_reads(
+        &mut self,
+        slave_id: SlaveId,
+        reads: &[(u16, u16)], // (address, quantity)
+        pipeline_timeout: Duration,
+    ) -> ModbusResult<Vec<ModbusResult<Vec<u16>>>> {
+        let requests: Vec<ModbusRequest> = reads
+            .iter()
+            .map(|&(address, quantity)| {
+                ModbusRequest::new_read(
+                    slave_id,
+                    ModbusFunction::ReadHoldingRegisters,
+                    address,
+                    quantity,
+                )
+            })
+            .collect();
+
+        let raw_results = self.pipeline(requests, pipeline_timeout).await?;
+
+        let results = raw_results
+            .into_iter()
+            .map(|r| r.and_then(|resp| resp.parse_registers()))
+            .collect();
+
+        Ok(results)
+    }
 }
 
 impl ModbusClient for ModbusTcpClient {
@@ -1779,6 +1921,265 @@ mod tests {
         assert_eq!(response.function, ModbusFunction::WriteSingleRegister);
         assert!(!response.is_exception());
         assert!(response.data().is_empty());
+    }
+
+    // =========================================================================
+    // Pipeline tests (using a real in-process TCP server)
+    // =========================================================================
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    /// Build a minimal Modbus TCP response frame for a FC03 (read holding registers) reply.
+    ///
+    /// `tid` must match the TID in the request so the client accepts it.
+    fn build_fc03_response_frame(tid: u16, slave_id: u8, values: &[u16]) -> Vec<u8> {
+        let byte_count = (values.len() * 2) as u8;
+        // PDU: unit_id(1) + func(1) + byte_count(1) + data(n*2)
+        let pdu_len = (2 + 1 + values.len() * 2) as u16;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&tid.to_be_bytes()); // transaction id
+        frame.extend_from_slice(&0u16.to_be_bytes()); // protocol id
+        frame.extend_from_slice(&pdu_len.to_be_bytes()); // length
+        frame.push(slave_id); // unit id
+        frame.push(0x03); // function code
+        frame.push(byte_count);
+        for &v in values {
+            frame.extend_from_slice(&v.to_be_bytes());
+        }
+        frame
+    }
+
+    /// Build a minimal Modbus TCP response frame for a FC06 (write single register) reply.
+    fn build_fc06_response_frame(tid: u16, slave_id: u8, address: u16, value: u16) -> Vec<u8> {
+        let pdu_len: u16 = 6; // unit_id(1) + func(1) + addr(2) + value(2)
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&tid.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&pdu_len.to_be_bytes());
+        frame.push(slave_id);
+        frame.push(0x06);
+        frame.extend_from_slice(&address.to_be_bytes());
+        frame.extend_from_slice(&value.to_be_bytes());
+        frame
+    }
+
+    /// Spawn a minimal single-use TCP server that reads exactly `request_count` Modbus TCP
+    /// frames, then calls `handler` with the list of (tid, function_code) pairs, and returns
+    /// whatever bytes `handler` produces.
+    async fn spawn_mock_server<H, Fut>(
+        request_count: usize,
+        handler: H,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+    where
+        H: FnOnce(Vec<(u16, u8, u8)>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Vec<u8>> + Send,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut requests_meta: Vec<(u16, u8, u8)> = Vec::new(); // (tid, slave_id, func)
+
+            for _ in 0..request_count {
+                // Read MBAP header (6 bytes)
+                let mut mbap = [0u8; 6];
+                socket.read_exact(&mut mbap).await.unwrap();
+                let tid = u16::from_be_bytes([mbap[0], mbap[1]]);
+                let length = u16::from_be_bytes([mbap[4], mbap[5]]) as usize;
+
+                // Read PDU
+                let mut pdu = vec![0u8; length];
+                socket.read_exact(&mut pdu).await.unwrap();
+                let slave_id = pdu[0];
+                let func = pdu[1];
+                requests_meta.push((tid, slave_id, func));
+            }
+
+            let response_bytes = handler(requests_meta).await;
+            socket.write_all(&response_bytes).await.unwrap();
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_empty() {
+        // Empty request list should return empty result immediately (no network needed)
+        let (server_addr, _handle) = spawn_mock_server(0, |_| async { vec![] }).await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let results = client
+            .pipeline(vec![], Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_single() {
+        // Single pipeline request should behave identically to a regular read_03 call.
+        let (server_addr, server_handle) = spawn_mock_server(1, |meta| async move {
+            let (tid, slave_id, _func) = meta[0];
+            let values: Vec<u16> = vec![1, 2, 3, 4, 5];
+            build_fc03_response_frame(tid, slave_id, &values)
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let requests = vec![ModbusRequest::new_read(
+            1,
+            ModbusFunction::ReadHoldingRegisters,
+            0,
+            5,
+        )];
+
+        let results = client
+            .pipeline(requests, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let registers = results[0].as_ref().unwrap().parse_registers().unwrap();
+        assert_eq!(registers, vec![1, 2, 3, 4, 5]);
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_basic() {
+        // 3 read requests pipelined — server replies in same order but could be any order.
+        // We reply in order here; test verifies result ordering is correct.
+        let (server_addr, server_handle) = spawn_mock_server(3, |meta| async move {
+            let mut out = Vec::new();
+            let expected_values: Vec<Vec<u16>> = vec![
+                vec![10, 11, 12],     // response for req 0
+                vec![20, 21],         // response for req 1
+                vec![30, 31, 32, 33], // response for req 2
+            ];
+            for (i, (tid, slave_id, _func)) in meta.iter().enumerate() {
+                out.extend_from_slice(&build_fc03_response_frame(
+                    *tid,
+                    *slave_id,
+                    &expected_values[i],
+                ));
+            }
+            out
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let requests = vec![
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 3),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 100, 2),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 200, 4),
+        ];
+
+        let results = client
+            .pipeline(requests, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(
+            results[0].as_ref().unwrap().parse_registers().unwrap(),
+            vec![10, 11, 12]
+        );
+        assert_eq!(
+            results[1].as_ref().unwrap().parse_registers().unwrap(),
+            vec![20, 21]
+        );
+        assert_eq!(
+            results[2].as_ref().unwrap().parse_registers().unwrap(),
+            vec![30, 31, 32, 33]
+        );
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_mixed() {
+        // Mix of read (FC03) and write (FC06) requests
+        let (server_addr, server_handle) = spawn_mock_server(2, |meta| async move {
+            let mut out = Vec::new();
+            // First request: FC03 read
+            let (tid0, slave0, _) = meta[0];
+            out.extend_from_slice(&build_fc03_response_frame(tid0, slave0, &[42, 43]));
+            // Second request: FC06 write — echo back address + value
+            let (tid1, slave1, _) = meta[1];
+            out.extend_from_slice(&build_fc06_response_frame(tid1, slave1, 200, 0x1234));
+            out
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let requests = vec![
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2),
+            ModbusRequest::new_write(
+                1,
+                ModbusFunction::WriteSingleRegister,
+                200,
+                vec![0x12, 0x34],
+            ),
+        ];
+
+        let results = client
+            .pipeline(requests, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // FC03 response
+        assert_eq!(
+            results[0].as_ref().unwrap().parse_registers().unwrap(),
+            vec![42, 43]
+        );
+        // FC06 response succeeds
+        assert!(results[1].is_ok());
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_reads_convenience() {
+        // Test the pipeline_reads convenience method
+        let (server_addr, server_handle) = spawn_mock_server(2, |meta| async move {
+            let mut out = Vec::new();
+            let data = vec![vec![1u16, 2, 3], vec![4u16, 5]];
+            for (i, (tid, slave_id, _)) in meta.iter().enumerate() {
+                out.extend_from_slice(&build_fc03_response_frame(*tid, *slave_id, &data[i]));
+            }
+            out
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let results = client
+            .pipeline_reads(1, &[(0, 3), (100, 2)], Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].as_ref().unwrap(), &[1, 2, 3]);
+        assert_eq!(results[1].as_ref().unwrap(), &[4, 5]);
+
+        server_handle.await.unwrap();
     }
 }
 

@@ -654,6 +654,270 @@ impl TcpTransport {
             frame, slave_id, function, data_start, data_len,
         ))
     }
+
+    /// Encode a request and assign a specific transaction ID (without auto-incrementing).
+    ///
+    /// Returns `(frame_bytes, transaction_id)`.  The transaction ID is assigned by the
+    /// caller so that we can track which response belongs to which request in pipelining.
+    fn encode_request_with_tid(&self, request: &ModbusRequest, tid: u16) -> Vec<u8> {
+        let protocol_id = 0u16;
+
+        let pdu_length = 1
+            + 1
+            + match request.function {
+                ModbusFunction::ReadCoils
+                | ModbusFunction::ReadDiscreteInputs
+                | ModbusFunction::ReadHoldingRegisters
+                | ModbusFunction::ReadInputRegisters => 4,
+
+                ModbusFunction::WriteSingleCoil | ModbusFunction::WriteSingleRegister => 4,
+
+                ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
+                    5 + request.data.len()
+                }
+            };
+
+        let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + pdu_length);
+
+        frame.extend_from_slice(&tid.to_be_bytes());
+        frame.extend_from_slice(&protocol_id.to_be_bytes());
+        frame.extend_from_slice(&(pdu_length as u16).to_be_bytes());
+
+        frame.push(request.slave_id);
+        frame.push(request.function.to_u8());
+        frame.extend_from_slice(&request.address.to_be_bytes());
+
+        match request.function {
+            ModbusFunction::ReadCoils
+            | ModbusFunction::ReadDiscreteInputs
+            | ModbusFunction::ReadHoldingRegisters
+            | ModbusFunction::ReadInputRegisters => {
+                frame.extend_from_slice(&request.quantity.to_be_bytes());
+            }
+            ModbusFunction::WriteSingleCoil => {
+                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
+                    0xFF00
+                } else {
+                    0x0000
+                };
+                frame.extend_from_slice(&value.to_be_bytes());
+            }
+            ModbusFunction::WriteSingleRegister => {
+                if request.data.len() >= 2 {
+                    frame.extend_from_slice(&request.data[0..2]);
+                } else {
+                    frame.extend_from_slice(&[0, 0]);
+                }
+            }
+            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
+                frame.extend_from_slice(&request.quantity.to_be_bytes());
+                frame.push(request.data.len() as u8);
+                frame.extend_from_slice(&request.data);
+            }
+        }
+
+        frame
+    }
+
+    /// Send multiple requests in a pipeline.
+    ///
+    /// Encodes all requests, assigns consecutive Transaction IDs, concatenates
+    /// the frames and sends them in a single `write_all` call.
+    ///
+    /// Returns the list of assigned Transaction IDs (same order as `requests`).
+    pub async fn send_pipeline_requests(
+        &mut self,
+        requests: &[ModbusRequest],
+    ) -> ModbusResult<Vec<u16>> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Ensure connection is established
+        if self.stream.is_none() {
+            self.reconnect().await?;
+        }
+
+        // Assign TIDs and encode all frames
+        let mut tids = Vec::with_capacity(requests.len());
+        let mut combined = Vec::new();
+
+        for request in requests {
+            request.validate()?;
+            let tid = self.next_transaction_id();
+            let frame = self.encode_request_with_tid(request, tid);
+
+            if self.packet_logging {
+                log_packet("send", &frame, "TCP", Some(request.slave_id));
+            }
+            if let Some(ref callback) = self.packet_callback {
+                callback(PacketDirection::Send, &frame);
+            }
+
+            self.stats.bytes_sent += frame.len() as u64;
+            self.stats.requests_sent += 1;
+
+            tids.push(tid);
+            combined.extend_from_slice(&frame);
+        }
+
+        // Send all frames in one syscall
+        let stream = self.stream.as_mut().unwrap();
+        let send_result = timeout(self.timeout, stream.write_all(&combined)).await;
+        if send_result.is_err() || send_result.unwrap().is_err() {
+            self.stats.timeouts += 1;
+            self.stats.errors += 1;
+            self.stream = None;
+            return Err(ModbusError::timeout(
+                "pipeline send",
+                self.timeout.as_millis() as u64,
+            ));
+        }
+
+        Ok(tids)
+    }
+
+    /// Receive `count` pipeline responses and map them by Transaction ID.
+    ///
+    /// Reads exactly `count` frames from the socket and returns a
+    /// `HashMap<tid, ModbusResponse>`.  The overall operation is bounded by
+    /// `pipeline_timeout`.
+    pub async fn receive_pipeline_responses(
+        &mut self,
+        count: usize,
+        pipeline_timeout: Duration,
+    ) -> ModbusResult<std::collections::HashMap<u16, ModbusResult<ModbusResponse>>> {
+        use std::collections::HashMap;
+
+        if count == 0 {
+            return Ok(HashMap::new());
+        }
+
+        // Take stream ownership to allow borrow-checker to split field access cleanly.
+        let mut stream = self
+            .stream
+            .take()
+            .ok_or_else(|| ModbusError::connection("Pipeline receive: not connected"))?;
+
+        let deadline = tokio::time::Instant::now() + pipeline_timeout;
+        // Collect raw frames first; defer decode until after stream is returned.
+        let mut raw_frames: Vec<Vec<u8>> = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // Return stream so connection is marked broken via None
+                drop(stream);
+                self.stats.timeouts += 1;
+                self.stats.errors += 1;
+                return Err(ModbusError::timeout(
+                    "pipeline receive",
+                    pipeline_timeout.as_millis() as u64,
+                ));
+            }
+
+            // Read MBAP header + function code byte (7 bytes total)
+            let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
+            let read_result = timeout(remaining, stream.read_exact(&mut header_buf)).await;
+            if read_result.is_err() || read_result.unwrap().is_err() {
+                drop(stream);
+                self.stats.timeouts += 1;
+                self.stats.errors += 1;
+                return Err(ModbusError::timeout(
+                    "pipeline receive header",
+                    pipeline_timeout.as_millis() as u64,
+                ));
+            }
+
+            // Validate MBAP length field
+            let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
+            if !(2..=254).contains(&length) {
+                drop(stream);
+                self.stats.errors += 1;
+                return Err(ModbusError::frame(format!(
+                    "Pipeline: invalid MBAP length: {} (must be 2-254)",
+                    length
+                )));
+            }
+
+            // Validate Protocol ID
+            let protocol_id = u16::from_be_bytes([header_buf[2], header_buf[3]]);
+            if protocol_id != 0 {
+                drop(stream);
+                self.stats.errors += 1;
+                return Err(ModbusError::frame(format!(
+                    "Pipeline: invalid protocol ID: {:04X}",
+                    protocol_id
+                )));
+            }
+
+            // Read remaining bytes
+            let remaining_bytes = (length as usize).saturating_sub(1);
+            let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
+            response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
+
+            if remaining_bytes > 0 {
+                let remaining_time =
+                    deadline.saturating_duration_since(tokio::time::Instant::now());
+                let read_result = timeout(
+                    remaining_time,
+                    stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
+                )
+                .await;
+
+                if read_result.is_err() || read_result.unwrap().is_err() {
+                    drop(stream);
+                    self.stats.timeouts += 1;
+                    self.stats.errors += 1;
+                    return Err(ModbusError::timeout(
+                        "pipeline receive data",
+                        pipeline_timeout.as_millis() as u64,
+                    ));
+                }
+            }
+
+            raw_frames.push(response_buf);
+        }
+
+        // All frames received — put stream back before decoding
+        self.stream = Some(stream);
+
+        // Decode frames and build response map
+        let mut map: HashMap<u16, ModbusResult<ModbusResponse>> = HashMap::with_capacity(count);
+
+        for response_buf in raw_frames {
+            self.stats.bytes_received += response_buf.len() as u64;
+
+            if let Some(ref callback) = self.packet_callback {
+                callback(PacketDirection::Receive, &response_buf);
+            }
+            if self.packet_logging {
+                log_packet("receive", &response_buf, "TCP", None);
+            }
+
+            let tid = u16::from_be_bytes([response_buf[0], response_buf[1]]);
+            let decode_result = self.decode_response(response_buf);
+
+            let entry = match decode_result {
+                Ok(response) => {
+                    if let Some(err) = response.get_exception() {
+                        self.stats.errors += 1;
+                        Err(err)
+                    } else {
+                        self.stats.responses_received += 1;
+                        Ok(response)
+                    }
+                }
+                Err(e) => {
+                    self.stats.errors += 1;
+                    Err(e)
+                }
+            };
+            map.insert(tid, entry);
+        }
+
+        Ok(map)
+    }
 }
 
 impl ModbusTransport for TcpTransport {
