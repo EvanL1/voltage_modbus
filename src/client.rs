@@ -736,8 +736,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         // Use parse_bits() which correctly skips byte_count prefix
-        let bits = response.parse_bits()?;
-        Ok(bits.into_iter().take(quantity as usize).collect())
+        let mut bits = response.parse_bits()?;
+        bits.truncate(quantity as usize);
+        Ok(bits)
     }
 
     async fn read_02(
@@ -760,8 +761,9 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
         let response = self.execute_request(request).await?;
         // Use parse_bits() which correctly skips byte_count prefix
-        let bits = response.parse_bits()?;
-        Ok(bits.into_iter().take(quantity as usize).collect())
+        let mut bits = response.parse_bits()?;
+        bits.truncate(quantity as usize);
+        Ok(bits)
     }
 
     async fn read_03(
@@ -811,15 +813,16 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
     }
 
     async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
-        let mut data = vec![];
-        data.extend_from_slice(&if value { [0xFF, 0x00] } else { [0x00, 0x00] });
-
         let request = ModbusRequest {
             slave_id,
             function: ModbusFunction::WriteSingleCoil,
             address,
             quantity: 1,
-            data,
+            data: if value {
+                vec![0xFF, 0x00]
+            } else {
+                vec![0x00, 0x00]
+            },
         };
 
         self.execute_request(request).await?;
@@ -827,12 +830,13 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
     }
 
     async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
+        let [hi, lo] = value.to_be_bytes();
         let request = ModbusRequest {
             slave_id,
             function: ModbusFunction::WriteSingleRegister,
             address,
             quantity: 1,
-            data: value.to_be_bytes().to_vec(),
+            data: vec![hi, lo],
         };
 
         self.execute_request(request).await?;

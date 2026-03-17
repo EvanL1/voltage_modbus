@@ -428,6 +428,8 @@ pub struct TcpTransport {
     timeout: Duration,
     transaction_id: u16,
     stats: TransportStats,
+    /// Persistent read buffer — reused across requests to avoid per-response heap allocation
+    read_buf: Box<[u8; 512]>,
     /// Enable packet logging for debugging (built-in tracing)
     packet_logging: bool,
     /// Optional callback for real packet data
@@ -443,6 +445,9 @@ impl TcpTransport {
         let stream = TcpStream::connect(address).await.map_err(|e| {
             ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
         })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
         Ok(Self {
             stream: Some(stream),
@@ -450,6 +455,7 @@ impl TcpTransport {
             timeout,
             transaction_id: 1,
             stats: TransportStats::default(),
+            read_buf: Box::new([0u8; 512]),
             packet_logging: false,
             packet_callback: None,
         })
@@ -464,6 +470,9 @@ impl TcpTransport {
         let stream = TcpStream::connect(address).await.map_err(|e| {
             ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
         })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
 
         Ok(Self {
             stream: Some(stream),
@@ -471,6 +480,7 @@ impl TcpTransport {
             timeout,
             transaction_id: 1,
             stats: TransportStats::default(),
+            read_buf: Box::new([0u8; 512]),
             packet_logging: enable_logging,
             packet_callback: None,
         })
@@ -526,6 +536,9 @@ impl TcpTransport {
         let stream = TcpStream::connect(self.address).await.map_err(|e| {
             ModbusError::connection(format!("Failed to reconnect to {}: {}", self.address, e))
         })?;
+        stream.set_nodelay(true).map_err(|e| {
+            ModbusError::connection(format!("Failed to set TCP_NODELAY on reconnect: {}", e))
+        })?;
 
         self.stream = Some(stream);
         Ok(())
@@ -541,7 +554,11 @@ impl TcpTransport {
     }
 
     /// Encode request to TCP frame
-    fn encode_request(&mut self, request: &ModbusRequest) -> Vec<u8> {
+    ///
+    /// Returns a stack-allocated buffer and the number of valid bytes.
+    /// Modbus TCP frames are at most 260 bytes (MBAP 6 + PDU max 254),
+    /// so [u8; 260] on the stack is always sufficient.
+    fn encode_request(&mut self, request: &ModbusRequest) -> ([u8; MAX_TCP_FRAME_SIZE], usize) {
         let transaction_id = self.next_transaction_id();
         let protocol_id = 0u16; // Always 0 for Modbus
 
@@ -561,24 +578,42 @@ impl TcpTransport {
                 } // address (2) + quantity (2) + byte_count (1) + data
             };
 
-        let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + pdu_length);
+        let mut frame = [0u8; MAX_TCP_FRAME_SIZE];
+        let mut pos = 0usize;
 
         // MBAP Header: Transaction ID (2) + Protocol ID (2) + Length (2)
-        frame.extend_from_slice(&transaction_id.to_be_bytes());
-        frame.extend_from_slice(&protocol_id.to_be_bytes());
-        frame.extend_from_slice(&(pdu_length as u16).to_be_bytes()); // PDU length without MBAP header
+        let tid_bytes = transaction_id.to_be_bytes();
+        frame[pos] = tid_bytes[0];
+        frame[pos + 1] = tid_bytes[1];
+        pos += 2;
+        let pid_bytes = protocol_id.to_be_bytes();
+        frame[pos] = pid_bytes[0];
+        frame[pos + 1] = pid_bytes[1];
+        pos += 2;
+        let len_bytes = (pdu_length as u16).to_be_bytes();
+        frame[pos] = len_bytes[0];
+        frame[pos + 1] = len_bytes[1];
+        pos += 2;
 
         // PDU: Unit ID + Function Code + Data
-        frame.push(request.slave_id);
-        frame.push(request.function.to_u8());
-        frame.extend_from_slice(&request.address.to_be_bytes());
+        frame[pos] = request.slave_id;
+        pos += 1;
+        frame[pos] = request.function.to_u8();
+        pos += 1;
+        let addr_bytes = request.address.to_be_bytes();
+        frame[pos] = addr_bytes[0];
+        frame[pos + 1] = addr_bytes[1];
+        pos += 2;
 
         match request.function {
             ModbusFunction::ReadCoils
             | ModbusFunction::ReadDiscreteInputs
             | ModbusFunction::ReadHoldingRegisters
             | ModbusFunction::ReadInputRegisters => {
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
+                let qty_bytes = request.quantity.to_be_bytes();
+                frame[pos] = qty_bytes[0];
+                frame[pos + 1] = qty_bytes[1];
+                pos += 2;
             }
 
             ModbusFunction::WriteSingleCoil => {
@@ -587,25 +622,37 @@ impl TcpTransport {
                 } else {
                     0x0000
                 };
-                frame.extend_from_slice(&value.to_be_bytes());
+                let val_bytes = value.to_be_bytes();
+                frame[pos] = val_bytes[0];
+                frame[pos + 1] = val_bytes[1];
+                pos += 2;
             }
 
             ModbusFunction::WriteSingleRegister => {
                 if request.data.len() >= 2 {
-                    frame.extend_from_slice(&request.data[0..2]);
+                    frame[pos] = request.data[0];
+                    frame[pos + 1] = request.data[1];
                 } else {
-                    frame.extend_from_slice(&[0, 0]);
+                    frame[pos] = 0;
+                    frame[pos + 1] = 0;
                 }
+                pos += 2;
             }
 
             ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(request.data.len() as u8);
-                frame.extend_from_slice(&request.data);
+                let qty_bytes = request.quantity.to_be_bytes();
+                frame[pos] = qty_bytes[0];
+                frame[pos + 1] = qty_bytes[1];
+                pos += 2;
+                frame[pos] = request.data.len() as u8;
+                pos += 1;
+                let data_len = request.data.len();
+                frame[pos..pos + data_len].copy_from_slice(&request.data);
+                pos += data_len;
             }
         }
 
-        frame
+        (frame, pos)
     }
 
     /// Decode response from TCP frame (zero-copy)
@@ -930,27 +977,28 @@ impl ModbusTransport for TcpTransport {
             self.reconnect().await?;
         }
 
-        // Encode and send request
-        let frame = self.encode_request(request);
+        // Encode request into stack-allocated frame (zero heap allocation)
+        let (frame_buf, frame_len) = self.encode_request(request);
+        let frame = &frame_buf[..frame_len];
         // Save the transaction ID for later verification
         // (encode_request updates self.transaction_id via next_transaction_id())
         let expected_transaction_id = self.transaction_id;
         self.stats.requests_sent += 1;
-        self.stats.bytes_sent += frame.len() as u64;
+        self.stats.bytes_sent += frame_len as u64;
 
         // Callback with REAL packet data (before sending)
         if let Some(ref callback) = self.packet_callback {
-            callback(PacketDirection::Send, &frame);
+            callback(PacketDirection::Send, frame);
         }
 
         // Log outgoing packet (built-in tracing)
         if self.packet_logging {
-            log_packet("send", &frame, "TCP", Some(request.slave_id));
+            log_packet("send", frame, "TCP", Some(request.slave_id));
         }
 
         let stream = self.stream.as_mut().unwrap();
 
-        let send_result = timeout(self.timeout, stream.write_all(&frame)).await;
+        let send_result = timeout(self.timeout, stream.write_all(frame)).await;
         if send_result.is_err() || send_result.unwrap().is_err() {
             self.stats.timeouts += 1;
             self.stats.errors += 1;
@@ -971,10 +1019,16 @@ impl ModbusTransport for TcpTransport {
         // Read response with TID validation loop
         // When multiple clients connect to the same device, responses may be interleaved.
         // We discard responses with mismatched TID and continue reading until we find ours.
+        //
+        // Use persistent read_buf to avoid per-request heap allocation.
+        // The final validated response is copied into a response-sized Vec for decode_response.
         let response_buf = loop {
-            // Read response header first (MBAP header + function code)
-            let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
-            let read_result = timeout(self.timeout, stream.read_exact(&mut header_buf)).await;
+            // Read response header first (MBAP header + function code) into persistent buf
+            let read_result = timeout(
+                self.timeout,
+                stream.read_exact(&mut self.read_buf[..MBAP_HEADER_SIZE + 1]),
+            )
+            .await;
 
             if read_result.is_err() || read_result.unwrap().is_err() {
                 self.stats.timeouts += 1;
@@ -987,7 +1041,7 @@ impl ModbusTransport for TcpTransport {
             }
 
             // L1: Validate Length field (must be in valid range [2, 254])
-            let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
+            let length = u16::from_be_bytes([self.read_buf[4], self.read_buf[5]]);
             if !(2..=254).contains(&length) {
                 self.stats.errors += 1;
                 self.stream = None;
@@ -998,7 +1052,7 @@ impl ModbusTransport for TcpTransport {
             }
 
             // L2: Validate Protocol ID (must be 0 for Modbus TCP)
-            let protocol_id = u16::from_be_bytes([header_buf[2], header_buf[3]]);
+            let protocol_id = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]);
             if protocol_id != 0 {
                 self.stats.errors += 1;
                 self.stream = None;
@@ -1008,15 +1062,14 @@ impl ModbusTransport for TcpTransport {
                 )));
             }
 
-            // L3: Read remaining data
+            // L3: Read remaining data into persistent buf
             let remaining_bytes = (length as usize).saturating_sub(1); // -1 for function code already read
-            let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
-            response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
+            let total_len = MBAP_HEADER_SIZE + 1 + remaining_bytes;
 
             if remaining_bytes > 0 {
                 let read_result = timeout(
                     self.timeout,
-                    stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
+                    stream.read_exact(&mut self.read_buf[MBAP_HEADER_SIZE + 1..total_len]),
                 )
                 .await;
 
@@ -1031,20 +1084,25 @@ impl ModbusTransport for TcpTransport {
                 }
             }
 
-            self.stats.bytes_received += response_buf.len() as u64;
+            self.stats.bytes_received += total_len as u64;
 
             // Callback with REAL packet data (after receiving)
             if let Some(ref callback) = self.packet_callback {
-                callback(PacketDirection::Receive, &response_buf);
+                callback(PacketDirection::Receive, &self.read_buf[..total_len]);
             }
 
             // Log incoming packet (built-in tracing)
             if self.packet_logging {
-                log_packet("receive", &response_buf, "TCP", Some(request.slave_id));
+                log_packet(
+                    "receive",
+                    &self.read_buf[..total_len],
+                    "TCP",
+                    Some(request.slave_id),
+                );
             }
 
             // L4: Validate Transaction ID
-            let actual_tid = u16::from_be_bytes([response_buf[0], response_buf[1]]);
+            let actual_tid = u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]);
             if actual_tid != expected_transaction_id {
                 debug!(
                     "Discarding mismatched response: TID={:04X}, expecting {:04X}",
@@ -1055,7 +1113,7 @@ impl ModbusTransport for TcpTransport {
             }
 
             // L5: Validate Unit ID (slave ID)
-            let actual_unit_id = response_buf[6];
+            let actual_unit_id = self.read_buf[6];
             if actual_unit_id != request.slave_id {
                 debug!(
                     "Discarding mismatched response: Unit ID={}, expecting {}",
@@ -1065,8 +1123,8 @@ impl ModbusTransport for TcpTransport {
                 continue;
             }
 
-            // All validations passed, use this response
-            break response_buf;
+            // All validations passed — copy to response-sized Vec for decode_response
+            break self.read_buf[..total_len].to_vec();
         };
 
         self.stats.responses_received += 1;
@@ -1257,7 +1315,7 @@ impl RtuTransport {
 
     /// Encode request to RTU frame
     fn encode_request(&self, request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
-        let mut frame = Vec::new();
+        let mut frame = Vec::with_capacity(256);
 
         // Slave ID
         frame.push(request.slave_id);
@@ -2159,6 +2217,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             transaction_id: 0,
             stats: TransportStats::default(),
+            read_buf: Box::new([0u8; 512]),
             packet_logging: false,
             packet_callback: None,
         };
@@ -2187,6 +2246,7 @@ mod tests {
             timeout: Duration::from_secs(5),
             transaction_id: 0,
             stats: TransportStats::default(),
+            read_buf: Box::new([0u8; 512]),
             packet_logging: false,
             packet_callback: None,
         };
@@ -2198,15 +2258,16 @@ mod tests {
             10,                                   // quantity
         );
 
-        let frame = transport.encode_request(&request);
+        let (frame, frame_len) = transport.encode_request(&request);
 
         // Transaction ID should be in first 2 bytes (big-endian)
         let tid_in_frame = u16::from_be_bytes([frame[0], frame[1]]);
         assert_eq!(tid_in_frame, transport.transaction_id);
         assert_eq!(transport.transaction_id, 1);
+        assert!(frame_len > 0);
 
         // Second request should have incremented transaction ID
-        let frame2 = transport.encode_request(&request);
+        let (frame2, _) = transport.encode_request(&request);
         let tid_in_frame2 = u16::from_be_bytes([frame2[0], frame2[1]]);
         assert_eq!(tid_in_frame2, 2);
     }

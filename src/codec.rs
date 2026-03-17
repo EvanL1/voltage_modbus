@@ -60,113 +60,141 @@ pub fn decode_register_value(
     bit_position: u8,
     byte_order: ByteOrder,
 ) -> ModbusResult<ModbusValue> {
-    match data_type.to_lowercase().as_str() {
-        "bool" | "boolean" | "coil" => {
-            if registers.is_empty() {
-                return Err(ModbusError::InvalidData {
-                    message: "No registers for bool".to_string(),
-                });
-            }
-
-            if bit_position > 15 {
-                return Err(ModbusError::InvalidData {
-                    message: format!("Invalid bit position: {} (must be 0-15)", bit_position),
-                });
-            }
-
-            let value = registers[0];
-            let bit_value = (value >> bit_position) & 0x01;
-            Ok(ModbusValue::Bool(bit_value != 0))
+    let dt = data_type;
+    if dt.eq_ignore_ascii_case("bool")
+        || dt.eq_ignore_ascii_case("boolean")
+        || dt.eq_ignore_ascii_case("coil")
+    {
+        if registers.is_empty() {
+            return Err(ModbusError::InvalidData {
+                message: "No registers for bool".to_string(),
+            });
         }
 
-        "uint16" | "u16" | "word" => {
-            if registers.is_empty() {
-                return Err(ModbusError::InvalidData {
-                    message: "No registers for uint16".to_string(),
-                });
-            }
-            Ok(ModbusValue::U16(registers[0]))
+        if bit_position > 15 {
+            return Err(ModbusError::InvalidData {
+                message: format!("Invalid bit position: {} (must be 0-15)", bit_position),
+            });
         }
 
-        "int16" | "i16" | "short" => {
-            if registers.is_empty() {
-                return Err(ModbusError::InvalidData {
-                    message: "No registers for int16".to_string(),
-                });
-            }
-            Ok(ModbusValue::I16(registers[0] as i16))
-        }
-
-        "uint32" | "u32" | "dword" => {
-            if registers.len() < 2 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for uint32".to_string(),
-                });
-            }
-            let regs: [u16; 2] = [registers[0], registers[1]];
-            let bytes = regs_to_bytes_4(&regs, byte_order);
-            Ok(ModbusValue::U32(u32::from_be_bytes(bytes)))
-        }
-
-        "int32" | "i32" | "long" => {
-            if registers.len() < 2 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for int32".to_string(),
-                });
-            }
-            let regs: [u16; 2] = [registers[0], registers[1]];
-            let bytes = regs_to_bytes_4(&regs, byte_order);
-            Ok(ModbusValue::I32(i32::from_be_bytes(bytes)))
-        }
-
-        "float32" | "f32" | "float" | "real" => {
-            if registers.len() < 2 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for float32".to_string(),
-                });
-            }
-            let regs: [u16; 2] = [registers[0], registers[1]];
-            let bytes = regs_to_bytes_4(&regs, byte_order);
-            Ok(ModbusValue::F32(f32::from_be_bytes(bytes)))
-        }
-
-        "uint64" | "u64" | "qword" => {
-            if registers.len() < 4 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for uint64".to_string(),
-                });
-            }
-            let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
-            let bytes = regs_to_bytes_8(&regs, byte_order);
-            Ok(ModbusValue::U64(u64::from_be_bytes(bytes)))
-        }
-
-        "int64" | "i64" | "longlong" => {
-            if registers.len() < 4 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for int64".to_string(),
-                });
-            }
-            let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
-            let bytes = regs_to_bytes_8(&regs, byte_order);
-            Ok(ModbusValue::I64(i64::from_be_bytes(bytes)))
-        }
-
-        "float64" | "f64" | "double" | "lreal" => {
-            if registers.len() < 4 {
-                return Err(ModbusError::InvalidData {
-                    message: "Not enough registers for float64".to_string(),
-                });
-            }
-            let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
-            let bytes = regs_to_bytes_8(&regs, byte_order);
-            Ok(ModbusValue::F64(f64::from_be_bytes(bytes)))
-        }
-
-        _ => Err(ModbusError::InvalidData {
-            message: format!("Unsupported data type: {}", data_type),
-        }),
+        let value = registers[0];
+        let bit_value = (value >> bit_position) & 0x01;
+        return Ok(ModbusValue::Bool(bit_value != 0));
     }
+
+    if dt.eq_ignore_ascii_case("uint16")
+        || dt.eq_ignore_ascii_case("u16")
+        || dt.eq_ignore_ascii_case("word")
+    {
+        if registers.is_empty() {
+            return Err(ModbusError::InvalidData {
+                message: "No registers for uint16".to_string(),
+            });
+        }
+        return Ok(ModbusValue::U16(registers[0]));
+    }
+
+    if dt.eq_ignore_ascii_case("int16")
+        || dt.eq_ignore_ascii_case("i16")
+        || dt.eq_ignore_ascii_case("short")
+    {
+        if registers.is_empty() {
+            return Err(ModbusError::InvalidData {
+                message: "No registers for int16".to_string(),
+            });
+        }
+        return Ok(ModbusValue::I16(registers[0] as i16));
+    }
+
+    if dt.eq_ignore_ascii_case("uint32")
+        || dt.eq_ignore_ascii_case("u32")
+        || dt.eq_ignore_ascii_case("dword")
+    {
+        if registers.len() < 2 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for uint32".to_string(),
+            });
+        }
+        let regs: [u16; 2] = [registers[0], registers[1]];
+        let bytes = regs_to_bytes_4(&regs, byte_order);
+        return Ok(ModbusValue::U32(u32::from_be_bytes(bytes)));
+    }
+
+    if dt.eq_ignore_ascii_case("int32")
+        || dt.eq_ignore_ascii_case("i32")
+        || dt.eq_ignore_ascii_case("long")
+    {
+        if registers.len() < 2 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for int32".to_string(),
+            });
+        }
+        let regs: [u16; 2] = [registers[0], registers[1]];
+        let bytes = regs_to_bytes_4(&regs, byte_order);
+        return Ok(ModbusValue::I32(i32::from_be_bytes(bytes)));
+    }
+
+    if dt.eq_ignore_ascii_case("float32")
+        || dt.eq_ignore_ascii_case("f32")
+        || dt.eq_ignore_ascii_case("float")
+        || dt.eq_ignore_ascii_case("real")
+    {
+        if registers.len() < 2 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for float32".to_string(),
+            });
+        }
+        let regs: [u16; 2] = [registers[0], registers[1]];
+        let bytes = regs_to_bytes_4(&regs, byte_order);
+        return Ok(ModbusValue::F32(f32::from_be_bytes(bytes)));
+    }
+
+    if dt.eq_ignore_ascii_case("uint64")
+        || dt.eq_ignore_ascii_case("u64")
+        || dt.eq_ignore_ascii_case("qword")
+    {
+        if registers.len() < 4 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for uint64".to_string(),
+            });
+        }
+        let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
+        let bytes = regs_to_bytes_8(&regs, byte_order);
+        return Ok(ModbusValue::U64(u64::from_be_bytes(bytes)));
+    }
+
+    if dt.eq_ignore_ascii_case("int64")
+        || dt.eq_ignore_ascii_case("i64")
+        || dt.eq_ignore_ascii_case("longlong")
+    {
+        if registers.len() < 4 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for int64".to_string(),
+            });
+        }
+        let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
+        let bytes = regs_to_bytes_8(&regs, byte_order);
+        return Ok(ModbusValue::I64(i64::from_be_bytes(bytes)));
+    }
+
+    if dt.eq_ignore_ascii_case("float64")
+        || dt.eq_ignore_ascii_case("f64")
+        || dt.eq_ignore_ascii_case("double")
+        || dt.eq_ignore_ascii_case("lreal")
+    {
+        if registers.len() < 4 {
+            return Err(ModbusError::InvalidData {
+                message: "Not enough registers for float64".to_string(),
+            });
+        }
+        let regs: [u16; 4] = [registers[0], registers[1], registers[2], registers[3]];
+        let bytes = regs_to_bytes_8(&regs, byte_order);
+        return Ok(ModbusValue::F64(f64::from_be_bytes(bytes)));
+    }
+
+    Err(ModbusError::InvalidData {
+        message: format!("Unsupported data type: {}", data_type),
+    })
 }
 
 /// Clamp a value to the valid range for a given Modbus data type.
@@ -181,20 +209,28 @@ pub fn decode_register_value(
 /// # Returns
 /// The clamped value, or the original value if the type is unknown/boolean
 pub fn clamp_to_data_type(value: f64, data_type: &str) -> f64 {
-    let (min, max): (f64, f64) = match data_type.to_lowercase().as_str() {
-        "uint16" | "u16" => (0.0, 65535.0),
-        "int16" | "i16" => (-32768.0, 32767.0),
-        "uint32" | "u32" => (0.0, 4294967295.0),
-        "int32" | "i32" => (-2147483648.0, 2147483647.0),
-        "uint64" | "u64" => (0.0, u64::MAX as f64),
-        "int64" | "i64" => (i64::MIN as f64, i64::MAX as f64),
-        "float32" | "f32" => (f32::MIN as f64, f32::MAX as f64),
-        "float64" | "f64" => (f64::MIN, f64::MAX),
-        // Boolean types don't need range clamping
-        "bool" | "boolean" | "coil" => return value,
-        // Unknown type - return as-is
-        _ => return value,
-    };
+    let dt = data_type;
+    let (min, max): (f64, f64) =
+        if dt.eq_ignore_ascii_case("uint16") || dt.eq_ignore_ascii_case("u16") {
+            (0.0, 65535.0)
+        } else if dt.eq_ignore_ascii_case("int16") || dt.eq_ignore_ascii_case("i16") {
+            (-32768.0, 32767.0)
+        } else if dt.eq_ignore_ascii_case("uint32") || dt.eq_ignore_ascii_case("u32") {
+            (0.0, 4294967295.0)
+        } else if dt.eq_ignore_ascii_case("int32") || dt.eq_ignore_ascii_case("i32") {
+            (-2147483648.0, 2147483647.0)
+        } else if dt.eq_ignore_ascii_case("uint64") || dt.eq_ignore_ascii_case("u64") {
+            (0.0, u64::MAX as f64)
+        } else if dt.eq_ignore_ascii_case("int64") || dt.eq_ignore_ascii_case("i64") {
+            (i64::MIN as f64, i64::MAX as f64)
+        } else if dt.eq_ignore_ascii_case("float32") || dt.eq_ignore_ascii_case("f32") {
+            (f32::MIN as f64, f32::MAX as f64)
+        } else if dt.eq_ignore_ascii_case("float64") || dt.eq_ignore_ascii_case("f64") {
+            (f64::MIN, f64::MAX)
+        } else {
+            // Boolean types and unknown types — return as-is
+            return value;
+        };
 
     value.clamp(min, max)
 }
@@ -338,39 +374,74 @@ pub fn encode_f64_as_type(
     byte_order: ByteOrder,
 ) -> ModbusResult<Vec<u16>> {
     let clamped = clamp_to_data_type(value, data_type);
+    let dt = data_type;
 
-    match data_type.to_lowercase().as_str() {
-        "bool" | "boolean" | "coil" => Ok(vec![if clamped != 0.0 { 1 } else { 0 }]),
-        "uint16" | "u16" | "word" => Ok(vec![clamped as u16]),
-        "int16" | "i16" | "short" => Ok(vec![(clamped as i16) as u16]),
-        "uint32" | "u32" | "dword" => {
-            let bytes = (clamped as u32).to_be_bytes();
-            Ok(bytes_4_to_regs(&bytes, byte_order).to_vec())
-        }
-        "int32" | "i32" | "long" => {
-            let bytes = (clamped as i32).to_be_bytes();
-            Ok(bytes_4_to_regs(&bytes, byte_order).to_vec())
-        }
-        "float32" | "f32" | "float" | "real" => {
-            let bytes = (clamped as f32).to_be_bytes();
-            Ok(bytes_4_to_regs(&bytes, byte_order).to_vec())
-        }
-        "uint64" | "u64" | "qword" => {
-            let bytes = (clamped as u64).to_be_bytes();
-            Ok(bytes_8_to_regs(&bytes, byte_order).to_vec())
-        }
-        "int64" | "i64" | "longlong" => {
-            let bytes = (clamped as i64).to_be_bytes();
-            Ok(bytes_8_to_regs(&bytes, byte_order).to_vec())
-        }
-        "float64" | "f64" | "double" | "lreal" => {
-            let bytes = clamped.to_be_bytes();
-            Ok(bytes_8_to_regs(&bytes, byte_order).to_vec())
-        }
-        _ => Err(ModbusError::InvalidData {
-            message: format!("Unsupported data type: {}", data_type),
-        }),
+    if dt.eq_ignore_ascii_case("bool")
+        || dt.eq_ignore_ascii_case("boolean")
+        || dt.eq_ignore_ascii_case("coil")
+    {
+        return Ok(vec![if clamped != 0.0 { 1 } else { 0 }]);
     }
+    if dt.eq_ignore_ascii_case("uint16")
+        || dt.eq_ignore_ascii_case("u16")
+        || dt.eq_ignore_ascii_case("word")
+    {
+        return Ok(vec![clamped as u16]);
+    }
+    if dt.eq_ignore_ascii_case("int16")
+        || dt.eq_ignore_ascii_case("i16")
+        || dt.eq_ignore_ascii_case("short")
+    {
+        return Ok(vec![(clamped as i16) as u16]);
+    }
+    if dt.eq_ignore_ascii_case("uint32")
+        || dt.eq_ignore_ascii_case("u32")
+        || dt.eq_ignore_ascii_case("dword")
+    {
+        let bytes = (clamped as u32).to_be_bytes();
+        return Ok(bytes_4_to_regs(&bytes, byte_order).to_vec());
+    }
+    if dt.eq_ignore_ascii_case("int32")
+        || dt.eq_ignore_ascii_case("i32")
+        || dt.eq_ignore_ascii_case("long")
+    {
+        let bytes = (clamped as i32).to_be_bytes();
+        return Ok(bytes_4_to_regs(&bytes, byte_order).to_vec());
+    }
+    if dt.eq_ignore_ascii_case("float32")
+        || dt.eq_ignore_ascii_case("f32")
+        || dt.eq_ignore_ascii_case("float")
+        || dt.eq_ignore_ascii_case("real")
+    {
+        let bytes = (clamped as f32).to_be_bytes();
+        return Ok(bytes_4_to_regs(&bytes, byte_order).to_vec());
+    }
+    if dt.eq_ignore_ascii_case("uint64")
+        || dt.eq_ignore_ascii_case("u64")
+        || dt.eq_ignore_ascii_case("qword")
+    {
+        let bytes = (clamped as u64).to_be_bytes();
+        return Ok(bytes_8_to_regs(&bytes, byte_order).to_vec());
+    }
+    if dt.eq_ignore_ascii_case("int64")
+        || dt.eq_ignore_ascii_case("i64")
+        || dt.eq_ignore_ascii_case("longlong")
+    {
+        let bytes = (clamped as i64).to_be_bytes();
+        return Ok(bytes_8_to_regs(&bytes, byte_order).to_vec());
+    }
+    if dt.eq_ignore_ascii_case("float64")
+        || dt.eq_ignore_ascii_case("f64")
+        || dt.eq_ignore_ascii_case("double")
+        || dt.eq_ignore_ascii_case("lreal")
+    {
+        let bytes = clamped.to_be_bytes();
+        return Ok(bytes_8_to_regs(&bytes, byte_order).to_vec());
+    }
+
+    Err(ModbusError::InvalidData {
+        message: format!("Unsupported data type: {}", data_type),
+    })
 }
 
 // ============================================================================
@@ -510,14 +581,46 @@ impl ModbusCodec {
 
 /// Get the number of registers required for a data type.
 pub fn registers_for_type(data_type: &str) -> usize {
-    match data_type.to_lowercase().as_str() {
-        "bool" | "boolean" | "coil" => 0, // Coils use separate addressing
-        "uint16" | "u16" | "word" | "int16" | "i16" | "short" => 1,
-        "uint32" | "u32" | "dword" | "int32" | "i32" | "long" | "float32" | "f32" | "float"
-        | "real" => 2,
-        "uint64" | "u64" | "qword" | "int64" | "i64" | "longlong" | "float64" | "f64"
-        | "double" | "lreal" => 4,
-        _ => 1, // Default to 1 register for unknown types
+    let dt = data_type;
+    if dt.eq_ignore_ascii_case("bool")
+        || dt.eq_ignore_ascii_case("boolean")
+        || dt.eq_ignore_ascii_case("coil")
+    {
+        0 // Coils use separate addressing
+    } else if dt.eq_ignore_ascii_case("uint16")
+        || dt.eq_ignore_ascii_case("u16")
+        || dt.eq_ignore_ascii_case("word")
+        || dt.eq_ignore_ascii_case("int16")
+        || dt.eq_ignore_ascii_case("i16")
+        || dt.eq_ignore_ascii_case("short")
+    {
+        1
+    } else if dt.eq_ignore_ascii_case("uint32")
+        || dt.eq_ignore_ascii_case("u32")
+        || dt.eq_ignore_ascii_case("dword")
+        || dt.eq_ignore_ascii_case("int32")
+        || dt.eq_ignore_ascii_case("i32")
+        || dt.eq_ignore_ascii_case("long")
+        || dt.eq_ignore_ascii_case("float32")
+        || dt.eq_ignore_ascii_case("f32")
+        || dt.eq_ignore_ascii_case("float")
+        || dt.eq_ignore_ascii_case("real")
+    {
+        2
+    } else if dt.eq_ignore_ascii_case("uint64")
+        || dt.eq_ignore_ascii_case("u64")
+        || dt.eq_ignore_ascii_case("qword")
+        || dt.eq_ignore_ascii_case("int64")
+        || dt.eq_ignore_ascii_case("i64")
+        || dt.eq_ignore_ascii_case("longlong")
+        || dt.eq_ignore_ascii_case("float64")
+        || dt.eq_ignore_ascii_case("f64")
+        || dt.eq_ignore_ascii_case("double")
+        || dt.eq_ignore_ascii_case("lreal")
+    {
+        4
+    } else {
+        1 // Default to 1 register for unknown types
     }
 }
 
