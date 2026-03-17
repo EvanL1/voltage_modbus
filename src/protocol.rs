@@ -85,12 +85,22 @@
 //! # Ok::<(), voltage_modbus::ModbusError>(())
 //! ```
 
-use crate::error::{ModbusError, ModbusResult};
 /// Modbus protocol definitions and data structures
 ///
 /// This module contains the core Modbus protocol definitions, including
 /// function codes, data types, and request/response structures.
-use std::fmt;
+///
+/// ## no_std compatibility
+///
+/// This module is no_std compatible. It uses `alloc` for `Vec` and `format!`
+/// (required for `ModbusRequest`/`ModbusResponse` which own heap-allocated data),
+/// and `core::fmt` for `Display` implementations.
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::ToString, vec::Vec};
+
+use core::fmt;
+
+use crate::error::{ModbusError, ModbusResult};
 
 /// Modbus address type (0-65535)
 pub type ModbusAddress = u16;
@@ -527,6 +537,9 @@ impl ModbusResponse {
 /// Data conversion utilities
 pub mod data_utils {
     use super::*;
+
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
 
     /// Convert register values to bytes (big-endian)
     pub fn registers_to_bytes(registers: &[u16]) -> Vec<u8> {

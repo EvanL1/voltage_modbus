@@ -4,6 +4,13 @@
 //! covering all aspects of Modbus communication including network transport, protocol
 //! parsing, data validation, and device interaction errors.
 //!
+//! ## no_std compatibility
+//!
+//! This module is no_std compatible when the `std` feature is disabled.
+//! - With `std`: uses `thiserror` for derive macros, includes `From<std::io::Error>`.
+//! - Without `std`: manually implements `Display` and `core::error::Error`; requires
+//!   `alloc` for `String`-bearing variants.
+//!
 //! ## Overview
 //!
 //! The error system is designed to provide clear, actionable error information for
@@ -50,7 +57,6 @@
 //!                 // Implement retry logic
 //!             } else {
 //!                 println!("Fatal error: {}", error);
-//!                 // Handle permanent failure
 //!             }
 //!         }
 //!     }
@@ -138,11 +144,16 @@
 //! }
 //! ```
 
-/// Modbus-specific error types
-///
-/// This module provides comprehensive error handling for all Modbus operations,
-/// including network, protocol, and data validation errors.
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
+#[cfg(feature = "std")]
 use thiserror::Error;
+
+// core::fmt is used by the manual Display impl in no_std mode.
+// In std mode thiserror generates all fmt code, so suppress the unused-import warning.
+#[cfg(not(feature = "std"))]
+use core::fmt;
 
 /// Result type alias for Modbus operations
 ///
@@ -157,121 +168,55 @@ pub type ModbusResult<T> = Result<T, ModbusError>;
 /// communication, from low-level I/O errors to high-level protocol violations.
 /// Each variant provides detailed context about the specific failure, making it
 /// easier to diagnose issues and implement appropriate recovery strategies.
-#[derive(Error, Debug, Clone, PartialEq)]
+///
+/// In no_std builds all `String`-bearing variants still work — they use
+/// `alloc::string::String` from the implicit `alloc` crate.
+#[cfg_attr(feature = "std", derive(Error))]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ModbusError {
     /// I/O related errors (network, serial)
-    ///
-    /// Covers low-level I/O failures including network socket errors,
-    /// serial port communication issues, and file system access problems.
-    ///
-    /// # Examples
-    /// - TCP connection refused
-    /// - Serial port access denied
-    /// - Network interface down
-    #[error("I/O error: {message}")]
+    #[cfg_attr(feature = "std", error("I/O error: {message}"))]
     Io { message: String },
 
     /// Connection errors
-    ///
-    /// Specific to connection establishment and maintenance issues that
-    /// are distinct from general I/O errors.
-    ///
-    /// # Examples
-    /// - Connection refused by remote host
-    /// - Connection lost during operation
-    /// - Authentication failure
-    #[error("Connection error: {message}")]
+    #[cfg_attr(feature = "std", error("Connection error: {message}"))]
     Connection { message: String },
 
     /// Timeout errors
-    ///
-    /// Occurs when operations exceed their configured timeout limits.
-    /// Includes context about which operation timed out and the timeout duration.
-    ///
-    /// # Examples
-    /// - Read operation timeout
-    /// - Write operation timeout
-    /// - Connection establishment timeout
-    #[error("Timeout after {timeout_ms}ms: {operation}")]
+    #[cfg_attr(feature = "std", error("Timeout after {timeout_ms}ms: {operation}"))]
     Timeout { operation: String, timeout_ms: u64 },
 
     /// Protocol-level errors
-    ///
-    /// General Modbus protocol specification violations that don't fit
-    /// into more specific categories.
-    ///
-    /// # Examples
-    /// - Invalid message length
-    /// - Unsupported protocol version
-    /// - Protocol state machine violations
-    #[error("Protocol error: {message}")]
+    #[cfg_attr(feature = "std", error("Protocol error: {message}"))]
     Protocol { message: String },
 
     /// Invalid function code
-    ///
-    /// Occurs when an unsupported or malformed Modbus function code is
-    /// encountered, either in requests or responses.
-    ///
-    /// # Examples
-    /// - Function code 0x99 (not in Modbus specification)
-    /// - Function code that doesn't match expected response
-    #[error("Invalid function code: {code}")]
+    #[cfg_attr(feature = "std", error("Invalid function code: {code}"))]
     InvalidFunction { code: u8 },
 
     /// Invalid address range
-    ///
-    /// Address validation failures including out-of-range addresses,
-    /// invalid quantity values, or address/quantity combinations that
-    /// exceed protocol limits.
-    ///
-    /// # Examples
-    /// - Reading 200 holding registers (max 125)
-    /// - Starting address + quantity > 65535
-    /// - Zero quantity in read request
-    #[error("Invalid address: start={start}, count={count}")]
+    #[cfg_attr(
+        feature = "std",
+        error("Invalid address: start={start}, count={count}")
+    )]
     InvalidAddress { start: u16, count: u16 },
 
     /// Invalid data value
-    ///
-    /// Data format and validation errors including values that don't
-    /// conform to expected formats or ranges.
-    ///
-    /// # Examples
-    /// - Coil value not 0x0000 or 0xFF00
-    /// - Invalid string encoding in register data
-    /// - Out-of-range numeric values
-    #[error("Invalid data: {message}")]
+    #[cfg_attr(feature = "std", error("Invalid data: {message}"))]
     InvalidData { message: String },
 
     /// CRC validation failure
-    ///
-    /// Checksum validation failures in Modbus RTU communication.
-    /// Provides both expected and actual CRC values for debugging.
-    ///
-    /// # Examples
-    /// - Message corruption during transmission
-    /// - Incorrect CRC calculation
-    /// - Noise on communication line
-    #[error("CRC validation failed: expected={expected:04X}, actual={actual:04X}")]
+    #[cfg_attr(
+        feature = "std",
+        error("CRC validation failed: expected={expected:04X}, actual={actual:04X}")
+    )]
     CrcMismatch { expected: u16, actual: u16 },
 
     /// Modbus exception response
-    ///
-    /// Standard Modbus exception codes returned by devices to indicate
-    /// various error conditions. Includes the original function code,
-    /// exception code, and human-readable description.
-    ///
-    /// # Standard Exception Codes
-    /// - 0x01: Illegal Function
-    /// - 0x02: Illegal Data Address
-    /// - 0x03: Illegal Data Value
-    /// - 0x04: Slave Device Failure
-    /// - 0x05: Acknowledge
-    /// - 0x06: Slave Device Busy
-    /// - 0x08: Memory Parity Error
-    /// - 0x0A: Gateway Path Unavailable
-    /// - 0x0B: Gateway Target Device Failed to Respond
-    #[error("Modbus exception: function={function:02X}, code={code:02X} ({message})")]
+    #[cfg_attr(
+        feature = "std",
+        error("Modbus exception: function={function:02X}, code={code:02X} ({message})")
+    )]
     Exception {
         function: u8,
         code: u8,
@@ -280,103 +225,119 @@ pub enum ModbusError {
     },
 
     /// Frame parsing errors
-    ///
-    /// Message frame format violations including invalid frame structure,
-    /// incomplete frames, or framing protocol errors.
-    ///
-    /// # Examples
-    /// - Incomplete TCP MBAP header
-    /// - Invalid RTU frame structure
-    /// - Message too short for claimed length
-    #[error("Frame error: {message}")]
+    #[cfg_attr(feature = "std", error("Frame error: {message}"))]
     Frame { message: String },
 
     /// Configuration errors
-    ///
-    /// Client or server configuration issues that prevent proper operation.
-    ///
-    /// # Examples
-    /// - Invalid TCP port number
-    /// - Malformed configuration file
-    /// - Missing required configuration parameters
-    #[error("Configuration error: {message}")]
+    #[cfg_attr(feature = "std", error("Configuration error: {message}"))]
     Configuration { message: String },
 
     /// Device not responding
-    ///
-    /// Specific error for devices that fail to respond to requests,
-    /// distinct from timeout errors as it indicates a pattern of
-    /// non-responsiveness.
-    ///
-    /// # Examples
-    /// - Device powered off
-    /// - Device address misconfigured
-    /// - Communication medium failure
-    #[error("Device {slave_id} not responding")]
+    #[cfg_attr(feature = "std", error("Device {slave_id} not responding"))]
     DeviceNotResponding { slave_id: u8 },
 
     /// Transaction ID mismatch in TCP response
-    ///
-    /// Occurs when the response's Transaction ID doesn't match the request's.
-    /// This can happen when multiple clients connect to the same device,
-    /// causing response confusion in the TCP buffer.
-    ///
-    /// # Examples
-    /// - Two clients polling the same Modbus device simultaneously
-    /// - TCP buffer containing mixed responses from different requests
-    /// - Device queue corruption under high load
-    #[error("Transaction ID mismatch: expected={expected:04X}, actual={actual:04X}")]
+    #[cfg_attr(
+        feature = "std",
+        error("Transaction ID mismatch: expected={expected:04X}, actual={actual:04X}")
+    )]
     TransactionIdMismatch { expected: u16, actual: u16 },
 
     /// Internal errors (should not occur in normal operation)
-    ///
-    /// Library internal errors that indicate bugs or unexpected
-    /// conditions within the Modbus implementation itself.
-    ///
-    /// # Examples
-    /// - Internal state corruption
-    /// - Unexpected code path execution
-    /// - Resource management failures
-    #[error("Internal error: {message}")]
+    #[cfg_attr(feature = "std", error("Internal error: {message}"))]
     Internal { message: String },
 
     // Legacy aliases for compatibility
     /// Legacy timeout error (use Timeout instead)
-    #[error("Timeout")]
+    #[cfg_attr(feature = "std", error("Timeout"))]
     #[deprecated(note = "Use Timeout with operation and timeout_ms fields")]
     TimeoutLegacy,
 
     /// Legacy invalid frame error (use Frame instead)
-    #[error("Invalid frame")]
+    #[cfg_attr(feature = "std", error("Invalid frame"))]
     #[deprecated(note = "Use Frame with message field")]
     InvalidFrame,
 
     /// Legacy invalid data value error (use InvalidData instead)
-    #[error("Invalid data value")]
+    #[cfg_attr(feature = "std", error("Invalid data value"))]
     #[deprecated(note = "Use InvalidData with message field")]
     InvalidDataValue,
 
     /// Legacy illegal function error (use InvalidFunction instead)
-    #[error("Illegal function")]
+    #[cfg_attr(feature = "std", error("Illegal function"))]
     #[deprecated(note = "Use InvalidFunction with code field")]
     IllegalFunction,
 
     /// Legacy internal error (use Internal instead)
-    #[error("Internal error")]
+    #[cfg_attr(feature = "std", error("Internal error"))]
     #[deprecated(note = "Use Internal with message field")]
     InternalError,
 }
 
+// In no_std mode we manually implement Display and core::error::Error,
+// since thiserror is not available.
+#[cfg(not(feature = "std"))]
+impl fmt::Display for ModbusError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io { message } => write!(f, "I/O error: {}", message),
+            Self::Connection { message } => write!(f, "Connection error: {}", message),
+            Self::Timeout {
+                operation,
+                timeout_ms,
+            } => write!(f, "Timeout after {}ms: {}", timeout_ms, operation),
+            Self::Protocol { message } => write!(f, "Protocol error: {}", message),
+            Self::InvalidFunction { code } => write!(f, "Invalid function code: {}", code),
+            Self::InvalidAddress { start, count } => {
+                write!(f, "Invalid address: start={}, count={}", start, count)
+            }
+            Self::InvalidData { message } => write!(f, "Invalid data: {}", message),
+            Self::CrcMismatch { expected, actual } => write!(
+                f,
+                "CRC validation failed: expected={:04X}, actual={:04X}",
+                expected, actual
+            ),
+            Self::Exception {
+                function,
+                code,
+                message,
+            } => write!(
+                f,
+                "Modbus exception: function={:02X}, code={:02X} ({})",
+                function, code, message
+            ),
+            Self::Frame { message } => write!(f, "Frame error: {}", message),
+            Self::Configuration { message } => write!(f, "Configuration error: {}", message),
+            Self::DeviceNotResponding { slave_id } => {
+                write!(f, "Device {} not responding", slave_id)
+            }
+            Self::TransactionIdMismatch { expected, actual } => write!(
+                f,
+                "Transaction ID mismatch: expected={:04X}, actual={:04X}",
+                expected, actual
+            ),
+            Self::Internal { message } => write!(f, "Internal error: {}", message),
+            #[allow(deprecated)]
+            Self::TimeoutLegacy => write!(f, "Timeout"),
+            #[allow(deprecated)]
+            Self::InvalidFrame => write!(f, "Invalid frame"),
+            #[allow(deprecated)]
+            Self::InvalidDataValue => write!(f, "Invalid data value"),
+            #[allow(deprecated)]
+            Self::IllegalFunction => write!(f, "Illegal function"),
+            #[allow(deprecated)]
+            Self::InternalError => write!(f, "Internal error"),
+        }
+    }
+}
+
+// In std mode, thiserror already derives Display; we still need the core::error::Error
+// impl for no_std builds (core::error::Error was stabilised in Rust 1.81).
+#[cfg(not(feature = "std"))]
+impl core::error::Error for ModbusError {}
+
 impl ModbusError {
     /// Create a new I/O error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Io` variant
     pub fn io<S: Into<String>>(message: S) -> Self {
         Self::Io {
             message: message.into(),
@@ -384,14 +345,6 @@ impl ModbusError {
     }
 
     /// Create a new connection error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Connection` variant
     pub fn connection<S: Into<String>>(message: S) -> Self {
         Self::Connection {
             message: message.into(),
@@ -399,15 +352,6 @@ impl ModbusError {
     }
 
     /// Create a new timeout error
-    ///
-    /// # Arguments
-    ///
-    /// * `operation` - Description of the operation that timed out
-    /// * `timeout_ms` - Timeout duration in milliseconds
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Timeout` variant
     pub fn timeout<S: Into<String>>(operation: S, timeout_ms: u64) -> Self {
         Self::Timeout {
             operation: operation.into(),
@@ -416,14 +360,6 @@ impl ModbusError {
     }
 
     /// Create a new protocol error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Protocol` variant
     pub fn protocol<S: Into<String>>(message: S) -> Self {
         Self::Protocol {
             message: message.into(),
@@ -431,41 +367,16 @@ impl ModbusError {
     }
 
     /// Create an invalid function error
-    ///
-    /// # Arguments
-    ///
-    /// * `code` - The invalid function code
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::InvalidFunction` variant
     pub fn invalid_function(code: u8) -> Self {
         Self::InvalidFunction { code }
     }
 
     /// Create an invalid address error
-    ///
-    /// # Arguments
-    ///
-    /// * `start` - Starting address
-    /// * `count` - Number of registers/coils
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::InvalidAddress` variant
     pub fn invalid_address(start: u16, count: u16) -> Self {
         Self::InvalidAddress { start, count }
     }
 
     /// Create an invalid data error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::InvalidData` variant
     pub fn invalid_data<S: Into<String>>(message: S) -> Self {
         Self::InvalidData {
             message: message.into(),
@@ -473,15 +384,6 @@ impl ModbusError {
     }
 
     /// Create a CRC mismatch error
-    ///
-    /// # Arguments
-    ///
-    /// * `expected` - Expected CRC value
-    /// * `actual` - Actual CRC value received
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::CrcMismatch` variant
     pub fn crc_mismatch(expected: u16, actual: u16) -> Self {
         Self::CrcMismatch { expected, actual }
     }
@@ -489,15 +391,6 @@ impl ModbusError {
     /// Create a Modbus exception error
     ///
     /// Automatically maps standard exception codes to human-readable messages.
-    ///
-    /// # Arguments
-    ///
-    /// * `function` - Original function code that caused the exception
-    /// * `code` - Modbus exception code
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Exception` variant with appropriate message
     pub fn exception(function: u8, code: u8) -> Self {
         let message: &'static str = match code {
             0x01 => "Illegal Function",
@@ -520,14 +413,6 @@ impl ModbusError {
     }
 
     /// Create a frame error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Frame` variant
     pub fn frame<S: Into<String>>(message: S) -> Self {
         Self::Frame {
             message: message.into(),
@@ -535,14 +420,6 @@ impl ModbusError {
     }
 
     /// Create a configuration error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Configuration` variant
     pub fn configuration<S: Into<String>>(message: S) -> Self {
         Self::Configuration {
             message: message.into(),
@@ -550,45 +427,16 @@ impl ModbusError {
     }
 
     /// Create a device not responding error
-    ///
-    /// # Arguments
-    ///
-    /// * `slave_id` - ID of the non-responding device
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::DeviceNotResponding` variant
     pub fn device_not_responding(slave_id: u8) -> Self {
         Self::DeviceNotResponding { slave_id }
     }
 
     /// Create a transaction ID mismatch error
-    ///
-    /// This error indicates that the response's Transaction ID doesn't match
-    /// the request's, which can occur when multiple clients connect to the
-    /// same Modbus device simultaneously, causing response confusion.
-    ///
-    /// # Arguments
-    ///
-    /// * `expected` - Expected Transaction ID (from the sent request)
-    /// * `actual` - Actual Transaction ID (from the received response)
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::TransactionIdMismatch` variant
     pub fn transaction_id_mismatch(expected: u16, actual: u16) -> Self {
         Self::TransactionIdMismatch { expected, actual }
     }
 
     /// Create an internal error
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - Descriptive error message
-    ///
-    /// # Returns
-    ///
-    /// New `ModbusError::Internal` variant
     pub fn internal<S: Into<String>>(message: S) -> Self {
         Self::Internal {
             message: message.into(),
@@ -596,15 +444,6 @@ impl ModbusError {
     }
 
     /// Check if the error is recoverable (can retry)
-    ///
-    /// Determines whether an operation that failed with this error
-    /// might succeed if retried, helping implement intelligent
-    /// retry strategies.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error condition might be temporary and retrying
-    /// the operation could succeed, `false` for permanent failures
     ///
     /// # Examples
     ///
@@ -623,9 +462,8 @@ impl ModbusError {
             Self::Connection { .. } => true,
             Self::Timeout { .. } => true,
             Self::DeviceNotResponding { .. } => true,
-            Self::TransactionIdMismatch { .. } => true, // Retrying may succeed after reconnection
+            Self::TransactionIdMismatch { .. } => true,
             Self::Exception { code, .. } => {
-                // Some exceptions are recoverable
                 matches!(code, 0x05 | 0x06) // Acknowledge, Busy
             }
             _ => false,
@@ -633,13 +471,6 @@ impl ModbusError {
     }
 
     /// Check if the error is a network/transport issue
-    ///
-    /// Identifies errors that are related to the underlying transport
-    /// mechanism (TCP, RTU) rather than Modbus protocol issues.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error is transport-related, `false` otherwise
     ///
     /// # Examples
     ///
@@ -660,13 +491,6 @@ impl ModbusError {
     }
 
     /// Check if the error is a protocol issue
-    ///
-    /// Identifies errors that are related to Modbus protocol violations
-    /// or communication at the protocol level.
-    ///
-    /// # Returns
-    ///
-    /// `true` if the error is protocol-related, `false` otherwise
     ///
     /// # Examples
     ///
@@ -692,21 +516,16 @@ impl ModbusError {
     }
 }
 
-/// Convert from std::io::Error
-///
-/// Automatically converts standard I/O errors to `ModbusError::Io`,
-/// preserving the original error message for debugging.
+/// Convert from std::io::Error — only available with the `std` feature
+#[cfg(feature = "std")]
 impl From<std::io::Error> for ModbusError {
     fn from(err: std::io::Error) -> Self {
         Self::io(err.to_string())
     }
 }
 
-/// Convert from tokio timeout errors
-///
-/// Converts Tokio's timeout errors to `ModbusError::Timeout` with
-/// a generic timeout message (specific timeout duration should be
-/// provided when creating timeout errors manually).
+/// Convert from tokio timeout errors — only available with the `std` feature
+#[cfg(feature = "std")]
 impl From<tokio::time::error::Elapsed> for ModbusError {
     fn from(_: tokio::time::error::Elapsed) -> Self {
         Self::timeout("Operation timeout", 0)

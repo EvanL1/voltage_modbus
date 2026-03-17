@@ -1,8 +1,12 @@
 //! Optimized Modbus PDU data structure
 //!
 //! Use a fixed-size stack array to avoid heap allocation and improve performance.
+//! This module is no_std compatible: it only uses `core` primitives and the
+//! `alloc` crate (for `format!` in error messages and `vec!` in write helpers).
+//! `tracing` diagnostics are compiled out in no_std builds.
 
-use tracing::debug;
+#[cfg(not(feature = "std"))]
+use alloc::{format, string::ToString, vec};
 
 use crate::constants::MAX_PDU_SIZE;
 use crate::error::{ModbusError, ModbusResult};
@@ -29,7 +33,8 @@ impl ModbusPdu {
     /// Create a PDU from a byte slice
     #[inline]
     pub fn from_slice(data: &[u8]) -> ModbusResult<Self> {
-        debug!("Parsing PDU from slice: {} bytes", data.len());
+        #[cfg(feature = "std")]
+        tracing::debug!("Parsing PDU from slice: {} bytes", data.len());
 
         if data.len() > MAX_PDU_SIZE {
             return Err(ModbusError::Protocol {
@@ -41,17 +46,20 @@ impl ModbusPdu {
         pdu.data[..data.len()].copy_from_slice(data);
         pdu.len = data.len();
 
-        // Log function code details
+        // Log function code details (std only)
+        #[cfg(feature = "std")]
         if let Some(fc) = pdu.function_code() {
             let fc_desc = Self::function_code_description(fc);
             if pdu.is_exception() {
                 let exc_code = pdu.exception_code().unwrap_or(0);
-                debug!(
+                tracing::debug!(
                     "PDU parsed: FC={:02X} (Exception: {}), exception_code={:02X}",
-                    fc, fc_desc, exc_code
+                    fc,
+                    fc_desc,
+                    exc_code
                 );
             } else {
-                debug!(
+                tracing::debug!(
                     "PDU parsed: FC={:02X} ({}), data_len={}",
                     fc,
                     fc_desc,
@@ -59,7 +67,7 @@ impl ModbusPdu {
                 );
             }
         } else {
-            debug!("PDU parsed: empty PDU");
+            tracing::debug!("PDU parsed: empty PDU");
         }
 
         Ok(pdu)
@@ -243,16 +251,17 @@ impl PduBuilder {
     /// Build the PDU
     #[inline]
     pub fn build(self) -> ModbusPdu {
+        #[cfg(feature = "std")]
         if let Some(fc) = self.pdu.function_code() {
             let fc_desc = ModbusPdu::function_code_description(fc);
-            debug!(
+            tracing::debug!(
                 "PDU built: FC={:02X} ({}), total_len={}",
                 fc,
                 fc_desc,
                 self.pdu.len()
             );
         } else {
-            debug!("PDU built: empty PDU");
+            tracing::debug!("PDU built: empty PDU");
         }
 
         self.pdu

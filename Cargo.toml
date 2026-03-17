@@ -27,51 +27,71 @@ name = "voltage_modbus"
 path = "src/lib.rs"
 
 [dependencies]
-# Async runtime
-tokio = { version = "1.0", features = ["full"] }
+# Async runtime (std only)
+tokio = { version = "1.0", features = ["full"], optional = true }
 
-# Error handling
-thiserror = "1.0"
+# Error handling — thiserror requires std; used only in std builds
+thiserror = { version = "1.0", optional = true }
 
-# Logging
-tracing = "0.1"
+# Logging — tracing supports no_std via its default-features = false path
+tracing = { version = "0.1", default-features = false }
 
-# Utilities
-bytes = "1.4"
+# Utilities (std only — bytes requires std allocator integration)
+bytes = { version = "1.4", optional = true }
+
+# CRC — supports no_std natively
 crc = "3.0"
 
-# Time
-chrono = "0.4"
+# Time (std only)
+chrono = { version = "0.4", optional = true }
 
-# RTU serial support (optional)
+# RTU serial support (optional, requires std)
 tokio-serial = { version = "5.4", optional = true }
 
-# IGW integration (optional)
+# IGW integration (optional, requires std)
 igw = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
 
 [features]
-default = []
-rtu = ["dep:tokio-serial"]
-igw = ["dep:igw"]
+# std feature enables all async/network capabilities (default ON for backwards compat)
+default = ["std"]
+std = [
+    "dep:tokio",
+    "dep:thiserror",
+    "dep:bytes",
+    "dep:chrono",
+]
+rtu = ["std", "dep:tokio-serial"]
+igw = ["std", "dep:igw"]
+
+# no_std builds use: cargo build --no-default-features
+
+[[bin]]
+name = "demo"
+path = "src/bin/demo.rs"
+required-features = ["std"]
 
 [[example]]
 name = "tcp_client"
 path = "examples/tcp_client.rs"
+required-features = ["std"]
 
 [[example]]
 name = "read_meter"
 path = "examples/read_meter.rs"
+required-features = ["std"]
 
 [[example]]
 name = "batch_read"
 path = "examples/batch_read.rs"
+required-features = ["std"]
 
 [[example]]
 name = "data_types"
 path = "examples/data_types.rs"
+required-features = ["std"]
 
 [profile.release]
 opt-level = 3
