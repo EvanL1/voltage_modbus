@@ -675,6 +675,13 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
+        // Reject broadcast reads early — no response would ever arrive.
+        if request.slave_id == 0 && request.function.is_read_function() {
+            return Err(ModbusError::invalid_data(
+                "Broadcast (slave_id=0) is only valid for write operations",
+            ));
+        }
+
         // Log request if logger is available
         // Note: For accurate packet logging with real TID, use transport.set_packet_callback()
         if let Some(ref logger) = self.logger {
@@ -688,6 +695,9 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
             );
         }
 
+        // For broadcast writes (slave_id = 0) the transport layer returns a synthetic
+        // ack immediately without waiting for a response (Modbus spec: no reply expected).
+        // Regular unicast requests wait for the real device response.
         let response = self.transport.request(&request).await?;
 
         // Log response if logger is available
@@ -1364,15 +1374,20 @@ mod tests {
             // Record the request
             self.requests.lock().unwrap().push(request.clone());
 
-            // Get the next response from queue
-            let response = self
-                .responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(|| Err(ModbusError::connection("No response prepared in mock")));
+            // Broadcast writes (slave_id = 0): mirror what real transports do —
+            // return a synthetic ack without consuming a pre-configured response.
+            let result = if request.slave_id == 0 {
+                Ok(ModbusResponse::new_broadcast_ack(request.function))
+            } else {
+                // Get the next response from queue
+                self.responses
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or_else(|| Err(ModbusError::connection("No response prepared in mock")))
+            };
 
-            async move { response }
+            async move { result }
         }
 
         fn is_connected(&self) -> bool {
@@ -1567,6 +1582,99 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].quantity, 500);
         assert_eq!(requests[1].quantity, 100);
+    }
+
+    // =========================================================================
+    // Broadcast (slave_id = 0) tests
+    // =========================================================================
+
+    /// Broadcast write coil (FC05) must succeed without waiting for a response.
+    #[tokio::test]
+    async fn test_broadcast_write_coil() {
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+
+        // slave_id = 0, write single coil ON at address 1
+        let result = client.write_05(0, 1, true).await;
+        assert!(
+            result.is_ok(),
+            "broadcast write_05 should succeed: {result:?}"
+        );
+
+        // The request must have been forwarded to the transport
+        let reqs = client.transport().get_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].slave_id, 0);
+        assert_eq!(reqs[0].function, ModbusFunction::WriteSingleCoil);
+    }
+
+    /// Broadcast write register (FC06) must succeed.
+    #[tokio::test]
+    async fn test_broadcast_write_register() {
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+
+        let result = client.write_06(0, 100, 0xABCD).await;
+        assert!(
+            result.is_ok(),
+            "broadcast write_06 should succeed: {result:?}"
+        );
+
+        let reqs = client.transport().get_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].slave_id, 0);
+        assert_eq!(reqs[0].function, ModbusFunction::WriteSingleRegister);
+    }
+
+    /// Broadcast write multiple registers (FC16) must succeed.
+    #[tokio::test]
+    async fn test_broadcast_write_multiple() {
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+
+        let result = client.write_10(0, 0, &[0x0001, 0x0002, 0x0003]).await;
+        assert!(
+            result.is_ok(),
+            "broadcast write_10 should succeed: {result:?}"
+        );
+
+        let reqs = client.transport().get_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].slave_id, 0);
+        assert_eq!(reqs[0].function, ModbusFunction::WriteMultipleRegisters);
+    }
+
+    /// Broadcast read (any FC) must be rejected with an error.
+    #[tokio::test]
+    async fn test_broadcast_read_rejected() {
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+
+        let err = client.read_03(0, 0, 1).await.unwrap_err();
+        assert!(
+            err.to_string().contains("Broadcast"),
+            "expected broadcast error, got: {err}"
+        );
+
+        // No request should have been sent to the transport
+        assert!(client.transport().get_requests().is_empty());
+    }
+
+    /// The synthetic broadcast ack has no data and no exception.
+    #[tokio::test]
+    async fn test_broadcast_response_is_ack() {
+        let mock = MockTransport::new();
+        let mut client = GenericModbusClient::new(mock);
+
+        // Use execute_request directly to inspect the returned ModbusResponse
+        let request =
+            ModbusRequest::new_write(0, ModbusFunction::WriteSingleRegister, 10, vec![0x00, 0x01]);
+        let response = client.execute_request(request).await.unwrap();
+
+        assert_eq!(response.slave_id, 0);
+        assert_eq!(response.function, ModbusFunction::WriteSingleRegister);
+        assert!(!response.is_exception());
+        assert!(response.data().is_empty());
     }
 }
 

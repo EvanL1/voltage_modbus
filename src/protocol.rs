@@ -299,12 +299,20 @@ impl ModbusRequest {
 
     /// Validate the request
     pub fn validate(&self) -> ModbusResult<()> {
-        // Validate slave ID
-        if self.slave_id == 0 || self.slave_id > 247 {
+        // Validate slave ID — 0 is the broadcast address (valid for write only), 1–247 are unicast
+        if self.slave_id > 247 {
             return Err(ModbusError::invalid_data(format!(
-                "Invalid slave ID: {}",
+                "Invalid slave ID: {} (must be 0-247)",
                 self.slave_id
             )));
+        }
+
+        // Broadcast (slave_id = 0) is only valid for write operations per Modbus spec.
+        // Read operations make no sense for broadcast because there is no response.
+        if self.slave_id == 0 && self.function.is_read_function() {
+            return Err(ModbusError::invalid_data(
+                "Broadcast (slave_id=0) is only valid for write operations",
+            ));
         }
 
         // Validate quantity for read operations
@@ -399,6 +407,23 @@ impl ModbusResponse {
             buffer: frame,
             data_offset: data_start,
             data_len,
+            exception: None,
+        }
+    }
+
+    /// Create a synthetic acknowledgement for broadcast messages (slave_id = 0).
+    ///
+    /// Broadcast messages are sent to all slaves simultaneously and, per the Modbus
+    /// specification, **no response is expected or returned**. This method produces a
+    /// zero-data response that callers can use as a success indicator without waiting
+    /// for a real reply.
+    pub fn new_broadcast_ack(function: ModbusFunction) -> Self {
+        Self {
+            slave_id: 0,
+            function,
+            buffer: Vec::new(),
+            data_offset: 0,
+            data_len: 0,
             exception: None,
         }
     }
@@ -661,5 +686,60 @@ mod tests {
         assert_eq!(bits[1], true);
         assert_eq!(bits[2], false);
         assert_eq!(bits[3], true);
+    }
+
+    // -------------------------------------------------------------------------
+    // Broadcast (slave_id = 0) tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_read_rejected() {
+        // slave_id = 0 with any read function must be rejected
+        for fc in [
+            ModbusFunction::ReadCoils,
+            ModbusFunction::ReadDiscreteInputs,
+            ModbusFunction::ReadHoldingRegisters,
+            ModbusFunction::ReadInputRegisters,
+        ] {
+            let req = ModbusRequest::new_read(0, fc, 0, 1);
+            let err = req.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("Broadcast"),
+                "expected broadcast error for {fc:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_broadcast_write_validates_ok() {
+        // slave_id = 0 with write functions must pass validation
+        for fc in [
+            ModbusFunction::WriteSingleCoil,
+            ModbusFunction::WriteSingleRegister,
+            ModbusFunction::WriteMultipleCoils,
+            ModbusFunction::WriteMultipleRegisters,
+        ] {
+            let req = ModbusRequest::new_write(0, fc, 0, vec![0xFF, 0x00]);
+            assert!(
+                req.validate().is_ok(),
+                "broadcast write should be valid for {fc:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_broadcast_ack_response() {
+        let ack = ModbusResponse::new_broadcast_ack(ModbusFunction::WriteSingleRegister);
+        assert_eq!(ack.slave_id, 0);
+        assert_eq!(ack.function, ModbusFunction::WriteSingleRegister);
+        assert!(!ack.is_exception());
+        assert_eq!(ack.data_len(), 0);
+        assert!(ack.data().is_empty());
+    }
+
+    #[test]
+    fn test_invalid_slave_id_above_247() {
+        let req = ModbusRequest::new_read(248, ModbusFunction::ReadHoldingRegisters, 0, 1);
+        assert!(req.validate().is_err());
     }
 }

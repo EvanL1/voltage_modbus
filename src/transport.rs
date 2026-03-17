@@ -697,6 +697,13 @@ impl ModbusTransport for TcpTransport {
             ));
         }
 
+        // Broadcast (slave_id = 0): per Modbus spec no response is expected.
+        // Return a synthetic ack immediately without waiting.
+        if request.slave_id == 0 {
+            self.stats.responses_received += 1;
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
+        }
+
         // Read response with TID validation loop
         // When multiple clients connect to the same device, responses may be interleaved.
         // We discard responses with mismatched TID and continue reading until we find ours.
@@ -777,8 +784,7 @@ impl ModbusTransport for TcpTransport {
             if actual_tid != expected_transaction_id {
                 debug!(
                     "Discarding mismatched response: TID={:04X}, expecting {:04X}",
-                    actual_tid,
-                    expected_transaction_id
+                    actual_tid, expected_transaction_id
                 );
                 // Discard this response and continue reading the next one
                 continue;
@@ -789,8 +795,7 @@ impl ModbusTransport for TcpTransport {
             if actual_unit_id != request.slave_id {
                 debug!(
                     "Discarding mismatched response: Unit ID={}, expecting {}",
-                    actual_unit_id,
-                    request.slave_id
+                    actual_unit_id, request.slave_id
                 );
                 // Discard this response and continue reading the next one
                 continue;
@@ -1205,6 +1210,13 @@ impl ModbusTransport for RtuTransport {
                     self.timeout.as_millis() as u64,
                 ));
             }
+        }
+
+        // Broadcast (slave_id = 0): per Modbus spec no response is expected.
+        // Return a synthetic ack immediately without waiting.
+        if request.slave_id == 0 {
+            self.stats.responses_received += 1;
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
         // Read response
