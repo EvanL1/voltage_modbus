@@ -56,6 +56,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use crate::coalescer::ReadCoalescer;
 use crate::device_limits::DeviceLimits;
 use crate::error::{ModbusError, ModbusResult};
 use crate::logging::CallbackLogger;
@@ -912,6 +913,109 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
 
     fn get_stats(&self) -> TransportStats {
         self.transport.get_stats()
+    }
+}
+
+/// Coalesced read methods available on any `GenericModbusClient<T>`
+impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
+    /// 批量读取多个 Holding Register 区域，自动合并相邻请求（FC03）
+    ///
+    /// 将多个 `(address, quantity)` 区域按 [`ReadCoalescer`] 的规则合并，
+    /// 用更少的网络请求完成读取，然后按原始输入顺序返回各区域的数据。
+    ///
+    /// # Arguments
+    ///
+    /// * `slave_id` - 从站 ID（1-247）
+    /// * `regions` - 待读取区域列表，每个元素为 `(address, quantity)`
+    ///
+    /// # Returns
+    ///
+    /// 按输入顺序返回每个区域的寄存器数据。
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use voltage_modbus::{ModbusTcpClient, ModbusResult};
+    /// use std::time::Duration;
+    ///
+    /// # async fn example() -> ModbusResult<()> {
+    /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+    ///
+    /// // 读取温度(0-1)、压力(2-3)、流量(10-11)，三个区域合并为一次请求
+    /// let results = client.read_holding_registers_coalesced(1, &[(0, 2), (2, 2), (10, 2)]).await?;
+    /// let temperature = &results[0]; // [reg0, reg1]
+    /// let pressure    = &results[1]; // [reg2, reg3]
+    /// let flow        = &results[2]; // [reg10, reg11]
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn read_holding_registers_coalesced(
+        &mut self,
+        slave_id: u8,
+        regions: &[(u16, u16)],
+    ) -> ModbusResult<Vec<Vec<u16>>> {
+        self.inner_read_coalesced(slave_id, 0x03, regions).await
+    }
+
+    /// 批量读取多个 Input Register 区域，自动合并相邻请求（FC04）
+    ///
+    /// 与 [`read_holding_registers_coalesced`](Self::read_holding_registers_coalesced) 相同，
+    /// 使用 FC04（Input Registers）。
+    pub async fn read_input_registers_coalesced(
+        &mut self,
+        slave_id: u8,
+        regions: &[(u16, u16)],
+    ) -> ModbusResult<Vec<Vec<u16>>> {
+        self.inner_read_coalesced(slave_id, 0x04, regions).await
+    }
+
+    /// 内部实现：对给定 function code 执行读合并
+    async fn inner_read_coalesced(
+        &mut self,
+        slave_id: u8,
+        function: u8,
+        regions: &[(u16, u16)],
+    ) -> ModbusResult<Vec<Vec<u16>>> {
+        if regions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // 构建 ReadRequest 列表
+        let requests: Vec<crate::coalescer::ReadRequest> = regions
+            .iter()
+            .map(|&(address, quantity)| {
+                crate::coalescer::ReadRequest::new(slave_id, function, address, quantity)
+            })
+            .collect();
+
+        let coalescer = ReadCoalescer::new();
+        let coalesced_list = coalescer.coalesce(&requests);
+
+        // 按合并后的顺序执行读请求，收集 (original_index → data) 映射
+        let mut results: Vec<Vec<u16>> = vec![Vec::new(); regions.len()];
+
+        for coalesced in &coalesced_list {
+            // 执行合并后的读请求
+            let data = match function {
+                0x03 => {
+                    self.read_03(slave_id, coalesced.address, coalesced.quantity)
+                        .await?
+                }
+                0x04 => {
+                    self.read_04(slave_id, coalesced.address, coalesced.quantity)
+                        .await?
+                }
+                _ => return Err(ModbusError::invalid_function(function)),
+            };
+
+            // 从合并响应中提取各原始区域的数据
+            let extracted = coalescer.extract_results(coalesced, &data);
+            for (i, &(orig_idx, _, _)) in coalesced.mappings.iter().enumerate() {
+                results[orig_idx] = extracted[i].clone();
+            }
+        }
+
+        Ok(results)
     }
 }
 

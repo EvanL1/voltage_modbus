@@ -96,6 +96,9 @@ pub mod codec;
 /// Command batching for optimized write operations
 pub mod batcher;
 
+/// Read coalescing for merging adjacent/overlapping register read requests
+pub mod coalescer;
+
 /// Device-specific protocol limits configuration
 pub mod device_limits;
 
@@ -119,6 +122,7 @@ pub use value::ModbusValue;
 
 // === Industrial features ===
 pub use batcher::{BatchCommand, CommandBatcher};
+pub use coalescer::{CoalescedRead, ReadCoalescer, ReadRequest};
 pub use codec::ModbusCodec;
 pub use device_limits::DeviceLimits;
 
