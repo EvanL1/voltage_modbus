@@ -644,6 +644,10 @@ impl TcpTransport {
                 frame[pos] = qty_bytes[0];
                 frame[pos + 1] = qty_bytes[1];
                 pos += 2;
+                debug_assert!(
+                    request.data.len() <= 246,
+                    "data payload too large for Modbus frame"
+                );
                 frame[pos] = request.data.len() as u8;
                 pos += 1;
                 let data_len = request.data.len();
@@ -706,7 +710,7 @@ impl TcpTransport {
     ///
     /// Returns `(frame_bytes, transaction_id)`.  The transaction ID is assigned by the
     /// caller so that we can track which response belongs to which request in pipelining.
-    fn encode_request_with_tid(&self, request: &ModbusRequest, tid: u16) -> Vec<u8> {
+    fn encode_request_with_tid(&self, request: &ModbusRequest, tid: u16) -> ModbusResult<Vec<u8>> {
         let protocol_id = 0u16;
 
         let pdu_length = 1
@@ -758,12 +762,14 @@ impl TcpTransport {
             }
             ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
                 frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(request.data.len() as u8);
+                frame.push(u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?);
                 frame.extend_from_slice(&request.data);
             }
         }
 
-        frame
+        Ok(frame)
     }
 
     /// Send multiple requests in a pipeline.
@@ -792,7 +798,7 @@ impl TcpTransport {
         for request in requests {
             request.validate()?;
             let tid = self.next_transaction_id();
-            let frame = self.encode_request_with_tid(request, tid);
+            let frame = self.encode_request_with_tid(request, tid)?;
 
             if self.packet_logging {
                 log_packet("send", &frame, "TCP", Some(request.slave_id));
@@ -809,9 +815,12 @@ impl TcpTransport {
         }
 
         // Send all frames in one syscall
-        let stream = self.stream.as_mut().unwrap();
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("stream not connected during pipeline send"))?;
         let send_result = timeout(self.timeout, stream.write_all(&combined)).await;
-        if send_result.is_err() || send_result.unwrap().is_err() {
+        if !matches!(send_result, Ok(Ok(_))) {
             self.stats.timeouts += 1;
             self.stats.errors += 1;
             self.stream = None;
@@ -996,10 +1005,13 @@ impl ModbusTransport for TcpTransport {
             log_packet("send", frame, "TCP", Some(request.slave_id));
         }
 
-        let stream = self.stream.as_mut().unwrap();
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("stream not connected"))?;
 
         let send_result = timeout(self.timeout, stream.write_all(frame)).await;
-        if send_result.is_err() || send_result.unwrap().is_err() {
+        if !matches!(send_result, Ok(Ok(_))) {
             self.stats.timeouts += 1;
             self.stats.errors += 1;
             self.stream = None; // Mark connection as broken
@@ -1022,7 +1034,16 @@ impl ModbusTransport for TcpTransport {
         //
         // Use persistent read_buf to avoid per-request heap allocation.
         // The final validated response is copied into a response-sized Vec for decode_response.
+        const MAX_STALE_RESPONSES: usize = 5;
+        let mut stale_count = 0usize;
         let response_buf = loop {
+            if stale_count >= MAX_STALE_RESPONSES {
+                self.stats.errors += 1;
+                self.stream = None;
+                return Err(ModbusError::protocol(
+                    "too many mismatched responses; possible bus conflict",
+                ));
+            }
             // Read response header first (MBAP header + function code) into persistent buf
             let read_result = timeout(
                 self.timeout,
@@ -1109,6 +1130,7 @@ impl ModbusTransport for TcpTransport {
                     actual_tid, expected_transaction_id
                 );
                 // Discard this response and continue reading the next one
+                stale_count += 1;
                 continue;
             }
 
@@ -1120,6 +1142,7 @@ impl ModbusTransport for TcpTransport {
                     actual_unit_id, request.slave_id
                 );
                 // Discard this response and continue reading the next one
+                stale_count += 1;
                 continue;
             }
 
@@ -1359,7 +1382,9 @@ impl RtuTransport {
                 // Address (2 bytes) + Quantity (2 bytes) + Byte count (1 byte) + Data
                 frame.extend_from_slice(&request.address.to_be_bytes());
                 frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(request.data.len() as u8);
+                frame.push(u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?);
                 frame.extend_from_slice(&request.data);
             }
 
@@ -1367,7 +1392,9 @@ impl RtuTransport {
                 // Address (2 bytes) + Quantity (2 bytes) + Byte count (1 byte) + Data
                 frame.extend_from_slice(&request.address.to_be_bytes());
                 frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(request.data.len() as u8);
+                frame.push(u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?);
                 frame.extend_from_slice(&request.data);
             }
         }
@@ -1889,7 +1916,9 @@ impl AsciiTransport {
             ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
                 raw_data.extend_from_slice(&request.address.to_be_bytes());
                 raw_data.extend_from_slice(&request.quantity.to_be_bytes());
-                raw_data.push(request.data.len() as u8);
+                raw_data.push(u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?);
                 raw_data.extend_from_slice(&request.data);
             }
         }

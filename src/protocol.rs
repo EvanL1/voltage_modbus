@@ -568,7 +568,7 @@ pub mod data_utils {
 
     /// Pack boolean values into bytes
     pub fn pack_bits(bits: &[bool]) -> Vec<u8> {
-        let byte_count = (bits.len() + 7) / 8;
+        let byte_count = bits.len().div_ceil(8);
         let mut bytes = vec![0u8; byte_count];
 
         for (i, &bit) in bits.iter().enumerate() {

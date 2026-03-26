@@ -22,7 +22,7 @@
 //! - `BigEndianSwap (CDAB)`: \[0x56, 0x78, 0x12, 0x34\] (Modbus common)
 //! - `LittleEndianSwap (BADC)`: \[0x34, 0x12, 0x78, 0x56\]
 
-use std::fmt;
+use core::fmt;
 
 /// Unified byte/word order representation for 16/32/64-bit values.
 ///

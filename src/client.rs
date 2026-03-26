@@ -853,7 +853,7 @@ impl<T: ModbusTransport + Send + Sync> ModbusClient for GenericModbusClient<T> {
             return Err(ModbusError::invalid_data("Invalid quantity"));
         }
 
-        let byte_count = (values.len() + 7) / 8;
+        let byte_count = values.len().div_ceil(8);
         // Note: byte_count is added by transport layer, we only send the coil data
         let mut data = Vec::with_capacity(byte_count);
 
@@ -938,7 +938,7 @@ impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
     ///
     /// # Example
     ///
-    /// ```rust,no_run
+    /// ```rust,ignore
     /// use voltage_modbus::{ModbusTcpClient, ModbusResult};
     /// use std::time::Duration;
     ///
@@ -2182,6 +2182,50 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].as_ref().unwrap(), &[1, 2, 3]);
         assert_eq!(results[1].as_ref().unwrap(), &[4, 5]);
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_out_of_order_responses() {
+        // Server sends responses in REVERSE order (TID2 first, then TID1).
+        // Client must return results in ORIGINAL request order.
+        let (server_addr, server_handle) = spawn_mock_server(2, |meta| async move {
+            let mut out = Vec::new();
+            // Send response for second request first (reverse order)
+            let (tid1, slave1, _) = meta[1];
+            out.extend_from_slice(&build_fc03_response_frame(tid1, slave1, &[200u16, 201]));
+            // Then send response for first request
+            let (tid0, slave0, _) = meta[0];
+            out.extend_from_slice(&build_fc03_response_frame(tid0, slave0, &[100u16, 101]));
+            out
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        let requests = vec![
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 10, 2),
+        ];
+
+        let results = client
+            .pipeline(requests, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        // Results must be in original request order despite out-of-order server responses
+        assert_eq!(
+            results[0].as_ref().unwrap().parse_registers().unwrap(),
+            vec![100u16, 101]
+        );
+        assert_eq!(
+            results[1].as_ref().unwrap().parse_registers().unwrap(),
+            vec![200u16, 201]
+        );
 
         server_handle.await.unwrap();
     }

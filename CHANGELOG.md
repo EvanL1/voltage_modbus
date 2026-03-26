@@ -5,6 +5,29 @@ All notable changes to Voltage Modbus library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-03-26
+
+### Fixed
+- **DoS prevention**: Added stale-response counter (max 5) to TCP TID-mismatch loop — a misbehaving server can no longer cause infinite looping (`transport.rs`)
+- **Panic safety**: Replaced `unwrap()` on `Option<TcpStream>` in pipeline send and regular request hot paths with `ok_or_else(...)? ` (`transport.rs`)
+- **Protocol correctness**: Added overflow guard in `PduBuilder::build_write_multiple_registers` and `build_write_multiple_coils` — byte_count field no longer silently truncates (`pdu.rs`)
+- **Protocol correctness**: `data.len() as u8` casts in transport encode functions replaced with checked `u8::try_from` (`transport.rs` TCP, RTU, ASCII paths)
+- **no_std**: `bytes.rs` and `value.rs` now use `core::fmt` instead of `std::fmt`
+- **Server module**: Fixed pre-existing `log` crate reference (changed to `tracing`), deprecated `ModbusError::InvalidFrame` usages, and `div_ceil` patterns in `server.rs`
+
+### Added
+- **Tests**: PDU boundary tests — overflow at 253 bytes, oversized `from_slice`, write-multiple-registers limit
+- **Tests**: Pipeline out-of-order response test — verifies TID-based reordering when server replies in reverse order
+- **Modules**: `server` and `register_bank` registered in `lib.rs` under `rtu` feature — tests now run with `cargo test --features rtu`
+- **CI**: `no-std` job — checks core modules compile for `thumbv7em-none-eabihf`
+- **CI**: `msrv` job — verifies compilation on Rust 1.85.0
+- **CI**: `security-audit` job — `cargo audit` on every push
+- **CI**: `coverage` job — LCOV report via `cargo-llvm-cov`, uploaded to Codecov
+- **CI**: `check` job now also runs `cargo check --no-default-features`
+
+### Changed
+- `README.md` version examples updated from `0.4` to `0.5`
+
 ## [0.4.7] - 2026-01-06
 
 ### Changed

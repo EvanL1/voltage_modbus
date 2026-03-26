@@ -1,7 +1,7 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.4.3
+//! **Version:** 0.5.1
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
@@ -142,6 +142,14 @@ pub mod coalescer;
 /// Device-specific protocol limits configuration
 #[cfg(feature = "std")]
 pub mod device_limits;
+
+/// Modbus server implementation (TCP slave mode)
+#[cfg(feature = "rtu")]
+pub mod server;
+
+/// In-memory register bank for server implementations
+#[cfg(feature = "rtu")]
+pub mod register_bank;
 
 // ============================================================================
 // Re-exports for convenience

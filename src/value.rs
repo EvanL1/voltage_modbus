@@ -3,7 +3,7 @@
 //! Self-contained data types for industrial Modbus applications.
 //! Designed for register encoding/decoding with minimal allocations.
 
-use std::fmt;
+use core::fmt;
 
 /// Industrial data type enumeration for Modbus register values.
 ///

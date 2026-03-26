@@ -8,7 +8,7 @@
 #[cfg(not(feature = "std"))]
 use alloc::{format, string::ToString, vec};
 
-use crate::constants::MAX_PDU_SIZE;
+use crate::constants::{MAX_PDU_SIZE, MAX_WRITE_COILS, MAX_WRITE_REGISTERS};
 use crate::error::{ModbusError, ModbusResult};
 
 /// High-performance PDU with stack-allocated fixed array
@@ -321,8 +321,13 @@ impl PduBuilder {
     /// * `address` - Starting address
     /// * `values` - Coil values
     pub fn build_write_multiple_coils(address: u16, values: &[bool]) -> ModbusResult<ModbusPdu> {
+        if values.len() > MAX_WRITE_COILS {
+            return Err(ModbusError::invalid_data(
+                "write_multiple_coils: maximum 1968 coils per request",
+            ));
+        }
         let quantity = values.len() as u16;
-        let byte_count = (values.len() + 7) / 8;
+        let byte_count = values.len().div_ceil(8);
 
         // Pack bits into bytes
         let mut coil_bytes = vec![0u8; byte_count];
@@ -347,8 +352,13 @@ impl PduBuilder {
     /// * `address` - Starting address
     /// * `values` - Register values
     pub fn build_write_multiple_registers(address: u16, values: &[u16]) -> ModbusResult<ModbusPdu> {
+        if values.len() > MAX_WRITE_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "write_multiple_registers: maximum 123 registers per request",
+            ));
+        }
         let quantity = values.len() as u16;
-        let byte_count = (values.len() * 2) as u8;
+        let byte_count = (values.len() * 2) as u8; // safe: 123*2=246 < 256
 
         let mut builder = PduBuilder::new()
             .function_code(0x10)?
@@ -447,6 +457,42 @@ mod tests {
         assert_eq!(
             pdu.as_slice(),
             &[0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn test_pdu_push_at_capacity_returns_error() {
+        use crate::constants::MAX_PDU_SIZE;
+        let mut pdu = ModbusPdu::new();
+        // Fill to exactly MAX_PDU_SIZE bytes
+        for i in 0..MAX_PDU_SIZE {
+            assert!(pdu.push(i as u8).is_ok(), "push {} should succeed", i);
+        }
+        // Next push must fail
+        let result = pdu.push(0xFF);
+        assert!(result.is_err(), "push when full should return Err");
+    }
+
+    #[test]
+    fn test_pdu_from_slice_rejects_oversized_input() {
+        use crate::constants::MAX_PDU_SIZE;
+        let oversized = vec![0u8; MAX_PDU_SIZE + 1];
+        let result = ModbusPdu::from_slice(&oversized);
+        assert!(
+            result.is_err(),
+            "from_slice with {} bytes should fail",
+            MAX_PDU_SIZE + 1
+        );
+    }
+
+    #[test]
+    fn test_pdu_from_slice_accepts_max_size() {
+        use crate::constants::MAX_PDU_SIZE;
+        let data = vec![0u8; MAX_PDU_SIZE];
+        let result = ModbusPdu::from_slice(&data);
+        assert!(
+            result.is_ok(),
+            "from_slice with MAX_PDU_SIZE bytes should succeed"
         );
     }
 }

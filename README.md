@@ -41,13 +41,13 @@ cargo add voltage_modbus
 For RTU (serial) support:
 
 ```toml
-voltage_modbus = { version = "0.4", features = ["rtu"] }
+voltage_modbus = { version = "0.5", features = ["rtu"] }
 ```
 
 For `no_std` (PDU encoding/decoding only):
 
 ```toml
-voltage_modbus = { version = "0.4", default-features = false }
+voltage_modbus = { version = "0.5", default-features = false }
 ```
 
 ## Quick Start
