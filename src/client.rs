@@ -1378,6 +1378,158 @@ impl ModbusRtuClient {
     }
 }
 
+/// Modbus RTU-over-TCP client.
+///
+/// Uses RTU framing (slave + PDU + CRC-16) over a raw TCP stream. Common on
+/// industrial gateways that bridge serial Modbus onto Ethernet without
+/// translating to proper Modbus TCP. Does not require serial dependencies.
+pub struct ModbusRtuOverTcpClient {
+    inner: GenericModbusClient<crate::transport::RtuOverTcpTransport>,
+}
+
+impl ModbusRtuOverTcpClient {
+    /// Connect to an RTU-over-TCP gateway.
+    pub async fn new(
+        address: std::net::SocketAddr,
+        timeout: Duration,
+    ) -> ModbusResult<Self> {
+        let transport = crate::transport::RtuOverTcpTransport::new(address, timeout).await?;
+        Ok(Self {
+            inner: GenericModbusClient::new(transport),
+        })
+    }
+
+    /// Parse address string and connect (e.g. `"192.168.1.10:502"`).
+    pub async fn from_address(address: &str, timeout: Duration) -> ModbusResult<Self> {
+        let transport =
+            crate::transport::RtuOverTcpTransport::from_address(address, timeout).await?;
+        Ok(Self {
+            inner: GenericModbusClient::new(transport),
+        })
+    }
+
+    /// Execute a raw request.
+    pub async fn execute_request(
+        &mut self,
+        request: ModbusRequest,
+    ) -> ModbusResult<ModbusResponse> {
+        self.inner.execute_request(request).await
+    }
+}
+
+impl ModbusClient for ModbusRtuOverTcpClient {
+    async fn read_01(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        self.inner.read_01(slave_id, address, quantity).await
+    }
+    async fn read_02(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        self.inner.read_02(slave_id, address, quantity).await
+    }
+    async fn read_03(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        self.inner.read_03(slave_id, address, quantity).await
+    }
+    async fn read_04(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        self.inner.read_04(slave_id, address, quantity).await
+    }
+    async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
+        self.inner.write_05(slave_id, address, value).await
+    }
+    async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
+        self.inner.write_06(slave_id, address, value).await
+    }
+    async fn write_0f(&mut self, slave_id: SlaveId, address: u16, values: &[bool]) -> ModbusResult<()> {
+        self.inner.write_0f(slave_id, address, values).await
+    }
+    async fn write_10(&mut self, slave_id: SlaveId, address: u16, values: &[u16]) -> ModbusResult<()> {
+        self.inner.write_10(slave_id, address, values).await
+    }
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+    async fn close(&mut self) -> ModbusResult<()> {
+        self.inner.close().await
+    }
+    fn get_stats(&self) -> TransportStats {
+        self.inner.get_stats()
+    }
+}
+
+/// Modbus ASCII client implementation using the generic client.
+///
+/// Thin wrapper over [`GenericModbusClient`]`<`[`AsciiTransport`]`>` — all
+/// protocol logic is shared with TCP and RTU; only the framing differs.
+#[cfg(feature = "rtu")]
+pub struct ModbusAsciiClient {
+    inner: GenericModbusClient<crate::transport::AsciiTransport>,
+}
+
+#[cfg(feature = "rtu")]
+impl ModbusAsciiClient {
+    /// Create a new ASCII client with default settings (7E1, 1s timeouts).
+    pub fn new(port: &str, baud_rate: u32) -> ModbusResult<Self> {
+        let transport = crate::transport::AsciiTransport::new(port, baud_rate)?;
+        Ok(Self {
+            inner: GenericModbusClient::new(transport),
+        })
+    }
+
+    /// Create from an existing [`AsciiTransport`].
+    pub fn from_transport(transport: crate::transport::AsciiTransport) -> Self {
+        Self {
+            inner: GenericModbusClient::new(transport),
+        }
+    }
+
+    /// Borrow the underlying transport.
+    pub fn transport(&self) -> &crate::transport::AsciiTransport {
+        self.inner.transport()
+    }
+
+    /// Execute a raw request.
+    pub async fn execute_request(
+        &mut self,
+        request: ModbusRequest,
+    ) -> ModbusResult<ModbusResponse> {
+        self.inner.execute_request(request).await
+    }
+}
+
+#[cfg(feature = "rtu")]
+impl ModbusClient for ModbusAsciiClient {
+    async fn read_01(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        self.inner.read_01(slave_id, address, quantity).await
+    }
+    async fn read_02(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        self.inner.read_02(slave_id, address, quantity).await
+    }
+    async fn read_03(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        self.inner.read_03(slave_id, address, quantity).await
+    }
+    async fn read_04(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        self.inner.read_04(slave_id, address, quantity).await
+    }
+    async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
+        self.inner.write_05(slave_id, address, value).await
+    }
+    async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
+        self.inner.write_06(slave_id, address, value).await
+    }
+    async fn write_0f(&mut self, slave_id: SlaveId, address: u16, values: &[bool]) -> ModbusResult<()> {
+        self.inner.write_0f(slave_id, address, values).await
+    }
+    async fn write_10(&mut self, slave_id: SlaveId, address: u16, values: &[u16]) -> ModbusResult<()> {
+        self.inner.write_10(slave_id, address, values).await
+    }
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+    async fn close(&mut self) -> ModbusResult<()> {
+        self.inner.close().await
+    }
+    fn get_stats(&self) -> TransportStats {
+        self.inner.get_stats()
+    }
+}
+
 #[cfg(feature = "rtu")]
 impl ModbusClient for ModbusRtuClient {
     async fn read_01(
@@ -1671,7 +1823,7 @@ mod tests {
 
     /// Create a FC01/FC02 (read coils/discrete inputs) response with byte_count prefix
     fn create_coil_response(slave_id: SlaveId, coils: &[bool]) -> ModbusResponse {
-        let byte_count = ((coils.len() + 7) / 8) as u8;
+        let byte_count = coils.len().div_ceil(8) as u8;
         let mut data = Vec::with_capacity(1 + byte_count as usize);
         data.push(byte_count);
 
@@ -2162,7 +2314,7 @@ mod tests {
         // Test the pipeline_reads convenience method
         let (server_addr, server_handle) = spawn_mock_server(2, |meta| async move {
             let mut out = Vec::new();
-            let data = vec![vec![1u16, 2, 3], vec![4u16, 5]];
+            let data = [vec![1u16, 2, 3], vec![4u16, 5]];
             for (i, (tid, slave_id, _)) in meta.iter().enumerate() {
                 out.extend_from_slice(&build_fc03_response_frame(*tid, *slave_id, &data[i]));
             }

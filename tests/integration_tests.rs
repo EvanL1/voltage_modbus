@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use voltage_modbus::*;
 
 /// Mock RTU transport for testing without actual serial hardware
@@ -13,6 +13,12 @@ use voltage_modbus::*;
 pub struct MockRtuTransport {
     responses: HashMap<Vec<u8>, Vec<u8>>,
     delay: Duration,
+}
+
+impl Default for MockRtuTransport {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MockRtuTransport {
@@ -224,7 +230,7 @@ fn test_frame_gap_calculations() {
 /// Test broadcast operations (slave ID 0)
 #[tokio::test]
 async fn test_broadcast_operations() {
-    let mut transport = MockRtuTransport::new();
+    let transport = MockRtuTransport::new();
 
     // Calculate proper CRC for broadcast write single coil (slave 0, addr 0x0001, value ON)
     let mut broadcast_data = vec![0x00, 0x05, 0x00, 0x01, 0xFF, 0x00];

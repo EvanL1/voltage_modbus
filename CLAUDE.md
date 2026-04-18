@@ -5,22 +5,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-# Build (default: TCP only)
+# Build (default features = "std": TCP client/server + async runtime)
 cargo build
-cargo build --features rtu          # With RTU serial support
-cargo build --features "rtu,igw"    # All features
+cargo build --features rtu                 # Add RTU serial support
+cargo build --features "rtu,igw"           # All std features
+cargo build --no-default-features          # no_std build (core modules only: constants, error, pdu, protocol)
 
 # Test
-cargo test                          # All unit + integration tests
-cargo test --lib                    # Unit tests only
-cargo test --test integration_tests # Integration tests only
-cargo test <test_name>              # Single test by name
-cargo test -p voltage_modbus <mod>::tests  # Tests in a specific module
+cargo test                                 # All unit + integration tests
+cargo test --lib                           # Unit tests only
+cargo test --test integration_tests        # Integration tests only
+cargo test <test_name>                     # Single test by name
+cargo test --features rtu                  # Include RTU tests
+
+# Run examples / demo binary (all require --features std, which is default)
+cargo run --example tcp_client
+cargo run --bin demo
 
 # Lint & Check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
+cargo clippy --no-default-features -- -D warnings  # Verify no_std build stays clean
 cargo fmt --check
-cargo doc --no-deps                 # Build docs (verify doc-tests compile)
+cargo doc --no-deps                        # Build docs (verify doc-tests compile)
 ```
 
 ## Architecture
@@ -45,23 +51,28 @@ Client methods use function-code naming as primary (`read_03`, `write_06`) with 
 
 ### Module Responsibilities
 
-- **`client.rs`** (1656L): `ModbusClient` trait, `GenericModbusClient<T>`, `ModbusTcpClient`, `ModbusRtuClient`, batch read methods
-- **`transport.rs`** (2085L): `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID), `RtuTransport` (CRC-16, frame gap timing), `TransportStats`, `PacketCallback`
-- **`protocol.rs`**: `ModbusFunction` enum, `ModbusRequest`/`ModbusResponse` structs, `data_utils` module for register/bit conversions
-- **`pdu.rs`**: `ModbusPdu` — stack-allocated fixed-size buffer (253 bytes, no heap), `PduBuilder` fluent API for constructing PDUs
-- **`error.rs`**: `ModbusError` enum with `thiserror`, classifiable via `is_recoverable()`, `is_transport_error()`, `is_protocol_error()`
+- **`client.rs`**: `ModbusClient` trait, `GenericModbusClient<T>`, `ModbusTcpClient`, `ModbusRtuClient`, batch read methods
+- **`transport.rs`**: `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID, pipelining), `RtuTransport` (CRC-16, frame gap timing), `TransportStats`, `PacketCallback`
+- **`server.rs`**: `ModbusTcpServer` — TCP server implementation backed by `RegisterBank`
+- **`register_bank.rs`**: `RegisterBank` — server-side storage for coils / discrete inputs / holding / input registers
+- **`protocol.rs`**: `ModbusFunction` enum, `ModbusRequest`/`ModbusResponse` structs, `data_utils` for register/bit conversions
+- **`pdu.rs`**: `ModbusPdu` — stack-allocated fixed-size buffer (253 bytes, no heap), `PduBuilder` fluent API
+- **`error.rs`**: `ModbusError` enum (`thiserror` in std, hand-rolled `Display` in no_std), classifiable via `is_recoverable()`, `is_transport_error()`, `is_protocol_error()`
 - **`codec.rs`**: `ModbusCodec` — encode/decode typed values (f32, f64, i32, u32, string) with configurable byte order
-- **`bytes.rs`**: `ByteOrder` enum (BigEndian, LittleEndian, MidBigEndian, MidLittleEndian) for multi-register data types
+- **`bytes.rs`**: `ByteOrder` enum (BigEndian, LittleEndian, MidBigEndian, MidLittleEndian)
 - **`batcher.rs`**: `CommandBatcher` — write command batching with configurable window and max batch size
+- **`coalescer.rs`**: read-request coalescing — merges overlapping/adjacent read ranges into fewer on-wire requests
 - **`value.rs`**: `ModbusValue` enum for typed industrial data values
 - **`device_limits.rs`**: `DeviceLimits` — per-device protocol limit configuration
-- **`constants.rs`**: Modbus spec constants (MAX_PDU_SIZE=253, MAX_READ_REGISTERS=125, etc.)
+- **`constants.rs`**: Modbus spec constants (MAX_PDU_SIZE=253, MAX_READ_REGISTERS=125, etc.) — `no_std` safe
+- **`logging.rs`** / **`utils.rs`**: tracing setup and shared helpers (std only)
 
 ### Feature Flags
 
-- **default**: TCP only (no optional deps)
-- **`rtu`**: Enables `ModbusRtuClient` and `RtuTransport` via `tokio-serial`
-- **`igw`**: IGW integration (optional)
+- **`std`** (default): enables `tokio`, `thiserror`, `bytes`, `chrono` — full async TCP client/server
+- **`rtu`**: implies `std`; adds `tokio-serial` for `ModbusRtuClient` / `RtuTransport`
+- **`igw`**: implies `std`; optional IGW integration
+- **no_std**: `cargo build --no-default-features` — only `constants`, `error`, `pdu`, `protocol` compile. Keep these four modules `alloc`/`core`-only; guard any `std`-dependent code behind `#[cfg(feature = "std")]`.
 
 ### Zero-Copy Response Parsing
 

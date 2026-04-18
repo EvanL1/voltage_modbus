@@ -172,6 +172,7 @@ pub type ModbusResult<T> = Result<T, ModbusError>;
 /// In no_std builds all `String`-bearing variants still work — they use
 /// `alloc::string::String` from the implicit `alloc` crate.
 #[cfg_attr(feature = "std", derive(Error))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum ModbusError {
     /// I/O related errors (network, serial)

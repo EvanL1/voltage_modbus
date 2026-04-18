@@ -115,7 +115,6 @@
 //! # }
 //! ```
 
-#[cfg(feature = "rtu")]
 use crc::{Crc, CRC_16_MODBUS};
 /// Modbus transport layer implementations
 ///
@@ -192,11 +191,9 @@ const MAX_TCP_FRAME_SIZE: usize = 260;
 const MBAP_HEADER_SIZE: usize = 6;
 
 /// Maximum frame size for Modbus RTU
-#[cfg(feature = "rtu")]
 const MAX_RTU_FRAME_SIZE: usize = 256;
 
-/// CRC calculator for RTU
-#[cfg(feature = "rtu")]
+/// CRC calculator shared by RTU and RTU-over-TCP transports
 const CRC_MODBUS: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
 
 /// Format raw bytes as hex string for packet logging
@@ -978,6 +975,13 @@ impl TcpTransport {
 
 impl ModbusTransport for TcpTransport {
     async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
+        tracing::trace!(
+            protocol = "tcp",
+            slave_id = request.slave_id,
+            function_code = request.function.to_u8(),
+            "modbus.request.start"
+        );
+
         // Validate request
         request.validate()?;
 
@@ -1126,8 +1130,10 @@ impl ModbusTransport for TcpTransport {
             let actual_tid = u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]);
             if actual_tid != expected_transaction_id {
                 debug!(
-                    "Discarding mismatched response: TID={:04X}, expecting {:04X}",
-                    actual_tid, expected_transaction_id
+                    actual_tid = actual_tid,
+                    expected_tid = expected_transaction_id,
+                    kind = "transaction_id_mismatch",
+                    "modbus.response.stale"
                 );
                 // Discard this response and continue reading the next one
                 stale_count += 1;
@@ -1138,8 +1144,10 @@ impl ModbusTransport for TcpTransport {
             let actual_unit_id = self.read_buf[6];
             if actual_unit_id != request.slave_id {
                 debug!(
-                    "Discarding mismatched response: Unit ID={}, expecting {}",
-                    actual_unit_id, request.slave_id
+                    actual_unit_id = actual_unit_id,
+                    expected_slave_id = request.slave_id,
+                    kind = "slave_id_mismatch",
+                    "modbus.response.stale"
                 );
                 // Discard this response and continue reading the next one
                 stale_count += 1;
@@ -1509,6 +1517,13 @@ impl RtuTransport {
 #[cfg(feature = "rtu")]
 impl ModbusTransport for RtuTransport {
     async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
+        tracing::trace!(
+            protocol = "rtu",
+            slave_id = request.slave_id,
+            function_code = request.function.to_u8(),
+            "modbus.request.start"
+        );
+
         // Validate request
         request.validate()?;
 
@@ -2195,6 +2210,312 @@ impl ModbusTransport for AsciiTransport {
     }
 }
 
+// ============================================================================
+// RTU-over-TCP transport
+// ============================================================================
+//
+// Wraps RTU frames (slave + PDU + CRC-16) in a raw TCP stream — common on
+// Chinese PLC gateways and USR-series serial-to-ethernet converters. Reuses
+// the RTU framing from [`RtuTransport`] but runs over [`TcpStream`] instead
+// of a serial port, so no serial dependencies are required.
+
+/// Modbus RTU-over-TCP transport.
+///
+/// Uses RTU framing (slave ID + function + data + CRC-16, little-endian CRC)
+/// but carries it over TCP. No MBAP header, no transaction ID.
+///
+/// Typical use case: industrial gateways that bridge serial Modbus devices
+/// onto an Ethernet network without translating to proper Modbus TCP.
+pub struct RtuOverTcpTransport {
+    address: SocketAddr,
+    stream: Option<TcpStream>,
+    timeout: Duration,
+    stats: TransportStats,
+}
+
+impl RtuOverTcpTransport {
+    /// Connect to a gateway.
+    pub async fn new(address: SocketAddr, timeout: Duration) -> ModbusResult<Self> {
+        let stream = TcpStream::connect(address).await.map_err(|e| {
+            ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
+        })?;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
+        Ok(Self {
+            address,
+            stream: Some(stream),
+            timeout,
+            stats: TransportStats::default(),
+        })
+    }
+
+    /// Parse address string and connect.
+    pub async fn from_address(address: &str, timeout: Duration) -> ModbusResult<Self> {
+        let addr: SocketAddr = address
+            .parse()
+            .map_err(|e| ModbusError::connection(format!("Invalid address {}: {}", address, e)))?;
+        Self::new(addr, timeout).await
+    }
+
+    fn encode_request(request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
+        let mut frame = Vec::with_capacity(MAX_RTU_FRAME_SIZE);
+        frame.push(request.slave_id);
+        frame.push(request.function.to_u8());
+        match request.function {
+            ModbusFunction::ReadCoils
+            | ModbusFunction::ReadDiscreteInputs
+            | ModbusFunction::ReadHoldingRegisters
+            | ModbusFunction::ReadInputRegisters => {
+                frame.extend_from_slice(&request.address.to_be_bytes());
+                frame.extend_from_slice(&request.quantity.to_be_bytes());
+            }
+            ModbusFunction::WriteSingleCoil => {
+                frame.extend_from_slice(&request.address.to_be_bytes());
+                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
+                    0xFF00
+                } else {
+                    0x0000
+                };
+                frame.extend_from_slice(&value.to_be_bytes());
+            }
+            ModbusFunction::WriteSingleRegister => {
+                frame.extend_from_slice(&request.address.to_be_bytes());
+                if request.data.len() >= 2 {
+                    frame.extend_from_slice(&request.data[0..2]);
+                } else {
+                    frame.extend_from_slice(&[0, 0]);
+                }
+            }
+            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
+                frame.extend_from_slice(&request.address.to_be_bytes());
+                frame.extend_from_slice(&request.quantity.to_be_bytes());
+                frame.push(u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?);
+                frame.extend_from_slice(&request.data);
+            }
+        }
+        let crc = CRC_MODBUS.checksum(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        Ok(frame)
+    }
+
+    fn decode_response(frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
+        if frame.len() < 4 {
+            return Err(ModbusError::frame("RTU-over-TCP frame too short"));
+        }
+        let pdu_len = frame.len() - 2;
+        let received_crc = u16::from_le_bytes([frame[pdu_len], frame[pdu_len + 1]]);
+        let calculated_crc = CRC_MODBUS.checksum(&frame[..pdu_len]);
+        if received_crc != calculated_crc {
+            return Err(ModbusError::crc_mismatch(calculated_crc, received_crc));
+        }
+        let slave_id = frame[0];
+        let function_code = frame[1];
+        if function_code & 0x80 != 0 {
+            if frame.len() < 5 {
+                return Err(ModbusError::frame("Invalid exception response"));
+            }
+            return Ok(ModbusResponse::new_exception(
+                slave_id,
+                ModbusFunction::from_u8(function_code & 0x7F)?,
+                frame[2],
+            ));
+        }
+        let function = ModbusFunction::from_u8(function_code)?;
+        let data_start = 2;
+        let data_len = pdu_len.saturating_sub(2);
+        Ok(ModbusResponse::new_from_frame(
+            frame, slave_id, function, data_start, data_len,
+        ))
+    }
+
+    /// Read a complete RTU frame from the TCP stream based on function code.
+    ///
+    /// Unlike serial RTU (which relies on inter-frame silence), this uses
+    /// length-prefixed reads derived from the function code — reliable
+    /// because TCP guarantees in-order delivery.
+    async fn read_frame(stream: &mut TcpStream) -> ModbusResult<Vec<u8>> {
+        let mut header = [0u8; 2];
+        stream.read_exact(&mut header).await?;
+        let func = header[1];
+
+        // Exception response: [slave, func|0x80, exception, crc(2)] = 5 bytes
+        let remaining = if func & 0x80 != 0 {
+            3
+        } else {
+            match func {
+                0x01..=0x04 => {
+                    // [byte_count, data..., crc(2)]: read byte_count first
+                    let mut bc = [0u8; 1];
+                    stream.read_exact(&mut bc).await?;
+                    let mut out = Vec::with_capacity(2 + 1 + bc[0] as usize + 2);
+                    out.extend_from_slice(&header);
+                    out.push(bc[0]);
+                    let mut data = vec![0u8; bc[0] as usize + 2];
+                    stream.read_exact(&mut data).await?;
+                    out.extend_from_slice(&data);
+                    return Ok(out);
+                }
+                0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
+                _ => return Err(ModbusError::frame(format!("Unsupported function code 0x{:02X}", func))),
+            }
+        };
+
+        let mut frame = Vec::with_capacity(2 + remaining);
+        frame.extend_from_slice(&header);
+        let mut rest = vec![0u8; remaining];
+        stream.read_exact(&mut rest).await?;
+        frame.extend_from_slice(&rest);
+        Ok(frame)
+    }
+
+    async fn reconnect(&mut self) -> ModbusResult<()> {
+        let stream = TcpStream::connect(self.address).await.map_err(|e| {
+            ModbusError::connection(format!("Reconnect to {} failed: {}", self.address, e))
+        })?;
+        stream.set_nodelay(true).ok();
+        self.stream = Some(stream);
+        Ok(())
+    }
+}
+
+impl ModbusTransport for RtuOverTcpTransport {
+    async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
+        tracing::trace!(
+            protocol = "rtu-over-tcp",
+            slave_id = request.slave_id,
+            function_code = request.function.to_u8(),
+            "modbus.request.start"
+        );
+
+        let frame = Self::encode_request(request)?;
+
+        if self.stream.is_none() {
+            self.reconnect().await?;
+        }
+        let stream = self.stream.as_mut().expect("stream reconnected");
+
+        self.stats.requests_sent += 1;
+        let io_timeout = self.timeout;
+
+        let write_result = timeout(io_timeout, stream.write_all(&frame)).await;
+        if let Err(_) | Ok(Err(_)) = &write_result {
+            self.stream = None;
+        }
+        match write_result {
+            Err(_) => return Err(ModbusError::timeout("write", io_timeout.as_millis() as u64)),
+            Ok(Err(e)) => return Err(ModbusError::connection(format!("write failed: {}", e))),
+            Ok(Ok(())) => {}
+        }
+
+        // Broadcast: no response expected
+        if request.slave_id == 0 {
+            self.stats.responses_received += 1;
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
+        }
+
+        let stream = self.stream.as_mut().expect("stream still open");
+        let read_result = timeout(io_timeout, Self::read_frame(stream)).await;
+        let frame = match read_result {
+            Err(_) => {
+                self.stream = None;
+                return Err(ModbusError::timeout("read", io_timeout.as_millis() as u64));
+            }
+            Ok(Err(e)) => {
+                self.stream = None;
+                return Err(e);
+            }
+            Ok(Ok(f)) => f,
+        };
+
+        self.stats.responses_received += 1;
+        self.stats.bytes_received += frame.len() as u64;
+        self.stats.bytes_sent += 0; // already counted via write
+
+        let response = Self::decode_response(frame).inspect_err(|_| {
+            self.stats.errors += 1;
+        })?;
+
+        if response.slave_id != request.slave_id {
+            self.stats.errors += 1;
+            return Err(ModbusError::frame(format!(
+                "Slave ID mismatch: expected {}, got {}",
+                request.slave_id, response.slave_id
+            )));
+        }
+        Ok(response)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    async fn close(&mut self) -> ModbusResult<()> {
+        if let Some(mut stream) = self.stream.take() {
+            stream.shutdown().await.ok();
+        }
+        Ok(())
+    }
+
+    fn get_stats(&self) -> TransportStats {
+        self.stats
+    }
+}
+
+#[cfg(test)]
+mod rtu_over_tcp_tests {
+    use super::*;
+
+    #[test]
+    fn encodes_read_holding_registers_with_crc() {
+        let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 100, 10);
+        let frame = RtuOverTcpTransport::encode_request(&req).unwrap();
+        // slave(1) + func(1) + addr(2) + qty(2) + crc(2) = 8 bytes
+        assert_eq!(frame.len(), 8);
+        assert_eq!(frame[0], 1);
+        assert_eq!(frame[1], 0x03);
+        assert_eq!(&frame[2..4], &100u16.to_be_bytes());
+        assert_eq!(&frame[4..6], &10u16.to_be_bytes());
+        // Verify CRC roundtrips via decode
+        let crc = CRC_MODBUS.checksum(&frame[..6]);
+        assert_eq!(&frame[6..8], &crc.to_le_bytes());
+    }
+
+    #[test]
+    fn decode_rejects_bad_crc() {
+        let mut frame = vec![1u8, 0x03, 0x02, 0x12, 0x34];
+        frame.extend_from_slice(&0xDEADu16.to_le_bytes()); // bogus CRC
+        let err = RtuOverTcpTransport::decode_response(frame).unwrap_err();
+        assert!(err.is_protocol_error() || err.is_transport_error());
+    }
+
+    #[test]
+    fn decode_read_holding_response_roundtrip() {
+        // Response: slave=1, fc=03, byte_count=4, regs=[0x1234, 0x5678]
+        let mut frame = vec![0x01, 0x03, 0x04, 0x12, 0x34, 0x56, 0x78];
+        let crc = CRC_MODBUS.checksum(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        let resp = RtuOverTcpTransport::decode_response(frame).unwrap();
+        assert_eq!(resp.slave_id, 1);
+        assert_eq!(resp.function, ModbusFunction::ReadHoldingRegisters);
+        assert_eq!(resp.data(), &[0x04, 0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn decode_exception_response() {
+        // Slave 1, FC 0x03 + 0x80 = 0x83 exception, code = 0x02 (illegal data address)
+        let mut frame = vec![0x01, 0x83, 0x02];
+        let crc = CRC_MODBUS.checksum(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        let resp = RtuOverTcpTransport::decode_response(frame).unwrap();
+        assert_eq!(resp.slave_id, 1);
+        assert_eq!(resp.function, ModbusFunction::ReadHoldingRegisters);
+        assert!(resp.is_exception());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2337,14 +2658,14 @@ mod rtu_tests {
         assert_eq!(ascii_hex, [b'0', b'F']);
 
         // Test ASCII hex to byte
-        let byte = AsciiTransport::ascii_hex_to_byte(&[b'1', b'A']).unwrap();
+        let byte = AsciiTransport::ascii_hex_to_byte(b"1A").unwrap();
         assert_eq!(byte, 0x1A);
 
-        let byte = AsciiTransport::ascii_hex_to_byte(&[b'0', b'F']).unwrap();
+        let byte = AsciiTransport::ascii_hex_to_byte(b"0F").unwrap();
         assert_eq!(byte, 0x0F);
 
         // Test lowercase support
-        let byte = AsciiTransport::ascii_hex_to_byte(&[b'a', b'f']).unwrap();
+        let byte = AsciiTransport::ascii_hex_to_byte(b"af").unwrap();
         assert_eq!(byte, 0xAF);
     }
 

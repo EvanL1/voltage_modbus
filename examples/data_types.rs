@@ -52,8 +52,8 @@ fn main() {
     ];
 
     println!(
-        "{:<8} {:<20} {:<12} {}",
-        "Type", "Value", "as_f64()", "Registers"
+        "{:<8} {:<20} {:<12} Registers",
+        "Type", "Value", "as_f64()"
     );
     println!("{}", "-".repeat(60));
 

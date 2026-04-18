@@ -112,6 +112,7 @@ pub type ModbusValue = u16;
 pub type SlaveId = u8;
 
 /// Modbus function codes
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ModbusFunction {
@@ -194,6 +195,7 @@ impl fmt::Display for ModbusFunction {
 }
 
 /// Modbus exception codes
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ModbusException {
@@ -695,10 +697,10 @@ mod tests {
         let bit_data = vec![1, 0b10101010]; // byte_count + 1 byte
         let response = ModbusResponse::new_success(1, ModbusFunction::ReadCoils, bit_data);
         let bits = response.parse_bits().unwrap();
-        assert_eq!(bits[0], false); // LSB first
-        assert_eq!(bits[1], true);
-        assert_eq!(bits[2], false);
-        assert_eq!(bits[3], true);
+        assert!(!bits[0]); // LSB first
+        assert!(bits[1]);
+        assert!(!bits[2]);
+        assert!(bits[3]);
     }
 
     // -------------------------------------------------------------------------

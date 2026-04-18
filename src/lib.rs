@@ -75,6 +75,7 @@
 // no_std support
 // ============================================================================
 #![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
@@ -139,6 +140,10 @@ pub mod batcher;
 #[cfg(feature = "std")]
 pub mod coalescer;
 
+/// Shared scheduler trait over batcher + coalescer request types
+#[cfg(feature = "std")]
+pub mod scheduler;
+
 /// Device-specific protocol limits configuration
 #[cfg(feature = "std")]
 pub mod device_limits;
@@ -184,13 +189,19 @@ pub use batcher::{BatchCommand, CommandBatcher};
 pub use coalescer::{CoalescedRead, ReadCoalescer, ReadRequest};
 
 #[cfg(feature = "std")]
+pub use scheduler::ScheduledRequest;
+
+#[cfg(feature = "std")]
 pub use codec::ModbusCodec;
 
 #[cfg(feature = "std")]
 pub use device_limits::DeviceLimits;
 
 #[cfg(feature = "std")]
-pub use transport::{ModbusTransport, TcpTransport, TransportStats};
+pub use client::ModbusRtuOverTcpClient;
+
+#[cfg(feature = "std")]
+pub use transport::{ModbusTransport, RtuOverTcpTransport, TcpTransport, TransportStats};
 
 #[cfg(feature = "std")]
 pub use transport::{PacketCallback, PacketDirection};
@@ -231,10 +242,10 @@ pub use device_limits::{
 pub use utils::OperationTimer;
 
 #[cfg(feature = "rtu")]
-pub use client::ModbusRtuClient;
+pub use client::{ModbusAsciiClient, ModbusRtuClient};
 
 #[cfg(feature = "rtu")]
-pub use transport::RtuTransport;
+pub use transport::{AsciiTransport, RtuTransport};
 
 /// Default timeout for operations (5 seconds)
 pub const DEFAULT_TIMEOUT_MS: u64 = 5000;

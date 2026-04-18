@@ -241,8 +241,8 @@ mod tests {
         assert_eq!(ModbusValue::I16(-50).as_f64(), -50.0);
         assert_eq!(ModbusValue::U32(100000).as_f64(), 100000.0);
         assert_eq!(ModbusValue::I32(-100000).as_f64(), -100000.0);
-        assert!((ModbusValue::F32(3.14).as_f64() - 3.14).abs() < 0.001);
-        assert_eq!(ModbusValue::F64(3.14159265359).as_f64(), 3.14159265359);
+        assert!((ModbusValue::F32(2.5).as_f64() - 2.5).abs() < 0.001);
+        assert_eq!(ModbusValue::F64(1.2345e10).as_f64(), 1.2345e10);
     }
 
     #[test]
@@ -283,10 +283,10 @@ mod tests {
         let _: ModbusValue = (-50i16).into();
         let _: ModbusValue = 100000u32.into();
         let _: ModbusValue = (-100000i32).into();
-        let _: ModbusValue = 3.14f32.into();
+        let _: ModbusValue = 2.5f32.into();
         let _: ModbusValue = 100000000u64.into();
         let _: ModbusValue = (-100000000i64).into();
-        let _: ModbusValue = 3.14159265359f64.into();
+        let _: ModbusValue = 1.2345e10f64.into();
     }
 
     #[test]

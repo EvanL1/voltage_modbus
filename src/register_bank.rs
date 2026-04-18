@@ -264,7 +264,7 @@ mod tests {
         // Test single coil write and read
         bank.write_05(10, true).unwrap();
         let coils = bank.read_01(10, 1).unwrap();
-        assert_eq!(coils[0], true);
+        assert!(coils[0]);
 
         // Test multiple coil operations
         bank.write_0f(20, &[true, false, true]).unwrap();

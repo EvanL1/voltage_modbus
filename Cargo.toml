@@ -42,6 +42,9 @@ bytes = { version = "1.4", optional = true }
 # CRC — supports no_std natively
 crc = "3.0"
 
+# defmt — optional, for embedded logging
+defmt = { version = "0.3", optional = true }
+
 # Time (std only)
 chrono = { version = "0.4", optional = true }
 
@@ -53,6 +56,12 @@ igw = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false
+required-features = ["std"]
 
 [features]
 # std feature enables all async/network capabilities (default ON for backwards compat)
@@ -65,6 +74,12 @@ std = [
 ]
 rtu = ["std", "dep:tokio-serial"]
 igw = ["std", "dep:igw"]
+
+# defmt integration — derives `defmt::Format` for no_std-safe public types
+# (ModbusError, ModbusFunction, ModbusException). Pairs well with `embedded`
+# for RTT/USB logging on MCUs. Enables defmt's `alloc` feature so variants
+# carrying `String` payloads can be formatted.
+defmt = ["dep:defmt", "defmt/alloc"]
 
 # no_std builds use: cargo build --no-default-features
 
@@ -92,6 +107,11 @@ required-features = ["std"]
 name = "data_types"
 path = "examples/data_types.rs"
 required-features = ["std"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
 
 [profile.release]
 opt-level = 3

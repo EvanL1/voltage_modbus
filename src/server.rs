@@ -1133,7 +1133,7 @@ mod tests {
         let coils = server_bank.read_coils(0, 1).unwrap();
         let registers = server_bank.read_holding_registers(0, 1).unwrap();
 
-        assert_eq!(coils[0], true);
+        assert!(coils[0]);
         assert_eq!(registers[0], 0x1234);
     }
 
