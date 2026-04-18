@@ -53,6 +53,7 @@ igw = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio-test = "0.4"
+proptest = "1.4"
 
 [features]
 # std feature enables all async/network capabilities (default ON for backwards compat)
