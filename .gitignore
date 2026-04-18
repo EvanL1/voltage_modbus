@@ -3,6 +3,11 @@
 **/*.rs.bk
 *.pdb
 
+# cargo-fuzz artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
 # IDE
 .vscode/
 .idea/

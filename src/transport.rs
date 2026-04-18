@@ -1464,6 +1464,36 @@ impl RtuTransport {
         ))
     }
 
+    /// Create a minimal `RtuTransport` instance without opening a serial port.
+    ///
+    /// Intended exclusively for fuzz/property-based testing of the decode path.
+    /// Not part of the public API — subject to change without notice.
+    #[doc(hidden)]
+    pub fn new_for_fuzz() -> Self {
+        Self {
+            port: None,
+            port_name: String::new(),
+            baud_rate: 9600,
+            data_bits: tokio_serial::DataBits::Eight,
+            stop_bits: tokio_serial::StopBits::One,
+            parity: tokio_serial::Parity::None,
+            timeout: std::time::Duration::from_millis(100),
+            frame_gap: std::time::Duration::from_millis(4),
+            stats: TransportStats::default(),
+            packet_logging: false,
+            packet_callback: None,
+        }
+    }
+
+    /// Thin public wrapper around `decode_response` for fuzz testing.
+    ///
+    /// Feeds arbitrary bytes through the RTU decode path without needing a
+    /// real serial port.  Not part of the public API — subject to change.
+    #[doc(hidden)]
+    pub fn decode_response_fuzz(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
+        self.decode_response(frame)
+    }
+
     /// Wait for frame gap before sending next frame
     async fn wait_frame_gap(&self) {
         tokio::time::sleep(self.frame_gap).await;
