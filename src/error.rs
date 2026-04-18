@@ -1,3 +1,8 @@
+// Deprecated variants below are exposed for backward compatibility; derive
+// macros (thiserror, defmt::Format) reference them and would otherwise trigger
+// lints. Silencing at module scope keeps call-site warnings for users intact.
+#![allow(deprecated)]
+
 //! # Voltage Modbus Error Handling
 //!
 //! This module provides comprehensive error handling for the Voltage Modbus library,
