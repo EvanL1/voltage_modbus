@@ -5,6 +5,30 @@ All notable changes to Voltage Modbus library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-04-18
+
+### Added
+- **Modbus ASCII client** — `ModbusAsciiClient` now exposed publicly (wraps the existing `AsciiTransport`). Gated on `rtu` feature.
+- **RTU-over-TCP transport** — `RtuOverTcpTransport` + `ModbusRtuOverTcpClient` for industrial gateways that carry raw RTU frames over TCP (no serial dependencies). Available in the default feature set.
+- **`embedded` feature** — `EmbeddedRtuTransport<RW>` over `embedded-io-async::{Read, Write}`, `no_std + alloc`, `heapless` TX buffer. Enables Modbus RTU on RP2040 / ESP32 / STM32 without any tokio or serial deps. Build with `cargo build --no-default-features --features embedded`.
+- **`defmt` feature** — derives `defmt::Format` on `ModbusError`, `ModbusFunction`, `ModbusException` for RTT/USB logging on MCUs. Pairs with `embedded`.
+- **`ScheduledRequest` trait** — minimal shared surface (`slave_id()` + `function_code()`) implemented by both `BatchCommand` and `ReadRequest`, for uniform routing/logging.
+- **Criterion benchmarks** — `benches/throughput.rs` covers PDU builder, byte-order decode (all 4 variants × f32/u32/f64), and read coalescer.
+- **cargo-fuzz targets** — `fuzz/fuzz_targets/` with 3 targets (TCP frame parser, RTU decode, PDU builder). 6.8M iterations, 0 crashes.
+- **proptest properties** — `tests/proptest_roundtrips.rs` with 15 properties covering byte-order roundtrips, PDU builder invariants, and coalescer invariants.
+- **docs.rs feature badges** — `doc_auto_cfg` auto-annotates every feature-gated item. `[package.metadata.docs.rs]` builds with `all-features`.
+
+### Changed
+- Transport-layer tracing calls restructured to use key-value fields (`protocol`, `slave_id`, `function_code`, `kind`) instead of interpolated strings — now filterable in `tracing-subscriber`.
+- `CRC_MODBUS` constant moved out of the `rtu`-feature gate so both RTU and RTU-over-TCP transports share it.
+
+### Fixed
+- Cleaned all pre-existing clippy warnings (`approx_constant`, `bool_assert_comparison`, `byte_char_slices`, `manual_div_ceil`, `useless_vec`, `new_without_default`). `cargo clippy --all-features --all-targets -- -D warnings` now passes.
+- Silenced self-referential `deprecated` warnings on `ModbusError` legacy variants (triggered by `defmt::Format` derive expansion). User-facing call-site deprecation warnings are preserved.
+
+### Notes
+- **Known behavior** (not changed in this release): `ReadCoalescer::coalesce` silently clips `quantity` when `address + quantity > u16::MAX` due to `saturating_add` in `end_address`. Documented by proptest; will be addressed in a follow-up.
+
 ## [0.5.1] - 2026-03-26
 
 ### Fixed
