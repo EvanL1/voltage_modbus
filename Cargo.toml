@@ -51,6 +51,12 @@ tokio-serial = { version = "5.4", optional = true }
 # IGW integration (optional, requires std)
 igw = { version = "0.2", optional = true }
 
+# Embedded async I/O (no_std compatible)
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
+
+# Heapless collections for no_alloc embedded buffers
+heapless = { version = "0.8", default-features = false, optional = true }
+
 [dev-dependencies]
 tokio-test = "0.4"
 
@@ -65,6 +71,10 @@ std = [
 ]
 rtu = ["std", "dep:tokio-serial"]
 igw = ["std", "dep:igw"]
+
+# Embedded transport: no_std + alloc, uses embedded-io-async + heapless
+# Usage: cargo build --no-default-features --features embedded
+embedded = ["dep:embedded-io-async", "dep:heapless"]
 
 # no_std builds use: cargo build --no-default-features
 

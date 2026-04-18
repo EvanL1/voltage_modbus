@@ -147,6 +147,10 @@ pub mod device_limits;
 #[cfg(feature = "rtu")]
 pub mod server;
 
+/// Embedded async RTU transport via `embedded-io-async` (no_std + alloc)
+#[cfg(feature = "embedded")]
+pub mod embedded;
+
 /// In-memory register bank for server implementations
 #[cfg(feature = "rtu")]
 pub mod register_bank;
@@ -235,6 +239,9 @@ pub use client::ModbusRtuClient;
 
 #[cfg(feature = "rtu")]
 pub use transport::RtuTransport;
+
+#[cfg(feature = "embedded")]
+pub use embedded::EmbeddedRtuTransport;
 
 /// Default timeout for operations (5 seconds)
 pub const DEFAULT_TIMEOUT_MS: u64 = 5000;
