@@ -43,15 +43,21 @@ fn bench_byte_order_decode(c: &mut Criterion) {
         ByteOrder::BigEndianSwap,
         ByteOrder::LittleEndianSwap,
     ] {
-        g.bench_with_input(BenchmarkId::new("f32", format!("{order:?}")), &order, |b, &o| {
-            b.iter(|| regs_to_f32(black_box(&regs2), o))
-        });
-        g.bench_with_input(BenchmarkId::new("u32", format!("{order:?}")), &order, |b, &o| {
-            b.iter(|| regs_to_u32(black_box(&regs2), o))
-        });
-        g.bench_with_input(BenchmarkId::new("f64", format!("{order:?}")), &order, |b, &o| {
-            b.iter(|| regs_to_f64(black_box(&regs4), o))
-        });
+        g.bench_with_input(
+            BenchmarkId::new("f32", format!("{order:?}")),
+            &order,
+            |b, &o| b.iter(|| regs_to_f32(black_box(&regs2), o)),
+        );
+        g.bench_with_input(
+            BenchmarkId::new("u32", format!("{order:?}")),
+            &order,
+            |b, &o| b.iter(|| regs_to_u32(black_box(&regs2), o)),
+        );
+        g.bench_with_input(
+            BenchmarkId::new("f64", format!("{order:?}")),
+            &order,
+            |b, &o| b.iter(|| regs_to_f64(black_box(&regs4), o)),
+        );
     }
     g.finish();
 }
@@ -79,5 +85,10 @@ fn bench_coalescer(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_pdu_builder, bench_byte_order_decode, bench_coalescer);
+criterion_group!(
+    benches,
+    bench_pdu_builder,
+    bench_byte_order_decode,
+    bench_coalescer
+);
 criterion_main!(benches);

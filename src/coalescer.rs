@@ -64,8 +64,8 @@ impl ReadRequest {
 
     /// 返回此请求覆盖的末尾地址（不含）
     #[inline]
-    fn end_address(&self) -> u16 {
-        self.address.saturating_add(self.quantity)
+    fn end_address(&self) -> u32 {
+        u32::from(self.address) + u32::from(self.quantity)
     }
 }
 
@@ -181,15 +181,15 @@ impl ReadCoalescer {
             if same_group {
                 // 计算合并后的总范围
                 let new_end = req.end_address().max(group_end);
-                let merged_qty = new_end - group_start;
+                let merged_qty = new_end - u32::from(group_start);
 
-                if merged_qty <= self.max_registers {
+                if merged_qty <= u32::from(self.max_registers) {
                     // 检查间隙：req.address 到 group_end 的距离
-                    let gap = req.address.saturating_sub(group_end);
-                    if gap <= self.gap_threshold || req.address <= group_end {
+                    let gap = u32::from(req.address).saturating_sub(group_end);
+                    if gap <= u32::from(self.gap_threshold) || u32::from(req.address) <= group_end {
                         // 合并到当前组
                         group_end = new_end;
-                        let offset = req.address - group_start;
+                        let offset = (u32::from(req.address) - u32::from(group_start)) as u16;
                         group_mappings.push((orig_idx, offset, req.quantity));
                         continue;
                     }
@@ -201,7 +201,7 @@ impl ReadCoalescer {
                 slave_id: group_slave,
                 function: group_fn,
                 address: group_start,
-                quantity: group_end - group_start,
+                quantity: Self::window_quantity(group_start, group_end),
                 mappings: std::mem::take(&mut group_mappings),
             });
 
@@ -217,11 +217,18 @@ impl ReadCoalescer {
             slave_id: group_slave,
             function: group_fn,
             address: group_start,
-            quantity: group_end - group_start,
+            quantity: Self::window_quantity(group_start, group_end),
             mappings: group_mappings,
         });
 
         result
+    }
+
+    #[inline]
+    fn window_quantity(start: u16, end: u32) -> u16 {
+        let quantity = end - u32::from(start);
+        debug_assert!(quantity <= u32::from(u16::MAX));
+        quantity as u16
     }
 
     /// 从合并后的响应数据中提取原始请求对应的数据
@@ -283,6 +290,18 @@ mod tests {
         assert_eq!(result[0].quantity, 5);
         assert_eq!(result[0].mappings.len(), 1);
         assert_eq!(result[0].mappings[0], (0, 0, 5));
+    }
+
+    #[test]
+    fn test_single_request_at_u16_max_address_keeps_quantity() {
+        let coalescer = ReadCoalescer::new();
+        let requests = vec![req(1, 0x03, u16::MAX, 1)];
+        let result = coalescer.coalesce(&requests);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].address, u16::MAX);
+        assert_eq!(result[0].quantity, 1);
+        assert_eq!(result[0].mappings, vec![(0, 0, 1)]);
     }
 
     // -------------------------------------------------------------------------

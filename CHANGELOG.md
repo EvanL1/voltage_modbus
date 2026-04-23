@@ -5,6 +5,17 @@ All notable changes to Voltage Modbus library will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [0.6.1] - 2026-04-23
+
+### Fixed
+- `ReadCoalescer::coalesce` now handles windows that extend past `u16::MAX` without collapsing quantity to zero.
+- `ModbusTcpServer` now returns complete Modbus TCP frames on successful responses, including MBAP header and unit id.
+- `RtuOverTcpTransport` now validates raw requests and records bytes/errors/timeouts consistently.
+- Server statistics now report accumulated counters from handled requests.
+- Register bank and raw request validation now reject address ranges that overflow the 16-bit Modbus address space.
+
 ## [0.6.0] - 2026-04-18
 
 ### Added
@@ -25,9 +36,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - Cleaned all pre-existing clippy warnings (`approx_constant`, `bool_assert_comparison`, `byte_char_slices`, `manual_div_ceil`, `useless_vec`, `new_without_default`). `cargo clippy --all-features --all-targets -- -D warnings` now passes.
 - Silenced self-referential `deprecated` warnings on `ModbusError` legacy variants (triggered by `defmt::Format` derive expansion). User-facing call-site deprecation warnings are preserved.
-
-### Notes
-- **Known behavior** (not changed in this release): `ReadCoalescer::coalesce` silently clips `quantity` when `address + quantity > u16::MAX` due to `saturating_add` in `end_address`. Documented by proptest; will be addressed in a follow-up.
 
 ## [0.5.1] - 2026-03-26
 

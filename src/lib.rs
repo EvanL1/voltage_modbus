@@ -1,7 +1,7 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.6.0
+//! **Version:** 0.6.1
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
@@ -149,7 +149,7 @@ pub mod scheduler;
 pub mod device_limits;
 
 /// Modbus server implementation (TCP slave mode)
-#[cfg(feature = "rtu")]
+#[cfg(feature = "std")]
 pub mod server;
 
 /// Embedded async RTU transport via `embedded-io-async` (no_std + alloc)
@@ -157,7 +157,7 @@ pub mod server;
 pub mod embedded;
 
 /// In-memory register bank for server implementations
-#[cfg(feature = "rtu")]
+#[cfg(feature = "std")]
 pub mod register_bank;
 
 // ============================================================================
@@ -216,6 +216,12 @@ pub use utils::PerformanceMetrics;
 #[cfg(feature = "std")]
 pub use logging::{CallbackLogger, LogCallback, LogLevel, LoggingMode};
 
+#[cfg(feature = "std")]
+pub use register_bank::{ModbusRegisterBank, RegisterBankStats};
+
+#[cfg(feature = "std")]
+pub use server::{ModbusServer, ModbusTcpServer, ModbusTcpServerConfig, ServerStats};
+
 // === Hidden but preserved (backward compatibility, std-only) ===
 #[cfg(feature = "std")]
 #[doc(hidden)]
@@ -247,6 +253,9 @@ pub use utils::OperationTimer;
 
 #[cfg(feature = "rtu")]
 pub use client::{ModbusAsciiClient, ModbusRtuClient};
+
+#[cfg(feature = "rtu")]
+pub use server::{ModbusRtuServer, ModbusRtuServerConfig};
 
 #[cfg(feature = "rtu")]
 pub use transport::{AsciiTransport, RtuTransport};

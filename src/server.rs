@@ -4,15 +4,18 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, Semaphore};
 use tokio::time::timeout;
+
+#[cfg(feature = "rtu")]
 use tokio_serial;
 use tracing::{debug, error, info, warn};
 
+use crate::constants::{MAX_READ_COILS, MAX_READ_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS};
 use crate::error::{ModbusError, ModbusResult};
 
 use crate::register_bank::{ModbusRegisterBank, RegisterBankStats};
@@ -135,12 +138,9 @@ impl ModbusTcpServer {
         info!("📡 New client connected: {}", peer_addr);
 
         // Update connection count
-        {
-            let mut stats = stats.lock().await;
+        if let Ok(mut stats) = stats.lock() {
             stats.connections_count += 1;
         }
-
-        let mut buffer = vec![0u8; MAX_TCP_FRAME_SIZE];
 
         loop {
             tokio::select! {
@@ -151,44 +151,47 @@ impl ModbusTcpServer {
                 }
 
                 // Handle client request
-                result = timeout(request_timeout, stream.read(&mut buffer)) => {
+                result = timeout(request_timeout, Self::read_tcp_frame(&mut stream)) => {
                     match result {
-                        Ok(Ok(0)) => {
-                            debug!("Client {} disconnected", peer_addr);
-                            break;
-                        }
-                        Ok(Ok(bytes_read)) => {
+                        Ok(Ok(frame)) => {
                             // Update stats
-                            {
-                                let mut stats = stats.lock().await;
+                            if let Ok(mut stats) = stats.lock() {
                                 stats.total_requests += 1;
-                                stats.bytes_received += bytes_read as u64;
+                                stats.bytes_received += frame.len() as u64;
                             }
 
                             // Process request
-                            match Self::handle_request(&buffer[..bytes_read], &register_bank).await {
+                            match Self::handle_request(&frame, &register_bank).await {
                                 Ok(response_data) => {
                                     if let Err(e) = stream.write_all(&response_data).await {
                                         error!("Failed to send response to {}: {}", peer_addr, e);
                                         break;
                                     } else {
                                         // Update success stats
-                                        let mut stats = stats.lock().await;
-                                        stats.successful_requests += 1;
-                                        stats.bytes_sent += response_data.len() as u64;
+                                        if let Ok(mut stats) = stats.lock() {
+                                            stats.successful_requests += 1;
+                                            stats.bytes_sent += response_data.len() as u64;
+                                        }
                                     }
                                 }
                                 Err(e) => {
                                     error!("Error processing request from {}: {}", peer_addr, e);
 
                                     // Send error response if possible
-                                    if let Ok(error_response) = Self::create_error_response(&buffer[..bytes_read], 0x01) {
+                                    let exception_code = Self::exception_code_for_error(&e);
+                                    if let Ok(error_response) =
+                                        Self::create_error_response(&frame, exception_code)
+                                    {
                                         let _ = stream.write_all(&error_response).await;
+                                        if let Ok(mut stats) = stats.lock() {
+                                            stats.bytes_sent += error_response.len() as u64;
+                                        }
                                     }
 
                                     // Update error stats
-                                    let mut stats = stats.lock().await;
-                                    stats.failed_requests += 1;
+                                    if let Ok(mut stats) = stats.lock() {
+                                        stats.failed_requests += 1;
+                                    }
                                 }
                             }
                         }
@@ -208,21 +211,68 @@ impl ModbusTcpServer {
         info!("🔌 Client {} disconnected", peer_addr);
     }
 
+    async fn read_tcp_frame(stream: &mut TcpStream) -> ModbusResult<Vec<u8>> {
+        let mut header = [0u8; MBAP_HEADER_SIZE];
+        stream.read_exact(&mut header).await?;
+
+        let protocol_id = u16::from_be_bytes([header[2], header[3]]);
+        if protocol_id != 0 {
+            return Err(ModbusError::frame(format!(
+                "Invalid protocol ID: {:04X}",
+                protocol_id
+            )));
+        }
+
+        let length = u16::from_be_bytes([header[4], header[5]]);
+        if !(2..=254).contains(&length) {
+            return Err(ModbusError::frame(format!(
+                "Invalid MBAP length: {} (must be 2-254)",
+                length
+            )));
+        }
+
+        let total_len = MBAP_HEADER_SIZE + usize::from(length);
+        if total_len > MAX_TCP_FRAME_SIZE {
+            return Err(ModbusError::frame("TCP frame too large"));
+        }
+
+        let mut frame = vec![0u8; total_len];
+        frame[..MBAP_HEADER_SIZE].copy_from_slice(&header);
+        stream.read_exact(&mut frame[MBAP_HEADER_SIZE..]).await?;
+        Ok(frame)
+    }
+
     /// Process Modbus request
     async fn handle_request(
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 8 {
+        if data.len() < MBAP_HEADER_SIZE + 2 {
             return Err(ModbusError::frame("Invalid TCP frame length"));
         }
 
+        let transaction_id = u16::from_be_bytes([data[0], data[1]]);
+        let protocol_id = u16::from_be_bytes([data[2], data[3]]);
+        if protocol_id != 0 {
+            return Err(ModbusError::frame(format!(
+                "Invalid protocol ID: {:04X}",
+                protocol_id
+            )));
+        }
+
+        let length = u16::from_be_bytes([data[4], data[5]]);
+        let expected_len = MBAP_HEADER_SIZE + usize::from(length);
+        if !(2..=254).contains(&length) || data.len() != expected_len {
+            return Err(ModbusError::frame("Invalid TCP frame length"));
+        }
+
+        let unit_id = data[6];
         let function_code = data[7];
         let pdu_data = &data[8..];
 
         debug!("Processing function code: 0x{:02X}", function_code);
 
-        match function_code {
+        let pdu_response = match function_code {
             0x01 => Self::handle_read_01(pdu_data, register_bank).await,
             0x02 => Self::handle_read_02(pdu_data, register_bank).await,
             0x03 => Self::handle_read_03(pdu_data, register_bank).await,
@@ -235,6 +285,37 @@ impl ModbusTcpServer {
                 warn!("Unsupported function code: 0x{:02X}", function_code);
                 Err(ModbusError::invalid_function(function_code))
             }
+        }?;
+
+        Self::create_success_response(transaction_id, unit_id, &pdu_response)
+    }
+
+    fn create_success_response(
+        transaction_id: u16,
+        unit_id: u8,
+        pdu_response: &[u8],
+    ) -> ModbusResult<Vec<u8>> {
+        let length = u16::try_from(1 + pdu_response.len())
+            .map_err(|_| ModbusError::frame("TCP response too large"))?;
+        if length > 254 {
+            return Err(ModbusError::frame("TCP response too large"));
+        }
+
+        let mut response = Vec::with_capacity(MBAP_HEADER_SIZE + usize::from(length));
+        response.extend_from_slice(&transaction_id.to_be_bytes());
+        response.extend_from_slice(&0u16.to_be_bytes());
+        response.extend_from_slice(&length.to_be_bytes());
+        response.push(unit_id);
+        response.extend_from_slice(pdu_response);
+        Ok(response)
+    }
+
+    fn exception_code_for_error(error: &ModbusError) -> u8 {
+        match error {
+            ModbusError::InvalidFunction { .. } => 0x01,
+            ModbusError::InvalidAddress { .. } => 0x02,
+            ModbusError::InvalidData { .. } | ModbusError::Frame { .. } => 0x03,
+            _ => 0x04,
         }
     }
 
@@ -249,6 +330,9 @@ impl ModbusTcpServer {
 
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
+        if quantity == 0 || usize::from(quantity) > MAX_READ_COILS {
+            return Err(ModbusError::invalid_data("Invalid read coils quantity"));
+        }
 
         let coils = register_bank.read_01(address, quantity)?;
 
@@ -257,7 +341,10 @@ impl ModbusTcpServer {
         // Pre-allocate: function_code(1) + byte_count(1) + data(byte_count)
         let mut response = Vec::with_capacity(2 + byte_count);
         response.push(0x01);
-        response.push(byte_count as u8);
+        response.push(
+            u8::try_from(byte_count)
+                .map_err(|_| ModbusError::invalid_data("Read coils response too large"))?,
+        );
 
         for chunk in coils.chunks(8) {
             let mut byte = 0u8;
@@ -283,6 +370,11 @@ impl ModbusTcpServer {
 
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
+        if quantity == 0 || usize::from(quantity) > MAX_READ_COILS {
+            return Err(ModbusError::invalid_data(
+                "Invalid read discrete inputs quantity",
+            ));
+        }
 
         let inputs = register_bank.read_02(address, quantity)?;
 
@@ -291,7 +383,11 @@ impl ModbusTcpServer {
         // Pre-allocate: function_code(1) + byte_count(1) + data(byte_count)
         let mut response = Vec::with_capacity(2 + byte_count);
         response.push(0x02);
-        response.push(byte_count as u8);
+        response.push(
+            u8::try_from(byte_count).map_err(|_| {
+                ModbusError::invalid_data("Read discrete inputs response too large")
+            })?,
+        );
 
         for chunk in inputs.chunks(8) {
             let mut byte = 0u8;
@@ -317,6 +413,11 @@ impl ModbusTcpServer {
 
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
+        if quantity == 0 || usize::from(quantity) > MAX_READ_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "Invalid read holding registers quantity",
+            ));
+        }
 
         let registers = register_bank.read_03(address, quantity)?;
 
@@ -324,7 +425,11 @@ impl ModbusTcpServer {
         let data_len = (quantity as usize) * 2;
         let mut response = Vec::with_capacity(2 + data_len);
         response.push(0x03);
-        response.push(data_len as u8);
+        response.push(
+            u8::try_from(data_len).map_err(|_| {
+                ModbusError::invalid_data("Read holding registers response too large")
+            })?,
+        );
         for &register in &registers {
             response.extend_from_slice(&register.to_be_bytes());
         }
@@ -343,6 +448,11 @@ impl ModbusTcpServer {
 
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
+        if quantity == 0 || usize::from(quantity) > MAX_READ_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "Invalid read input registers quantity",
+            ));
+        }
 
         let registers = register_bank.read_04(address, quantity)?;
 
@@ -350,7 +460,11 @@ impl ModbusTcpServer {
         let data_len = (quantity as usize) * 2;
         let mut response = Vec::with_capacity(2 + data_len);
         response.push(0x04);
-        response.push(data_len as u8);
+        response.push(
+            u8::try_from(data_len).map_err(|_| {
+                ModbusError::invalid_data("Read input registers response too large")
+            })?,
+        );
         for &register in &registers {
             response.extend_from_slice(&register.to_be_bytes());
         }
@@ -369,6 +483,9 @@ impl ModbusTcpServer {
 
         let address = u16::from_be_bytes([data[0], data[1]]);
         let value_bytes = u16::from_be_bytes([data[2], data[3]]);
+        if value_bytes != 0xFF00 && value_bytes != 0x0000 {
+            return Err(ModbusError::invalid_data("Invalid coil write value"));
+        }
         let coil_value = value_bytes == 0xFF00;
 
         register_bank.write_05(address, coil_value)?;
@@ -411,6 +528,14 @@ impl ModbusTcpServer {
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
         let byte_count = data[4] as usize;
+        if quantity == 0 || usize::from(quantity) > MAX_WRITE_COILS {
+            return Err(ModbusError::invalid_data(
+                "Invalid write multiple coils quantity",
+            ));
+        }
+        if byte_count != usize::from(quantity).div_ceil(8) {
+            return Err(ModbusError::frame("invalid frame"));
+        }
 
         if data.len() < 5 + byte_count {
             return Err(ModbusError::frame("invalid frame"));
@@ -447,6 +572,11 @@ impl ModbusTcpServer {
         let address = u16::from_be_bytes([data[0], data[1]]);
         let quantity = u16::from_be_bytes([data[2], data[3]]);
         let byte_count = data[4] as usize;
+        if quantity == 0 || usize::from(quantity) > MAX_WRITE_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "Invalid write multiple registers quantity",
+            ));
+        }
 
         if data.len() < 5 + byte_count || byte_count != (quantity as usize * 2) {
             return Err(ModbusError::frame("invalid frame"));
@@ -531,6 +661,7 @@ impl ModbusServer for ModbusTcpServer {
         let register_bank = self.register_bank.clone();
         let stats = self.stats.clone();
         let request_timeout = self.config.request_timeout;
+        let connection_limit = Arc::new(Semaphore::new(self.config.max_connections));
         let is_running_flag = self.is_running.clone();
         let mut shutdown_rx = shutdown_tx.subscribe();
 
@@ -544,12 +675,20 @@ impl ModbusServer for ModbusTcpServer {
                         match result {
                             Ok((stream, addr)) => {
                                 debug!("Accepted connection from {}", addr);
+                                let permit = match connection_limit.clone().try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(_) => {
+                                        warn!("Rejecting {}: max connections reached", addr);
+                                        continue;
+                                    }
+                                };
 
                                 let register_bank = register_bank.clone();
                                 let stats = stats.clone();
                                 let shutdown_rx = shutdown_tx.subscribe();
 
                                 tokio::spawn(async move {
+                                    let _permit = permit;
                                     Self::handle_client(stream, register_bank, stats, shutdown_rx, request_timeout).await;
                                 });
                             }
@@ -587,9 +726,11 @@ impl ModbusServer for ModbusTcpServer {
     }
 
     fn get_stats(&self) -> ServerStats {
-        // Note: This is a synchronous method, so we can't use async lock
-        // In a real implementation, you might want to use a different approach
-        let mut stats = ServerStats::default();
+        let mut stats = self
+            .stats
+            .lock()
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
 
         if let Some(start_time) = self.start_time {
             stats.uptime_seconds = start_time.elapsed().as_secs();
@@ -605,6 +746,7 @@ impl ModbusServer for ModbusTcpServer {
 }
 
 /// Modbus RTU server configuration
+#[cfg(feature = "rtu")]
 #[derive(Debug, Clone)]
 pub struct ModbusRtuServerConfig {
     pub port: String,
@@ -617,6 +759,7 @@ pub struct ModbusRtuServerConfig {
     pub register_bank: Option<Arc<ModbusRegisterBank>>,
 }
 
+#[cfg(feature = "rtu")]
 impl Default for ModbusRtuServerConfig {
     fn default() -> Self {
         Self {
@@ -633,6 +776,7 @@ impl Default for ModbusRtuServerConfig {
 }
 
 /// Modbus RTU server implementation
+#[cfg(feature = "rtu")]
 pub struct ModbusRtuServer {
     config: ModbusRtuServerConfig,
     register_bank: Arc<ModbusRegisterBank>,
@@ -642,6 +786,7 @@ pub struct ModbusRtuServer {
     start_time: Option<std::time::Instant>,
 }
 
+#[cfg(feature = "rtu")]
 impl ModbusRtuServer {
     /// Create a new RTU server with default configuration
     pub fn new(port: &str, baud_rate: u32) -> ModbusResult<Self> {
@@ -780,8 +925,7 @@ impl ModbusRtuServer {
                             last_activity = now;
 
                             // Update stats
-                            {
-                                let mut stats = stats.lock().await;
+                            if let Ok(mut stats) = stats.lock() {
                                 stats.bytes_received += bytes_read as u64;
                             }
                         }
@@ -821,8 +965,7 @@ impl ModbusRtuServer {
         stats: &Arc<Mutex<ServerStats>>,
     ) {
         // Update request stats
-        {
-            let mut stats = stats.lock().await;
+        if let Ok(mut stats) = stats.lock() {
             stats.total_requests += 1;
         }
 
@@ -845,10 +988,19 @@ impl ModbusRtuServer {
 
                 if let Err(e) = port.write_all(&response_with_crc).await {
                     error!("Failed to write response: {}", e);
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.failed_requests += 1;
+                    }
+                } else if let Ok(mut stats) = stats.lock() {
+                    stats.successful_requests += 1;
+                    stats.bytes_sent += response_with_crc.len() as u64;
                 }
             }
             Err(e) => {
                 error!("Error processing request: {}", e);
+                if let Ok(mut stats) = stats.lock() {
+                    stats.failed_requests += 1;
+                }
                 // Send exception response if needed
             }
         }
@@ -915,6 +1067,7 @@ impl ModbusRtuServer {
 /// Modbus RTU server implementation
 ///
 /// Note: This is a placeholder for future implementation
+#[cfg(feature = "rtu")]
 impl ModbusServer for ModbusRtuServer {
     async fn start(&mut self) -> ModbusResult<()> {
         if self.is_running.load(Ordering::Relaxed) {
@@ -985,9 +1138,11 @@ impl ModbusServer for ModbusRtuServer {
     }
 
     fn get_stats(&self) -> ServerStats {
-        // Note: This is a synchronous method, so we can't use async lock
-        // In a real implementation, you might want to use a different approach
-        let mut stats = ServerStats::default();
+        let mut stats = self
+            .stats
+            .lock()
+            .map(|stats| stats.clone())
+            .unwrap_or_default();
 
         if let Some(start_time) = self.start_time {
             stats.uptime_seconds = start_time.elapsed().as_secs();
@@ -1005,6 +1160,7 @@ impl ModbusServer for ModbusRtuServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "rtu")]
     use std::time::Duration;
 
     #[test]
@@ -1018,6 +1174,40 @@ mod tests {
         assert!(server.get_register_bank().is_some());
     }
 
+    #[tokio::test]
+    async fn test_tcp_handle_request_returns_complete_mbap_frame() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+        register_bank.write_06(0, 0x1234).unwrap();
+
+        let request = [
+            0x12, 0x34, // transaction id
+            0x00, 0x00, // protocol id
+            0x00, 0x06, // length: unit + fc + address + quantity
+            0x01, // unit id
+            0x03, // read holding registers
+            0x00, 0x00, // address
+            0x00, 0x01, // quantity
+        ];
+
+        let response = ModbusTcpServer::handle_request(&request, &register_bank)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response,
+            vec![
+                0x12, 0x34, // transaction id is preserved
+                0x00, 0x00, // protocol id
+                0x00, 0x05, // length: unit + fc + byte_count + two data bytes
+                0x01, // unit id
+                0x03, // function
+                0x02, // byte count
+                0x12, 0x34,
+            ]
+        );
+    }
+
+    #[cfg(feature = "rtu")]
     #[test]
     fn test_rtu_server_creation() {
         // Test RTU server creation
@@ -1029,6 +1219,7 @@ mod tests {
         assert!(server.get_register_bank().is_some());
     }
 
+    #[cfg(feature = "rtu")]
     #[test]
     fn test_rtu_server_configuration() {
         // Test RTU server with custom configuration
@@ -1050,6 +1241,7 @@ mod tests {
         assert!(!server.is_running());
     }
 
+    #[cfg(feature = "rtu")]
     #[tokio::test]
     async fn test_rtu_server_lifecycle() {
         // Test RTU server start/stop lifecycle
@@ -1075,6 +1267,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "rtu")]
     #[test]
     fn test_crc_calculation() {
         // Test CRC calculation function
@@ -1090,6 +1283,7 @@ mod tests {
         assert_ne!(crc, crc2);
     }
 
+    #[cfg(feature = "rtu")]
     #[test]
     fn test_rtu_error_response() {
         // Test RTU error response creation

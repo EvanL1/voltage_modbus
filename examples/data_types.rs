@@ -51,10 +51,7 @@ fn main() {
         ("Bool", ModbusValue::Bool(true)),
     ];
 
-    println!(
-        "{:<8} {:<20} {:<12} Registers",
-        "Type", "Value", "as_f64()"
-    );
+    println!("{:<8} {:<20} {:<12} Registers", "Type", "Value", "as_f64()");
     println!("{}", "-".repeat(60));
 
     for (name, value) in &values {

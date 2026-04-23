@@ -79,6 +79,7 @@ impl ModbusRegisterBank {
 
     /// Read coils starting at address (function code 0x01)
     pub fn read_coils(&self, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        validate_address_range(address, quantity)?;
         let coils = self
             .coils
             .read()
@@ -86,7 +87,7 @@ impl ModbusRegisterBank {
         let mut result = Vec::with_capacity(quantity as usize);
 
         for i in 0..quantity {
-            let addr = address.wrapping_add(i);
+            let addr = checked_address(address, i)?;
             result.push(coils.get(&addr).copied().unwrap_or(false));
         }
 
@@ -110,12 +111,15 @@ impl ModbusRegisterBank {
 
     /// Write multiple coils (function code 0x0F)
     pub fn write_0f(&self, address: u16, values: &[bool]) -> ModbusResult<()> {
+        let quantity = u16::try_from(values.len())
+            .map_err(|_| ModbusError::invalid_address(address, u16::MAX))?;
+        validate_address_range(address, quantity)?;
         let mut coils = self
             .coils
             .write()
             .map_err(|_| ModbusError::internal("Failed to lock coils"))?;
         for (i, &value) in values.iter().enumerate() {
-            let addr = address.wrapping_add(i as u16);
+            let addr = checked_address(address, i)?;
             coils.insert(addr, value);
         }
         Ok(())
@@ -123,6 +127,7 @@ impl ModbusRegisterBank {
 
     /// Read discrete inputs starting at address (function code 0x02)
     pub fn read_discrete_inputs(&self, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+        validate_address_range(address, quantity)?;
         let inputs = self
             .discrete_inputs
             .read()
@@ -130,7 +135,7 @@ impl ModbusRegisterBank {
         let mut result = Vec::with_capacity(quantity as usize);
 
         for i in 0..quantity {
-            let addr = address.wrapping_add(i);
+            let addr = checked_address(address, i)?;
             result.push(inputs.get(&addr).copied().unwrap_or(false));
         }
 
@@ -144,6 +149,7 @@ impl ModbusRegisterBank {
 
     /// Read holding registers starting at address (function code 0x03)
     pub fn read_holding_registers(&self, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        validate_address_range(address, quantity)?;
         let registers = self
             .holding_registers
             .read()
@@ -151,7 +157,7 @@ impl ModbusRegisterBank {
         let mut result = Vec::with_capacity(quantity as usize);
 
         for i in 0..quantity {
-            let addr = address.wrapping_add(i);
+            let addr = checked_address(address, i)?;
             result.push(registers.get(&addr).copied().unwrap_or(0));
         }
 
@@ -175,12 +181,15 @@ impl ModbusRegisterBank {
 
     /// Write multiple registers (function code 0x10)
     pub fn write_10(&self, address: u16, values: &[u16]) -> ModbusResult<()> {
+        let quantity = u16::try_from(values.len())
+            .map_err(|_| ModbusError::invalid_address(address, u16::MAX))?;
+        validate_address_range(address, quantity)?;
         let mut registers = self
             .holding_registers
             .write()
             .map_err(|_| ModbusError::internal("Failed to lock holding registers"))?;
         for (i, &value) in values.iter().enumerate() {
-            let addr = address.wrapping_add(i as u16);
+            let addr = checked_address(address, i)?;
             registers.insert(addr, value);
         }
         Ok(())
@@ -188,6 +197,7 @@ impl ModbusRegisterBank {
 
     /// Read input registers starting at address (function code 0x04)
     pub fn read_input_registers(&self, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+        validate_address_range(address, quantity)?;
         let registers = self
             .input_registers
             .read()
@@ -195,7 +205,7 @@ impl ModbusRegisterBank {
         let mut result = Vec::with_capacity(quantity as usize);
 
         for i in 0..quantity {
-            let addr = address.wrapping_add(i);
+            let addr = checked_address(address, i)?;
             result.push(registers.get(&addr).copied().unwrap_or(0));
         }
 
@@ -230,12 +240,45 @@ impl ModbusRegisterBank {
     /// Get register bank statistics
     pub fn get_stats(&self) -> RegisterBankStats {
         RegisterBankStats {
-            coils_count: self.coils.read().unwrap().len(),
-            discrete_inputs_count: self.discrete_inputs.read().unwrap().len(),
-            holding_registers_count: self.holding_registers.read().unwrap().len(),
-            input_registers_count: self.input_registers.read().unwrap().len(),
+            coils_count: self.coils.read().map(|coils| coils.len()).unwrap_or(0),
+            discrete_inputs_count: self
+                .discrete_inputs
+                .read()
+                .map(|inputs| inputs.len())
+                .unwrap_or(0),
+            holding_registers_count: self
+                .holding_registers
+                .read()
+                .map(|registers| registers.len())
+                .unwrap_or(0),
+            input_registers_count: self
+                .input_registers
+                .read()
+                .map(|registers| registers.len())
+                .unwrap_or(0),
         }
     }
+}
+
+fn validate_address_range(address: u16, quantity: u16) -> ModbusResult<()> {
+    if quantity == 0 {
+        return Err(ModbusError::invalid_address(address, quantity));
+    }
+
+    if address.checked_add(quantity - 1).is_none() {
+        return Err(ModbusError::invalid_address(address, quantity));
+    }
+
+    Ok(())
+}
+
+fn checked_address(address: u16, offset: impl TryInto<u16>) -> ModbusResult<u16> {
+    let offset = offset
+        .try_into()
+        .map_err(|_| ModbusError::invalid_address(address, u16::MAX))?;
+    address
+        .checked_add(offset)
+        .ok_or_else(|| ModbusError::invalid_address(address, offset.saturating_add(1)))
 }
 
 impl Default for ModbusRegisterBank {
@@ -285,5 +328,14 @@ mod tests {
         bank.write_10(100, &[100, 200, 300]).unwrap();
         let registers = bank.read_03(100, 3).unwrap();
         assert_eq!(registers, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn test_range_overflow_is_rejected() {
+        let bank = ModbusRegisterBank::new();
+
+        assert!(bank.read_03(u16::MAX, 2).is_err());
+        assert!(bank.write_10(u16::MAX, &[1, 2]).is_err());
+        assert!(bank.read_01(10, 0).is_err());
     }
 }

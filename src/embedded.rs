@@ -118,10 +118,9 @@ where
     ///
     /// Returns a `heapless::Vec<u8, MAX_FRAME>` containing:
     /// `[slave_id, function_code, ...PDU body..., CRC_lo, CRC_hi]`
-    pub fn encode_request(
-        &self,
-        request: &ModbusRequest,
-    ) -> ModbusResult<HVec<u8, MAX_FRAME>> {
+    pub fn encode_request(&self, request: &ModbusRequest) -> ModbusResult<HVec<u8, MAX_FRAME>> {
+        request.validate()?;
+
         let mut frame: HVec<u8, MAX_FRAME> = HVec::new();
 
         push(&mut frame, request.slave_id)?;
@@ -138,8 +137,11 @@ where
 
             ModbusFunction::WriteSingleCoil => {
                 extend(&mut frame, &request.address.to_be_bytes())?;
-                let coil_value: u16 =
-                    if !request.data.is_empty() && request.data[0] != 0 { 0xFF00 } else { 0x0000 };
+                let coil_value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
+                    0xFF00
+                } else {
+                    0x0000
+                };
                 extend(&mut frame, &coil_value.to_be_bytes())?;
             }
 
@@ -391,7 +393,7 @@ mod tests {
 
         // Minimum: slave(1) FC(1) addr(2) qty(2) CRC(2) = 8 bytes
         assert_eq!(frame.len(), 8);
-        assert_eq!(frame[0], 1);   // slave_id
+        assert_eq!(frame[0], 1); // slave_id
         assert_eq!(frame[1], 0x03); // FC03
         assert_eq!(frame[2], 0x00); // address hi
         assert_eq!(frame[3], 0x00); // address lo
@@ -411,12 +413,12 @@ mod tests {
         let req = ModbusRequest::new_write(
             2,
             ModbusFunction::WriteSingleRegister,
-            0x0064,  // address 100
+            0x0064, // address 100
             vec![0x12, 0x34],
         );
         let frame = transport.encode_request(&req).unwrap();
 
-        assert_eq!(frame[0], 2);    // slave_id
+        assert_eq!(frame[0], 2); // slave_id
         assert_eq!(frame[1], 0x06); // FC06
         assert_eq!(frame[2], 0x00);
         assert_eq!(frame[3], 0x64); // address 100
@@ -526,7 +528,7 @@ mod tests {
         // Verify what was actually written to the mock
         let written = &transport.io.written;
         assert!(!written.is_empty());
-        assert_eq!(written[0], 1);    // slave_id
+        assert_eq!(written[0], 1); // slave_id
         assert_eq!(written[1], 0x03); // FC03
     }
 

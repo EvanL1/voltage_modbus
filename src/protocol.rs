@@ -329,11 +329,7 @@ impl ModbusRequest {
 
         // Validate quantity for read operations
         if self.function.is_read_function() {
-            if self.quantity == 0 {
-                return Err(ModbusError::invalid_data(
-                    "Quantity cannot be zero".to_string(),
-                ));
-            }
+            validate_address_range(self.address, self.quantity)?;
 
             match self.function {
                 ModbusFunction::ReadCoils | ModbusFunction::ReadDiscreteInputs => {
@@ -356,8 +352,81 @@ impl ModbusRequest {
             }
         }
 
+        match self.function {
+            ModbusFunction::WriteSingleCoil => {
+                validate_address_range(self.address, 1)?;
+                match self.data.as_slice() {
+                    [_] => {}
+                    [hi, lo] if u16::from_be_bytes([*hi, *lo]) == 0x0000 => {}
+                    [hi, lo] if u16::from_be_bytes([*hi, *lo]) == 0xFF00 => {}
+                    _ => {
+                        return Err(ModbusError::invalid_data(
+                            "Invalid single coil payload; expected one boolean byte or 0x0000/0xFF00",
+                        ));
+                    }
+                }
+            }
+            ModbusFunction::WriteSingleRegister => {
+                validate_address_range(self.address, 1)?;
+                if self.data.len() != 2 {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid single register payload length: expected 2, got {}",
+                        self.data.len()
+                    )));
+                }
+            }
+            ModbusFunction::WriteMultipleCoils => {
+                validate_address_range(self.address, self.quantity)?;
+                if self.quantity > crate::MAX_WRITE_COILS as u16 {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Too many coils to write: {}",
+                        self.quantity
+                    )));
+                }
+                let expected_bytes = usize::from(self.quantity.div_ceil(8));
+                if self.data.len() != expected_bytes {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid coil payload length: expected {}, got {}",
+                        expected_bytes,
+                        self.data.len()
+                    )));
+                }
+            }
+            ModbusFunction::WriteMultipleRegisters => {
+                validate_address_range(self.address, self.quantity)?;
+                if self.quantity > crate::MAX_WRITE_REGISTERS as u16 {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Too many registers to write: {}",
+                        self.quantity
+                    )));
+                }
+                let expected_bytes = usize::from(self.quantity) * 2;
+                if self.data.len() != expected_bytes {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid register payload length: expected {}, got {}",
+                        expected_bytes,
+                        self.data.len()
+                    )));
+                }
+            }
+            _ => {}
+        }
+
         Ok(())
     }
+}
+
+#[inline]
+fn validate_address_range(address: ModbusAddress, quantity: u16) -> ModbusResult<()> {
+    if quantity == 0 {
+        return Err(ModbusError::invalid_address(address, quantity));
+    }
+
+    if address.checked_add(quantity - 1).is_none() {
+        return Err(ModbusError::invalid_address(address, quantity));
+    }
+
+    Ok(())
 }
 
 /// Modbus response structure
@@ -667,6 +736,36 @@ mod tests {
         let too_many_registers =
             ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 100, 200);
         assert!(too_many_registers.validate().is_err());
+
+        let address_overflow =
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, u16::MAX, 2);
+        assert!(address_overflow.validate().is_err());
+
+        let valid_write_multiple = ModbusRequest {
+            slave_id: 1,
+            function: ModbusFunction::WriteMultipleRegisters,
+            address: 10,
+            quantity: 2,
+            data: vec![0x12, 0x34, 0x56, 0x78],
+        };
+        assert!(valid_write_multiple.validate().is_ok());
+
+        let invalid_write_payload = ModbusRequest {
+            slave_id: 1,
+            function: ModbusFunction::WriteMultipleRegisters,
+            address: 10,
+            quantity: 2,
+            data: vec![0x12, 0x34],
+        };
+        assert!(invalid_write_payload.validate().is_err());
+
+        let empty_single_register =
+            ModbusRequest::new_write(1, ModbusFunction::WriteSingleRegister, 10, vec![]);
+        assert!(empty_single_register.validate().is_err());
+
+        let invalid_single_coil =
+            ModbusRequest::new_write(1, ModbusFunction::WriteSingleCoil, 10, vec![0x00, 0x01]);
+        assert!(invalid_single_coil.validate().is_err());
     }
 
     #[test]

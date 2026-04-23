@@ -1389,10 +1389,7 @@ pub struct ModbusRtuOverTcpClient {
 
 impl ModbusRtuOverTcpClient {
     /// Connect to an RTU-over-TCP gateway.
-    pub async fn new(
-        address: std::net::SocketAddr,
-        timeout: Duration,
-    ) -> ModbusResult<Self> {
+    pub async fn new(address: std::net::SocketAddr, timeout: Duration) -> ModbusResult<Self> {
         let transport = crate::transport::RtuOverTcpTransport::new(address, timeout).await?;
         Ok(Self {
             inner: GenericModbusClient::new(transport),
@@ -1418,16 +1415,36 @@ impl ModbusRtuOverTcpClient {
 }
 
 impl ModbusClient for ModbusRtuOverTcpClient {
-    async fn read_01(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+    async fn read_01(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
         self.inner.read_01(slave_id, address, quantity).await
     }
-    async fn read_02(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+    async fn read_02(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
         self.inner.read_02(slave_id, address, quantity).await
     }
-    async fn read_03(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+    async fn read_03(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
         self.inner.read_03(slave_id, address, quantity).await
     }
-    async fn read_04(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+    async fn read_04(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
         self.inner.read_04(slave_id, address, quantity).await
     }
     async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
@@ -1436,10 +1453,20 @@ impl ModbusClient for ModbusRtuOverTcpClient {
     async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
         self.inner.write_06(slave_id, address, value).await
     }
-    async fn write_0f(&mut self, slave_id: SlaveId, address: u16, values: &[bool]) -> ModbusResult<()> {
+    async fn write_0f(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[bool],
+    ) -> ModbusResult<()> {
         self.inner.write_0f(slave_id, address, values).await
     }
-    async fn write_10(&mut self, slave_id: SlaveId, address: u16, values: &[u16]) -> ModbusResult<()> {
+    async fn write_10(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[u16],
+    ) -> ModbusResult<()> {
         self.inner.write_10(slave_id, address, values).await
     }
     fn is_connected(&self) -> bool {
@@ -1495,16 +1522,36 @@ impl ModbusAsciiClient {
 
 #[cfg(feature = "rtu")]
 impl ModbusClient for ModbusAsciiClient {
-    async fn read_01(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+    async fn read_01(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
         self.inner.read_01(slave_id, address, quantity).await
     }
-    async fn read_02(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<bool>> {
+    async fn read_02(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
         self.inner.read_02(slave_id, address, quantity).await
     }
-    async fn read_03(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+    async fn read_03(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
         self.inner.read_03(slave_id, address, quantity).await
     }
-    async fn read_04(&mut self, slave_id: SlaveId, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
+    async fn read_04(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
         self.inner.read_04(slave_id, address, quantity).await
     }
     async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
@@ -1513,10 +1560,20 @@ impl ModbusClient for ModbusAsciiClient {
     async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
         self.inner.write_06(slave_id, address, value).await
     }
-    async fn write_0f(&mut self, slave_id: SlaveId, address: u16, values: &[bool]) -> ModbusResult<()> {
+    async fn write_0f(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[bool],
+    ) -> ModbusResult<()> {
         self.inner.write_0f(slave_id, address, values).await
     }
-    async fn write_10(&mut self, slave_id: SlaveId, address: u16, values: &[u16]) -> ModbusResult<()> {
+    async fn write_10(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[u16],
+    ) -> ModbusResult<()> {
         self.inner.write_10(slave_id, address, values).await
     }
     fn is_connected(&self) -> bool {

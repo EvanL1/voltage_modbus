@@ -149,10 +149,10 @@ proptest! {
 /// Strategy that generates a `ReadRequest` with Modbus-legal quantities.
 fn arb_read_request() -> impl Strategy<Value = ReadRequest> {
     (
-        any::<u8>(),              // slave_id (0–255)
-        prop_oneof![Just(3u8), Just(4u8)],  // function: 0x03 or 0x04
-        any::<u16>(),             // address
-        1u16..=125u16,            // quantity within Modbus limit
+        any::<u8>(),                       // slave_id (0–255)
+        prop_oneof![Just(3u8), Just(4u8)], // function: 0x03 or 0x04
+        any::<u16>(),                      // address
+        1u16..=125u16,                     // quantity within Modbus limit
     )
         .prop_map(|(slave_id, function, address, quantity)| ReadRequest {
             slave_id,
@@ -232,12 +232,7 @@ proptest! {
     }
 
     /// All mappings within a CoalescedRead have offsets that respect the merged
-    /// address range, accounting for u16 saturation in `end_address()`.
-    ///
-    /// The coalescer computes its window using `saturating_add`, so when
-    /// `address + quantity` overflows u16, `group.quantity` may be smaller than
-    /// the individual request's quantity. We therefore only assert the invariant
-    /// when no u16 overflow occurs.
+    /// address range, including windows that extend past `u16::MAX`.
     #[test]
     fn prop_coalescer_mapping_offsets_in_range(
         requests in vec(arb_read_request(), 0..=32),
@@ -248,16 +243,12 @@ proptest! {
         for group in &coalesced {
             for &(orig_idx, offset, orig_qty) in &group.mappings {
                 let req = &requests[orig_idx];
-                // Only assert when the original request end_address does not saturate.
-                let overflows = req.address.checked_add(req.quantity).is_none();
-                if !overflows {
-                    let end = offset + orig_qty; // safe: offset and qty fit in a u16 window
-                    prop_assert!(
-                        end <= group.quantity,
-                        "mapping orig_idx={} offset={} + qty={} = {} exceeds group quantity={} (addr={}, req_qty={})",
-                        orig_idx, offset, orig_qty, end, group.quantity, req.address, req.quantity
-                    );
-                }
+                let end = offset + orig_qty; // safe: coalesced windows are capped at 125 registers
+                prop_assert!(
+                    end <= group.quantity,
+                    "mapping orig_idx={} offset={} + qty={} = {} exceeds group quantity={} (addr={}, req_qty={})",
+                    orig_idx, offset, orig_qty, end, group.quantity, req.address, req.quantity
+                );
             }
         }
     }

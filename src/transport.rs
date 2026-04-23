@@ -56,7 +56,7 @@
 //!
 //! ### RTU Transport
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use voltage_modbus::transport::{RtuTransport, ModbusTransport};
 //! use voltage_modbus::protocol::{ModbusRequest, ModbusFunction};
 //!
@@ -244,7 +244,7 @@ fn log_packet(direction: &str, data: &[u8], protocol: &str, slave_id: Option<u8>
 /// ## Usage Example
 ///
 /// ```rust,no_run
-/// use voltage_modbus::transport::{ModbusTransport, RtuTransport};
+/// use voltage_modbus::transport::ModbusTransport;
 /// use voltage_modbus::protocol::{ModbusRequest, ModbusFunction};
 ///
 /// async fn generic_request(transport: &mut impl ModbusTransport) -> Result<Vec<u16>, Box<dyn std::error::Error>> {
@@ -288,11 +288,12 @@ pub trait ModbusTransport: Send + Sync {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use voltage_modbus::transport::{RtuTransport, ModbusTransport};
+    /// use voltage_modbus::transport::{TcpTransport, ModbusTransport};
     /// use voltage_modbus::protocol::{ModbusRequest, ModbusFunction};
+    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut transport = RtuTransport::new("/dev/ttyUSB0", 9600)?;
+    /// let mut transport = TcpTransport::new("127.0.0.1:502".parse()?, Duration::from_secs(5)).await?;
     ///
     /// let request = ModbusRequest::new_read(
     ///     1,                                    // slave_id
@@ -334,7 +335,7 @@ pub trait ModbusTransport: Send + Sync {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use voltage_modbus::transport::{ModbusTransport, RtuTransport};
+    /// # use voltage_modbus::transport::ModbusTransport;
     /// # fn example(transport: &impl ModbusTransport) {
     /// if transport.is_connected() {
     ///     println!("Transport is connected");
@@ -359,10 +360,11 @@ pub trait ModbusTransport: Send + Sync {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use voltage_modbus::transport::{RtuTransport, ModbusTransport};
+    /// use voltage_modbus::transport::{TcpTransport, ModbusTransport};
+    /// use std::time::Duration;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let mut transport = RtuTransport::new("/dev/ttyUSB0", 9600)?;
+    /// let mut transport = TcpTransport::new("127.0.0.1:502".parse()?, Duration::from_secs(5)).await?;
     ///
     /// // Use transport for communication...
     ///
@@ -388,7 +390,7 @@ pub trait ModbusTransport: Send + Sync {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// # use voltage_modbus::transport::{ModbusTransport, RtuTransport};
+    /// # use voltage_modbus::transport::ModbusTransport;
     /// # fn example(transport: &impl ModbusTransport) {
     /// let stats = transport.get_stats();
     ///
@@ -555,7 +557,10 @@ impl TcpTransport {
     /// Returns a stack-allocated buffer and the number of valid bytes.
     /// Modbus TCP frames are at most 260 bytes (MBAP 6 + PDU max 254),
     /// so [u8; 260] on the stack is always sufficient.
-    fn encode_request(&mut self, request: &ModbusRequest) -> ([u8; MAX_TCP_FRAME_SIZE], usize) {
+    fn encode_request(
+        &mut self,
+        request: &ModbusRequest,
+    ) -> ModbusResult<([u8; MAX_TCP_FRAME_SIZE], usize)> {
         let transaction_id = self.next_transaction_id();
         let protocol_id = 0u16; // Always 0 for Modbus
 
@@ -645,7 +650,9 @@ impl TcpTransport {
                     request.data.len() <= 246,
                     "data payload too large for Modbus frame"
                 );
-                frame[pos] = request.data.len() as u8;
+                frame[pos] = u8::try_from(request.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?;
                 pos += 1;
                 let data_len = request.data.len();
                 frame[pos..pos + data_len].copy_from_slice(&request.data);
@@ -653,7 +660,7 @@ impl TcpTransport {
             }
         }
 
-        (frame, pos)
+        Ok((frame, pos))
     }
 
     /// Decode response from TCP frame (zero-copy)
@@ -872,7 +879,7 @@ impl TcpTransport {
             // Read MBAP header + function code byte (7 bytes total)
             let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
             let read_result = timeout(remaining, stream.read_exact(&mut header_buf)).await;
-            if read_result.is_err() || read_result.unwrap().is_err() {
+            if !matches!(read_result, Ok(Ok(_))) {
                 drop(stream);
                 self.stats.timeouts += 1;
                 self.stats.errors += 1;
@@ -918,7 +925,7 @@ impl TcpTransport {
                 )
                 .await;
 
-                if read_result.is_err() || read_result.unwrap().is_err() {
+                if !matches!(read_result, Ok(Ok(_))) {
                     drop(stream);
                     self.stats.timeouts += 1;
                     self.stats.errors += 1;
@@ -991,7 +998,7 @@ impl ModbusTransport for TcpTransport {
         }
 
         // Encode request into stack-allocated frame (zero heap allocation)
-        let (frame_buf, frame_len) = self.encode_request(request);
+        let (frame_buf, frame_len) = self.encode_request(request)?;
         let frame = &frame_buf[..frame_len];
         // Save the transaction ID for later verification
         // (encode_request updates self.transaction_id via next_transaction_id())
@@ -1055,7 +1062,7 @@ impl ModbusTransport for TcpTransport {
             )
             .await;
 
-            if read_result.is_err() || read_result.unwrap().is_err() {
+            if !matches!(read_result, Ok(Ok(_))) {
                 self.stats.timeouts += 1;
                 self.stats.errors += 1;
                 self.stream = None;
@@ -1098,7 +1105,7 @@ impl ModbusTransport for TcpTransport {
                 )
                 .await;
 
-                if read_result.is_err() || read_result.unwrap().is_err() {
+                if !matches!(read_result, Ok(Ok(_))) {
                     self.stats.timeouts += 1;
                     self.stats.errors += 1;
                     self.stream = None;
@@ -2289,6 +2296,8 @@ impl RtuOverTcpTransport {
     }
 
     fn encode_request(request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
+        request.validate()?;
+
         let mut frame = Vec::with_capacity(MAX_RTU_FRAME_SIZE);
         frame.push(request.slave_id);
         frame.push(request.function.to_u8());
@@ -2389,7 +2398,12 @@ impl RtuOverTcpTransport {
                     return Ok(out);
                 }
                 0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
-                _ => return Err(ModbusError::frame(format!("Unsupported function code 0x{:02X}", func))),
+                _ => {
+                    return Err(ModbusError::frame(format!(
+                        "Unsupported function code 0x{:02X}",
+                        func
+                    )))
+                }
             }
         };
 
@@ -2420,22 +2434,31 @@ impl ModbusTransport for RtuOverTcpTransport {
             "modbus.request.start"
         );
 
+        request.validate()?;
         let frame = Self::encode_request(request)?;
 
         if self.stream.is_none() {
             self.reconnect().await?;
         }
-        let stream = self.stream.as_mut().expect("stream reconnected");
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("stream not connected"))?;
 
         self.stats.requests_sent += 1;
+        self.stats.bytes_sent += frame.len() as u64;
         let io_timeout = self.timeout;
 
         let write_result = timeout(io_timeout, stream.write_all(&frame)).await;
         if let Err(_) | Ok(Err(_)) = &write_result {
             self.stream = None;
+            self.stats.errors += 1;
         }
         match write_result {
-            Err(_) => return Err(ModbusError::timeout("write", io_timeout.as_millis() as u64)),
+            Err(_) => {
+                self.stats.timeouts += 1;
+                return Err(ModbusError::timeout("write", io_timeout.as_millis() as u64));
+            }
             Ok(Err(e)) => return Err(ModbusError::connection(format!("write failed: {}", e))),
             Ok(Ok(())) => {}
         }
@@ -2446,15 +2469,21 @@ impl ModbusTransport for RtuOverTcpTransport {
             return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
-        let stream = self.stream.as_mut().expect("stream still open");
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("stream not connected after write"))?;
         let read_result = timeout(io_timeout, Self::read_frame(stream)).await;
         let frame = match read_result {
             Err(_) => {
                 self.stream = None;
+                self.stats.timeouts += 1;
+                self.stats.errors += 1;
                 return Err(ModbusError::timeout("read", io_timeout.as_millis() as u64));
             }
             Ok(Err(e)) => {
                 self.stream = None;
+                self.stats.errors += 1;
                 return Err(e);
             }
             Ok(Ok(f)) => f,
@@ -2462,7 +2491,6 @@ impl ModbusTransport for RtuOverTcpTransport {
 
         self.stats.responses_received += 1;
         self.stats.bytes_received += frame.len() as u64;
-        self.stats.bytes_sent += 0; // already counted via write
 
         let response = Self::decode_response(frame).inspect_err(|_| {
             self.stats.errors += 1;
@@ -2497,6 +2525,8 @@ impl ModbusTransport for RtuOverTcpTransport {
 #[cfg(test)]
 mod rtu_over_tcp_tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn encodes_read_holding_registers_with_crc() {
@@ -2543,6 +2573,40 @@ mod rtu_over_tcp_tests {
         assert_eq!(resp.slave_id, 1);
         assert_eq!(resp.function, ModbusFunction::ReadHoldingRegisters);
         assert!(resp.is_exception());
+    }
+
+    #[tokio::test]
+    async fn request_updates_stats_for_successful_roundtrip() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 8];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[0], 1);
+            assert_eq!(request[1], 0x03);
+
+            let mut response = vec![0x01, 0x03, 0x02, 0x12, 0x34];
+            let crc = CRC_MODBUS.checksum(&response);
+            response.extend_from_slice(&crc.to_le_bytes());
+            socket.write_all(&response).await.unwrap();
+        });
+
+        let mut transport = RtuOverTcpTransport::new(address, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let request = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+        let response = transport.request(&request).await.unwrap();
+
+        assert_eq!(response.parse_registers().unwrap(), vec![0x1234]);
+        let stats = transport.get_stats();
+        assert_eq!(stats.requests_sent, 1);
+        assert_eq!(stats.responses_received, 1);
+        assert_eq!(stats.bytes_sent, 8);
+        assert_eq!(stats.bytes_received, 7);
+
+        server.await.unwrap();
     }
 }
 
@@ -2638,7 +2702,7 @@ mod tests {
             10,                                   // quantity
         );
 
-        let (frame, frame_len) = transport.encode_request(&request);
+        let (frame, frame_len) = transport.encode_request(&request).unwrap();
 
         // Transaction ID should be in first 2 bytes (big-endian)
         let tid_in_frame = u16::from_be_bytes([frame[0], frame[1]]);
@@ -2647,7 +2711,7 @@ mod tests {
         assert!(frame_len > 0);
 
         // Second request should have incremented transaction ID
-        let (frame2, _) = transport.encode_request(&request);
+        let (frame2, _) = transport.encode_request(&request).unwrap();
         let tid_in_frame2 = u16::from_be_bytes([frame2[0], frame2[1]]);
         assert_eq!(tid_in_frame2, 2);
     }
