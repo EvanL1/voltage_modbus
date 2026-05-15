@@ -1,7 +1,7 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.6.1
+//! **Version:** 0.6.2
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
@@ -33,9 +33,12 @@
 //! ## Quick Start (std)
 //!
 //! ```rust,no_run
+//! #[cfg(feature = "std")]
 //! use voltage_modbus::{ModbusTcpClient, ModbusClient, ModbusResult};
+//! #[cfg(feature = "std")]
 //! use std::time::Duration;
 //!
+//! #[cfg(feature = "std")]
 //! #[tokio::main]
 //! async fn main() -> ModbusResult<()> {
 //!     // Connect to Modbus TCP server
@@ -51,6 +54,9 @@
 //!     client.close().await?;
 //!     Ok(())
 //! }
+//!
+//! #[cfg(not(feature = "std"))]
+//! fn main() {}
 //! ```
 //!
 //! ## no_std Usage (embedded)

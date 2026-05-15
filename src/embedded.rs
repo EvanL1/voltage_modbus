@@ -100,13 +100,12 @@ where
     /// Send a Modbus RTU request and wait for the response.
     ///
     /// Encodes the request into an RTU frame (slave + PDU + CRC-16 LE),
-    /// writes it to the I/O object, then reads bytes until the expected
-    /// response length is reached.  The response CRC is verified before
-    /// returning.
+    /// writes it to the I/O object, then reads bytes according to the response
+    /// header. The response CRC is verified before returning.
     pub async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         let frame = self.encode_request(request)?;
         self.write_frame(&frame).await?;
-        let response_buf = self.read_response(request).await?;
+        let response_buf = self.read_response().await?;
         self.decode_response(response_buf)
     }
 
@@ -233,45 +232,60 @@ where
             .map_err(|_| ModbusError::io("embedded write error"))
     }
 
-    /// Read exactly the number of bytes expected for a response to `request`.
-    async fn read_response(&mut self, request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
-        let expected = expected_response_len(request);
-        let mut buf = vec![0u8; expected];
+    async fn read_response(&mut self) -> ModbusResult<Vec<u8>> {
+        let mut header = [0u8; 2];
         self.io
-            .read_exact(&mut buf)
+            .read_exact(&mut header)
             .await
             .map_err(|_| ModbusError::io("embedded read error"))?;
-        Ok(buf)
-    }
-}
 
-// ============================================================================
-// Frame length prediction
-// ============================================================================
+        let mut frame = Vec::with_capacity(MAX_FRAME);
+        frame.extend_from_slice(&header);
 
-/// Compute the expected byte length of the RTU *response* for a given request.
-///
-/// This lets us do a single exact `read_exact` instead of byte-by-byte polling.
-/// Layout: `[slave(1), FC(1), ...payload..., CRC(2)]`
-fn expected_response_len(request: &ModbusRequest) -> usize {
-    match request.function {
-        // Read functions: slave + FC + byte_count + data + CRC
-        ModbusFunction::ReadCoils | ModbusFunction::ReadDiscreteInputs => {
-            // quantity bits → ceil(quantity / 8) bytes of data
-            let data_bytes = usize::from(request.quantity.div_ceil(8));
-            1 + 1 + 1 + data_bytes + 2
+        let function_code = header[1];
+        if function_code & 0x80 != 0 {
+            let mut tail = [0u8; 3];
+            self.io
+                .read_exact(&mut tail)
+                .await
+                .map_err(|_| ModbusError::io("embedded read error"))?;
+            frame.extend_from_slice(&tail);
+            return Ok(frame);
         }
-        ModbusFunction::ReadHoldingRegisters | ModbusFunction::ReadInputRegisters => {
-            // quantity registers × 2 bytes each
-            let data_bytes = usize::from(request.quantity) * 2;
-            1 + 1 + 1 + data_bytes + 2
+
+        match ModbusFunction::from_u8(function_code)? {
+            ModbusFunction::ReadCoils
+            | ModbusFunction::ReadDiscreteInputs
+            | ModbusFunction::ReadHoldingRegisters
+            | ModbusFunction::ReadInputRegisters => {
+                let mut byte_count = [0u8; 1];
+                self.io
+                    .read_exact(&mut byte_count)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.push(byte_count[0]);
+
+                let mut tail = vec![0u8; usize::from(byte_count[0]) + 2];
+                self.io
+                    .read_exact(&mut tail)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&tail);
+            }
+            ModbusFunction::WriteSingleCoil
+            | ModbusFunction::WriteSingleRegister
+            | ModbusFunction::WriteMultipleCoils
+            | ModbusFunction::WriteMultipleRegisters => {
+                let mut tail = [0u8; 6];
+                self.io
+                    .read_exact(&mut tail)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&tail);
+            }
         }
-        // Write-single: slave + FC + echo_addr(2) + echo_value(2) + CRC
-        ModbusFunction::WriteSingleCoil | ModbusFunction::WriteSingleRegister => 1 + 1 + 2 + 2 + 2,
-        // Write-multiple: slave + FC + echo_addr(2) + echo_qty(2) + CRC
-        ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-            1 + 1 + 2 + 2 + 2
-        }
+
+        Ok(frame)
     }
 }
 
@@ -297,6 +311,9 @@ fn extend(buf: &mut HVec<u8, MAX_FRAME>, bytes: &[u8]) -> ModbusResult<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+
     use super::*;
     use crate::protocol::{ModbusFunction, ModbusRequest};
 
@@ -510,38 +527,58 @@ mod tests {
     // Full roundtrip: encode → (mock I/O) → decode
     // ------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn test_request_roundtrip_fc03() {
-        let regs = [0x1234u16, 0x5678];
-        let response_frame = make_fc03_response(1, &regs);
+    #[test]
+    fn test_request_roundtrip_fc03() {
+        tokio_test::block_on(async {
+            let regs = [0x1234u16, 0x5678];
+            let response_frame = make_fc03_response(1, &regs);
 
-        let mock = MockIo::new(response_frame.clone());
-        let mut transport = EmbeddedRtuTransport::new(mock);
+            let mock = MockIo::new(response_frame.clone());
+            let mut transport = EmbeddedRtuTransport::new(mock);
 
-        let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2);
-        let response = transport.request(&req).await.unwrap();
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2);
+            let response = transport.request(&req).await.unwrap();
 
-        assert!(!response.is_exception());
-        let parsed = response.parse_registers().unwrap();
-        assert_eq!(parsed, regs);
+            assert!(!response.is_exception());
+            let parsed = response.parse_registers().unwrap();
+            assert_eq!(parsed, regs);
 
-        // Verify what was actually written to the mock
-        let written = &transport.io.written;
-        assert!(!written.is_empty());
-        assert_eq!(written[0], 1); // slave_id
-        assert_eq!(written[1], 0x03); // FC03
+            // Verify what was actually written to the mock
+            let written = &transport.io.written;
+            assert!(!written.is_empty());
+            assert_eq!(written[0], 1); // slave_id
+            assert_eq!(written[1], 0x03); // FC03
+        });
     }
 
-    #[tokio::test]
-    async fn test_request_bad_crc_error() {
-        let mut frame = make_fc03_response(1, &[0xBEEFu16]);
-        let last = frame.len() - 1;
-        frame[last] ^= 0xFF; // corrupt CRC
+    #[test]
+    fn test_request_returns_short_exception_response() {
+        tokio_test::block_on(async {
+            let response_frame = make_exception_frame(1, 0x03, 0x02);
+            let mock = MockIo::new(response_frame);
+            let mut transport = EmbeddedRtuTransport::new(mock);
 
-        let mock = MockIo::new(frame);
-        let mut transport = EmbeddedRtuTransport::new(mock);
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 10);
+            let response = transport.request(&req).await.unwrap();
 
-        let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
-        assert!(transport.request(&req).await.is_err());
+            assert!(response.is_exception());
+            assert_eq!(response.slave_id, 1);
+            assert_eq!(response.function, ModbusFunction::ReadHoldingRegisters);
+        });
+    }
+
+    #[test]
+    fn test_request_bad_crc_error() {
+        tokio_test::block_on(async {
+            let mut frame = make_fc03_response(1, &[0xBEEFu16]);
+            let last = frame.len() - 1;
+            frame[last] ^= 0xFF; // corrupt CRC
+
+            let mock = MockIo::new(frame);
+            let mut transport = EmbeddedRtuTransport::new(mock);
+
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+            assert!(transport.request(&req).await.is_err());
+        });
     }
 }

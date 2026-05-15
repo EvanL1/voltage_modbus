@@ -73,8 +73,10 @@
 //! ### Basic Error Handling
 //!
 //! ```rust
+//! #[cfg(feature = "std")]
 //! use voltage_modbus::{ModbusClient, ModbusError};
 //!
+//! #[cfg(feature = "std")]
 //! async fn read_with_error_handling(client: &mut impl ModbusClient) {
 //!     match client.read_03(1, 0, 10).await {
 //!         Ok(registers) => {
@@ -94,6 +96,7 @@
 //! }
 //!
 //! // Example showing function code naming
+//! #[cfg(feature = "std")]
 //! async fn example_with_function_codes(client: &mut impl ModbusClient) {
 //!     // Read holding registers using function code naming
 //!     match client.read_03(1, 0, 10).await {
@@ -126,9 +129,12 @@
 //! ### Retry Logic
 //!
 //! ```rust
+//! #[cfg(feature = "std")]
 //! use voltage_modbus::{ModbusError, ModbusResult};
+//! #[cfg(feature = "std")]
 //! use tokio::time::{sleep, Duration};
 //!
+//! #[cfg(feature = "std")]
 //! async fn read_with_retry<F, Fut>(operation: F, max_retries: usize) -> ModbusResult<Vec<u16>>
 //! where
 //!     F: Fn() -> Fut,
@@ -540,6 +546,9 @@ impl From<tokio::time::error::Elapsed> for ModbusError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::format;
+
     use super::*;
 
     #[test]

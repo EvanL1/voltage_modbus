@@ -3,6 +3,8 @@
 //! This module contains integration tests that test the library
 //! components working together in realistic scenarios.
 
+#![cfg(feature = "std")]
+
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;

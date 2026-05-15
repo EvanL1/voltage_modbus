@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-05-15
+
+### Added
+- `ModbusRequest::new_write_multiple_coils` for FC0F requests where the final packed coil byte is only partially used.
+
+### Fixed
+- Generic clients now validate that responses match the request slave id, function code, read byte count, and write echo fields.
+- Embedded RTU response reading now handles short Modbus exception responses instead of waiting for the normal success-frame length.
+- TCP server request handlers now reject malformed PDUs with trailing bytes.
+- `cargo test --no-default-features` now works by gating std-only integration/property tests and std-only doctest snippets.
+
 ## [0.6.1] - 2026-04-23
 
 ### Fixed

@@ -324,7 +324,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("Invalid read coils request"));
         }
 
@@ -364,7 +364,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("Invalid read discrete inputs request"));
         }
 
@@ -407,7 +407,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -442,7 +442,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -477,7 +477,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -501,7 +501,7 @@ impl ModbusTcpServer {
         data: &[u8],
         register_bank: &Arc<ModbusRegisterBank>,
     ) -> ModbusResult<Vec<u8>> {
-        if data.len() < 4 {
+        if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -537,7 +537,7 @@ impl ModbusTcpServer {
             return Err(ModbusError::frame("invalid frame"));
         }
 
-        if data.len() < 5 + byte_count {
+        if data.len() != 5 + byte_count {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -578,7 +578,7 @@ impl ModbusTcpServer {
             ));
         }
 
-        if data.len() < 5 + byte_count || byte_count != (quantity as usize * 2) {
+        if data.len() != 5 + byte_count || byte_count != (quantity as usize * 2) {
             return Err(ModbusError::frame("invalid frame"));
         }
 
@@ -1205,6 +1205,50 @@ mod tests {
                 0x12, 0x34,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handle_request_rejects_read_trailing_bytes() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+
+        let request = [
+            0x12, 0x34, // transaction id
+            0x00, 0x00, // protocol id
+            0x00, 0x07, // length includes one trailing byte
+            0x01, // unit id
+            0x03, // read holding registers
+            0x00, 0x00, // address
+            0x00, 0x01, // quantity
+            0x99, // invalid trailing byte
+        ];
+
+        let err = ModbusTcpServer::handle_request(&request, &register_bank)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::Frame { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handle_request_rejects_write_trailing_bytes() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+
+        let request = [
+            0x12, 0x34, // transaction id
+            0x00, 0x00, // protocol id
+            0x00, 0x0A, // length includes one trailing byte
+            0x01, // unit id
+            0x10, // write multiple registers
+            0x00, 0x00, // address
+            0x00, 0x01, // quantity
+            0x02, // byte count
+            0x12, 0x34, // register value
+            0x99, // invalid trailing byte
+        ];
+
+        let err = ModbusTcpServer::handle_request(&request, &register_bank)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ModbusError::Frame { .. }));
     }
 
     #[cfg(feature = "rtu")]

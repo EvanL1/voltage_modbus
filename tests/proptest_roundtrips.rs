@@ -3,6 +3,8 @@
 //! Tests byte-order roundtrips, PDU builder invariants, and read-coalescer
 //! structural invariants using proptest with 256 randomized cases each.
 
+#![cfg(feature = "std")]
+
 use proptest::collection::vec;
 use proptest::prelude::*;
 use voltage_modbus::bytes::{

@@ -286,7 +286,10 @@ impl ModbusRequest {
         }
     }
 
-    /// Create a new write request
+    /// Create a new write request.
+    ///
+    /// For packed coil writes where the last byte is only partially used, use
+    /// [`Self::new_write_multiple_coils`] to pass the exact coil quantity.
     pub fn new_write(
         slave_id: SlaveId,
         function: ModbusFunction,
@@ -303,6 +306,22 @@ impl ModbusRequest {
         Self {
             slave_id,
             function,
+            address,
+            quantity,
+            data,
+        }
+    }
+
+    /// Create a write-multiple-coils request with an explicit coil quantity.
+    pub fn new_write_multiple_coils(
+        slave_id: SlaveId,
+        address: ModbusAddress,
+        quantity: u16,
+        data: Vec<u8>,
+    ) -> Self {
+        Self {
+            slave_id,
+            function: ModbusFunction::WriteMultipleCoils,
             address,
             quantity,
             data,
@@ -701,6 +720,9 @@ pub mod data_utils {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "std"))]
+    use alloc::vec;
+
     use super::*;
 
     #[test]
@@ -766,6 +788,14 @@ mod tests {
         let invalid_single_coil =
             ModbusRequest::new_write(1, ModbusFunction::WriteSingleCoil, 10, vec![0x00, 0x01]);
         assert!(invalid_single_coil.validate().is_err());
+    }
+
+    #[test]
+    fn test_write_multiple_coils_preserves_explicit_quantity() {
+        let req = ModbusRequest::new_write_multiple_coils(1, 10, 9, vec![0xFF, 0x01]);
+
+        assert_eq!(req.quantity, 9);
+        assert!(req.validate().is_ok());
     }
 
     #[test]

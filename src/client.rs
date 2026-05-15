@@ -682,6 +682,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
                 "Broadcast (slave_id=0) is only valid for write operations",
             ));
         }
+        request.validate()?;
 
         // Log request if logger is available
         // Note: For accurate packet logging with real TID, use transport.set_packet_callback()
@@ -700,6 +701,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         // ack immediately without waiting for a response (Modbus spec: no reply expected).
         // Regular unicast requests wait for the real device response.
         let response = self.transport.request(&request).await?;
+        validate_response_matches_request(&request, &response)?;
 
         // Log response if logger is available
         if let Some(ref logger) = self.logger {
@@ -712,6 +714,123 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         }
 
         Ok(response)
+    }
+}
+
+fn validate_response_matches_request(
+    request: &ModbusRequest,
+    response: &ModbusResponse,
+) -> ModbusResult<()> {
+    if let Some(error) = response.get_exception() {
+        return Err(error);
+    }
+
+    if response.slave_id != request.slave_id {
+        return Err(ModbusError::protocol(format!(
+            "Response slave ID mismatch: expected {}, got {}",
+            request.slave_id, response.slave_id
+        )));
+    }
+
+    if response.function != request.function {
+        return Err(ModbusError::protocol(format!(
+            "Response function mismatch: expected 0x{:02X}, got 0x{:02X}",
+            request.function.to_u8(),
+            response.function.to_u8()
+        )));
+    }
+
+    if request.slave_id == 0 {
+        return Ok(());
+    }
+
+    match request.function {
+        ModbusFunction::ReadCoils | ModbusFunction::ReadDiscreteInputs => {
+            validate_read_byte_count(request, response, usize::from(request.quantity.div_ceil(8)))
+        }
+        ModbusFunction::ReadHoldingRegisters | ModbusFunction::ReadInputRegisters => {
+            validate_read_byte_count(request, response, usize::from(request.quantity) * 2)
+        }
+        ModbusFunction::WriteSingleCoil => validate_write_echo(
+            response,
+            request.address,
+            expected_single_coil_value(request),
+        ),
+        ModbusFunction::WriteSingleRegister => {
+            let data = request.data.as_slice();
+            if data.len() != 2 {
+                return Err(ModbusError::invalid_data(
+                    "Invalid single register payload length",
+                ));
+            }
+            validate_write_echo(
+                response,
+                request.address,
+                u16::from_be_bytes([data[0], data[1]]),
+            )
+        }
+        ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
+            validate_write_echo(response, request.address, request.quantity)
+        }
+    }
+}
+
+fn validate_read_byte_count(
+    request: &ModbusRequest,
+    response: &ModbusResponse,
+    expected_byte_count: usize,
+) -> ModbusResult<()> {
+    let data = response.data();
+    if data.len() != 1 + expected_byte_count {
+        return Err(ModbusError::frame(format!(
+            "Invalid read response length for 0x{:02X}: expected {}, got {}",
+            request.function.to_u8(),
+            1 + expected_byte_count,
+            data.len()
+        )));
+    }
+    if usize::from(data[0]) != expected_byte_count {
+        return Err(ModbusError::frame(format!(
+            "Invalid read response byte count for 0x{:02X}: expected {}, got {}",
+            request.function.to_u8(),
+            expected_byte_count,
+            data[0]
+        )));
+    }
+    Ok(())
+}
+
+fn validate_write_echo(
+    response: &ModbusResponse,
+    expected_address: u16,
+    expected_value_or_quantity: u16,
+) -> ModbusResult<()> {
+    let data = response.data();
+    if data.len() != 4 {
+        return Err(ModbusError::frame(format!(
+            "Invalid write response length: expected 4, got {}",
+            data.len()
+        )));
+    }
+
+    let actual_address = u16::from_be_bytes([data[0], data[1]]);
+    let actual_value_or_quantity = u16::from_be_bytes([data[2], data[3]]);
+    if actual_address != expected_address || actual_value_or_quantity != expected_value_or_quantity
+    {
+        return Err(ModbusError::protocol(format!(
+            "Write echo mismatch: expected address={} value={}, got address={} value={}",
+            expected_address, expected_value_or_quantity, actual_address, actual_value_or_quantity
+        )));
+    }
+
+    Ok(())
+}
+
+fn expected_single_coil_value(request: &ModbusRequest) -> u16 {
+    if !request.data.is_empty() && request.data[0] != 0 {
+        0xFF00
+    } else {
+        0x0000
     }
 }
 
@@ -1896,6 +2015,79 @@ mod tests {
             }
         }
         ModbusResponse::new_success(slave_id, ModbusFunction::ReadCoils, data)
+    }
+
+    fn create_write_response(
+        slave_id: SlaveId,
+        function: ModbusFunction,
+        address: u16,
+        value_or_quantity: u16,
+    ) -> ModbusResponse {
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&address.to_be_bytes());
+        data.extend_from_slice(&value_or_quantity.to_be_bytes());
+        ModbusResponse::new_success(slave_id, function, data)
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_wrong_function_response() {
+        let mock = MockTransport::new();
+        let mut data = Vec::new();
+        data.push(2);
+        data.extend_from_slice(&0x1234u16.to_be_bytes());
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadInputRegisters,
+            data,
+        )));
+
+        let mut client = GenericModbusClient::new(mock);
+        let err = client.read_03(1, 0, 1).await.unwrap_err();
+        assert!(err.to_string().contains("function mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_read_rejects_wrong_byte_count() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadHoldingRegisters,
+            vec![4, 0x12, 0x34],
+        )));
+
+        let mut client = GenericModbusClient::new(mock);
+        let err = client.read_03(1, 0, 1).await.unwrap_err();
+        assert!(err.to_string().contains("read response"));
+    }
+
+    #[tokio::test]
+    async fn test_write_single_register_rejects_wrong_echo_value() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(create_write_response(
+            1,
+            ModbusFunction::WriteSingleRegister,
+            100,
+            0x2222,
+        )));
+
+        let mut client = GenericModbusClient::new(mock);
+        let err = client.write_06(1, 100, 0x1111).await.unwrap_err();
+        assert!(err.to_string().contains("Write echo mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_write_multiple_registers_rejects_wrong_echo_quantity() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(create_write_response(
+            1,
+            ModbusFunction::WriteMultipleRegisters,
+            10,
+            1,
+        )));
+
+        let mut client = GenericModbusClient::new(mock);
+        let err = client.write_10(1, 10, &[0x1111, 0x2222]).await.unwrap_err();
+        assert!(err.to_string().contains("Write echo mismatch"));
     }
 
     // =========================================================================
