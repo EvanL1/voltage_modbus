@@ -129,7 +129,7 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 #[cfg(feature = "rtu")]
-use tokio_serial;
+use tokio_serial::{self, SerialPort as _};
 
 use crate::error::{ModbusError, ModbusResult};
 use crate::protocol::{ModbusFunction, ModbusRequest, ModbusResponse};
@@ -195,6 +195,81 @@ const MAX_RTU_FRAME_SIZE: usize = 256;
 
 /// CRC calculator shared by RTU and RTU-over-TCP transports
 const CRC_MODBUS: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
+
+/// Delay after a broadcast frame before the next request may be sent.
+///
+/// Slaves never acknowledge a broadcast, so the master must give them time to
+/// execute it (Modbus over Serial Line "turnaround delay"). 100 ms is the
+/// conventional default.
+#[cfg(feature = "rtu")]
+const BROADCAST_TURNAROUND: Duration = Duration::from_millis(100);
+
+/// Compute the RTU inter-frame gap (t3.5) for a baud rate.
+///
+/// MODBUS over Serial Line spec V1.02 §2.5.1.1: below 19200 baud the gap is
+/// 3.5 character times (11 bits per character); above 19200 the spec mandates
+/// a fixed 1750 µs because character-time-based gaps become too short to be
+/// respected by slave devices.
+#[cfg(feature = "rtu")]
+pub(crate) fn rtu_frame_gap(baud_rate: u32) -> Duration {
+    if baud_rate > 19200 {
+        Duration::from_micros(1750)
+    } else {
+        let char_time_us = 11_000_000u64 / u64::from(baud_rate.max(1));
+        Duration::from_micros(char_time_us * 35 / 10)
+    }
+}
+
+/// Read a complete RTU response frame using length-prefixed reads derived from
+/// the function code.
+///
+/// Shared by the serial RTU, RTU-over-TCP and (structurally) embedded
+/// transports. Deriving the frame length from the function code instead of
+/// detecting inter-byte silence makes the read robust against bursty byte
+/// delivery — USB serial adapters buffer in ~16 ms chunks, which at high baud
+/// rates is far longer than t3.5 and would otherwise truncate frames.
+async fn read_rtu_frame<R>(reader: &mut R) -> ModbusResult<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let mut header = [0u8; 2];
+    reader.read_exact(&mut header).await?;
+    let func = header[1];
+
+    // Exception response: [slave, func|0x80, exception, crc(2)] = 5 bytes
+    let remaining = if func & 0x80 != 0 {
+        3
+    } else {
+        match func {
+            0x01..=0x04 => {
+                // [byte_count, data..., crc(2)]: read byte_count first
+                let mut bc = [0u8; 1];
+                reader.read_exact(&mut bc).await?;
+                let mut out = Vec::with_capacity(2 + 1 + bc[0] as usize + 2);
+                out.extend_from_slice(&header);
+                out.push(bc[0]);
+                let mut data = vec![0u8; bc[0] as usize + 2];
+                reader.read_exact(&mut data).await?;
+                out.extend_from_slice(&data);
+                return Ok(out);
+            }
+            0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
+            _ => {
+                return Err(ModbusError::frame(format!(
+                    "Unsupported function code 0x{:02X}",
+                    func
+                )))
+            }
+        }
+    };
+
+    let mut frame = Vec::with_capacity(2 + remaining);
+    frame.extend_from_slice(&header);
+    let mut rest = vec![0u8; remaining];
+    reader.read_exact(&mut rest).await?;
+    frame.extend_from_slice(&rest);
+    Ok(frame)
+}
 
 /// Format raw bytes as hex string for packet logging
 ///
@@ -1248,10 +1323,7 @@ impl RtuTransport {
         parity: tokio_serial::Parity,
         timeout: Duration,
     ) -> ModbusResult<Self> {
-        // Calculate frame gap time based on baud rate
-        // Minimum gap is 3.5 character times
-        let char_time_us = (11_000_000 / baud_rate) as u64; // 11 bits per character in microseconds
-        let frame_gap = Duration::from_micros(char_time_us * 35 / 10); // 3.5 character times
+        let frame_gap = rtu_frame_gap(baud_rate);
 
         let mut transport = Self {
             port: None,
@@ -1283,8 +1355,7 @@ impl RtuTransport {
         timeout: Duration,
         enable_logging: bool,
     ) -> ModbusResult<Self> {
-        let char_time_us = (11_000_000 / baud_rate) as u64;
-        let frame_gap = Duration::from_micros(char_time_us * 35 / 10);
+        let frame_gap = rtu_frame_gap(baud_rate);
 
         let mut transport = Self {
             port: None,
@@ -1505,50 +1576,6 @@ impl RtuTransport {
     async fn wait_frame_gap(&self) {
         tokio::time::sleep(self.frame_gap).await;
     }
-
-    /// Read RTU frame from serial port
-    async fn read_frame(&mut self) -> ModbusResult<Vec<u8>> {
-        let port = self
-            .port
-            .as_mut()
-            .ok_or_else(|| ModbusError::connection("Serial port not connected"))?;
-
-        let mut frame = Vec::new();
-        let mut buffer = [0u8; 1];
-
-        // Read until frame gap timeout
-        loop {
-            match timeout(self.frame_gap, port.read_exact(&mut buffer)).await {
-                Ok(Ok(_)) => {
-                    frame.push(buffer[0]);
-
-                    // Prevent frames from getting too large
-                    if frame.len() > MAX_RTU_FRAME_SIZE {
-                        return Err(ModbusError::frame("RTU frame too large"));
-                    }
-                }
-                Ok(Err(e)) => {
-                    return Err(ModbusError::io(format!("Serial read error: {}", e)));
-                }
-                Err(_) => {
-                    // Timeout - end of frame
-                    if !frame.is_empty() {
-                        break;
-                    }
-                    // If no data yet, continue waiting
-                }
-            }
-        }
-
-        if frame.is_empty() {
-            return Err(ModbusError::timeout(
-                "No response received",
-                self.timeout.as_millis() as u64,
-            ));
-        }
-
-        Ok(frame)
-    }
 }
 
 #[cfg(feature = "rtu")]
@@ -1593,6 +1620,10 @@ impl ModbusTransport for RtuTransport {
             .as_mut()
             .ok_or_else(|| ModbusError::connection("Serial port not connected"))?;
 
+        // Discard any stale bytes (e.g. a late reply to a previous timed-out
+        // request) so they cannot be mistaken for the response to this request.
+        let _ = port.clear(tokio_serial::ClearBuffer::Input);
+
         let send_result = timeout(self.timeout, port.write_all(&frame)).await;
         match send_result {
             Ok(Ok(_)) => {
@@ -1614,14 +1645,22 @@ impl ModbusTransport for RtuTransport {
         }
 
         // Broadcast (slave_id = 0): per Modbus spec no response is expected.
-        // Return a synthetic ack immediately without waiting.
+        // Wait the turnaround delay so slaves finish executing before the
+        // master issues its next request, then return a synthetic ack.
         if request.slave_id == 0 {
+            tokio::time::sleep(BROADCAST_TURNAROUND).await;
             self.stats.responses_received += 1;
             return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
-        // Read response
-        let response_frame = match timeout(self.timeout, self.read_frame()).await {
+        // Read response — frame length is derived from the function code, so
+        // bursty byte delivery (USB serial adapters) cannot truncate frames the
+        // way inter-byte-gap detection could.
+        let port = self
+            .port
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("Serial port not connected"))?;
+        let response_frame = match timeout(self.timeout, read_rtu_frame(port)).await {
             Ok(Ok(frame)) => frame,
             Ok(Err(e)) => {
                 self.stats.errors += 1;
@@ -2167,6 +2206,10 @@ impl ModbusTransport for AsciiTransport {
             .as_mut()
             .ok_or_else(|| ModbusError::connection("Serial port not connected"))?;
 
+        // Discard any stale bytes (e.g. a late reply to a previous timed-out
+        // request) so they cannot be mistaken for the response to this request.
+        let _ = port.clear(tokio_serial::ClearBuffer::Input);
+
         let send_result = timeout(self.timeout, port.write_all(&frame)).await;
         match send_result {
             Ok(Ok(_)) => {
@@ -2188,6 +2231,15 @@ impl ModbusTransport for AsciiTransport {
                     self.timeout.as_millis() as u64,
                 ));
             }
+        }
+
+        // Broadcast (slave_id = 0): per Modbus spec no response is expected.
+        // Wait the turnaround delay so slaves finish executing, then return a
+        // synthetic ack instead of blocking on a reply that will never come.
+        if request.slave_id == 0 {
+            tokio::time::sleep(BROADCAST_TURNAROUND).await;
+            self.stats.responses_received += 1;
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
         // Read response
@@ -2370,51 +2422,6 @@ impl RtuOverTcpTransport {
         ))
     }
 
-    /// Read a complete RTU frame from the TCP stream based on function code.
-    ///
-    /// Unlike serial RTU (which relies on inter-frame silence), this uses
-    /// length-prefixed reads derived from the function code — reliable
-    /// because TCP guarantees in-order delivery.
-    async fn read_frame(stream: &mut TcpStream) -> ModbusResult<Vec<u8>> {
-        let mut header = [0u8; 2];
-        stream.read_exact(&mut header).await?;
-        let func = header[1];
-
-        // Exception response: [slave, func|0x80, exception, crc(2)] = 5 bytes
-        let remaining = if func & 0x80 != 0 {
-            3
-        } else {
-            match func {
-                0x01..=0x04 => {
-                    // [byte_count, data..., crc(2)]: read byte_count first
-                    let mut bc = [0u8; 1];
-                    stream.read_exact(&mut bc).await?;
-                    let mut out = Vec::with_capacity(2 + 1 + bc[0] as usize + 2);
-                    out.extend_from_slice(&header);
-                    out.push(bc[0]);
-                    let mut data = vec![0u8; bc[0] as usize + 2];
-                    stream.read_exact(&mut data).await?;
-                    out.extend_from_slice(&data);
-                    return Ok(out);
-                }
-                0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
-                _ => {
-                    return Err(ModbusError::frame(format!(
-                        "Unsupported function code 0x{:02X}",
-                        func
-                    )))
-                }
-            }
-        };
-
-        let mut frame = Vec::with_capacity(2 + remaining);
-        frame.extend_from_slice(&header);
-        let mut rest = vec![0u8; remaining];
-        stream.read_exact(&mut rest).await?;
-        frame.extend_from_slice(&rest);
-        Ok(frame)
-    }
-
     async fn reconnect(&mut self) -> ModbusResult<()> {
         let stream = TcpStream::connect(self.address).await.map_err(|e| {
             ModbusError::connection(format!("Reconnect to {} failed: {}", self.address, e))
@@ -2473,7 +2480,7 @@ impl ModbusTransport for RtuOverTcpTransport {
             .stream
             .as_mut()
             .ok_or_else(|| ModbusError::connection("stream not connected after write"))?;
-        let read_result = timeout(io_timeout, Self::read_frame(stream)).await;
+        let read_result = timeout(io_timeout, read_rtu_frame(stream)).await;
         let frame = match read_result {
             Err(_) => {
                 self.stream = None;
@@ -2611,6 +2618,65 @@ mod rtu_over_tcp_tests {
 }
 
 #[cfg(test)]
+mod rtu_frame_reader_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    fn with_crc(body: &[u8]) -> Vec<u8> {
+        let mut frame = body.to_vec();
+        let crc = CRC_MODBUS.checksum(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
+    #[tokio::test]
+    async fn reads_fc03_response_delivered_in_bursts() {
+        // Simulate a USB serial adapter delivering the frame in two chunks with
+        // a gap far longer than t3.5 — must still parse as one frame.
+        let frame = with_crc(&[0x01, 0x03, 0x04, 0x12, 0x34, 0x56, 0x78]);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+
+        let expected = frame.clone();
+        let writer = tokio::spawn(async move {
+            tx.write_all(&frame[..3]).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tx.write_all(&frame[3..]).await.unwrap();
+        });
+
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        writer.await.unwrap();
+        assert_eq!(got, expected);
+    }
+
+    #[tokio::test]
+    async fn reads_exception_frame() {
+        let frame = with_crc(&[0x01, 0x83, 0x02]);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&frame).await.unwrap();
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        assert_eq!(got, frame);
+        assert_eq!(got.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn reads_write_echo_frame() {
+        let frame = with_crc(&[0x01, 0x06, 0x00, 0x64, 0x12, 0x34]);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&frame).await.unwrap();
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        assert_eq!(got, frame);
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_function_code() {
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&[0x01, 0x2B]).await.unwrap();
+        let err = read_rtu_frame(&mut rx).await.unwrap_err();
+        assert!(err.is_protocol_error());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2728,6 +2794,16 @@ mod rtu_tests {
         let crc = RtuTransport::calculate_crc(&data);
         // Expected CRC for this data should be calculated
         assert!(crc > 0);
+    }
+
+    #[test]
+    fn test_rtu_frame_gap_matches_spec() {
+        // Below 19200 baud: 3.5 × 11-bit character times
+        assert_eq!(rtu_frame_gap(9600), Duration::from_micros(4007));
+        assert_eq!(rtu_frame_gap(19200), Duration::from_micros(2002));
+        // Above 19200 baud: fixed 1750 µs per MODBUS over Serial Line V1.02
+        assert_eq!(rtu_frame_gap(38400), Duration::from_micros(1750));
+        assert_eq!(rtu_frame_gap(115200), Duration::from_micros(1750));
     }
 
     #[test]

@@ -134,7 +134,8 @@ impl ModbusTcpServer {
     ) {
         let peer_addr = stream
             .peer_addr()
-            .unwrap_or_else(|_| "unknown".parse().unwrap());
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         info!("📡 New client connected: {}", peer_addr);
 
         // Update connection count
@@ -751,6 +752,11 @@ impl ModbusServer for ModbusTcpServer {
 pub struct ModbusRtuServerConfig {
     pub port: String,
     pub baud_rate: u32,
+    /// Slave address this server answers to (1-247).
+    ///
+    /// Frames addressed to other slaves are ignored; broadcast frames
+    /// (address 0) are executed but never answered, per the Modbus spec.
+    pub slave_id: u8,
     pub data_bits: tokio_serial::DataBits,
     pub stop_bits: tokio_serial::StopBits,
     pub parity: tokio_serial::Parity,
@@ -765,6 +771,7 @@ impl Default for ModbusRtuServerConfig {
         Self {
             port: "/dev/ttyUSB0".to_string(),
             baud_rate: 9600,
+            slave_id: 1,
             data_bits: tokio_serial::DataBits::Eight,
             stop_bits: tokio_serial::StopBits::One,
             parity: tokio_serial::Parity::None,
@@ -793,6 +800,7 @@ impl ModbusRtuServer {
         let config = ModbusRtuServerConfig {
             port: port.to_string(),
             baud_rate,
+            frame_gap: crate::transport::rtu_frame_gap(baud_rate),
             ..Default::default()
         };
 
@@ -828,44 +836,76 @@ impl ModbusRtuServer {
         CRC_MODBUS.checksum(data)
     }
 
-    /// Handle RTU request
-    async fn handle_request(&mut self, data: &[u8]) -> ModbusResult<Vec<u8>> {
-        if data.len() < 3 {
-            return Err(ModbusError::frame("Invalid RTU frame length"));
+    /// Process a single received RTU frame.
+    ///
+    /// Returns `Some(frame)` (CRC already appended) when a reply must be sent.
+    /// Returns `None` when the frame must stay unanswered per the Modbus spec:
+    /// noise/CRC-corrupted frames, frames addressed to another slave, and
+    /// broadcasts (executed but never acknowledged — a reply would collide
+    /// with other slaves on the bus).
+    async fn process_frame(
+        frame: &[u8],
+        own_slave_id: u8,
+        register_bank: &Arc<ModbusRegisterBank>,
+    ) -> Option<Vec<u8>> {
+        // Minimum RTU frame: slave(1) + function(1) + CRC(2)
+        if frame.len() < 4 {
+            return None;
         }
 
-        let slave_id = data[0];
-        let function_code = data[1];
-        let pdu_data = &data[2..data.len() - 2]; // Remove CRC
-
-        // Verify slave ID matches (or is broadcast)
-        if slave_id != 0 && slave_id != 1 {
-            return Err(ModbusError::device_not_responding(slave_id));
+        let crc_split = frame.len() - 2;
+        let received_crc = u16::from_le_bytes([frame[crc_split], frame[crc_split + 1]]);
+        let calculated_crc = Self::calculate_crc(&frame[..crc_split]);
+        if received_crc != calculated_crc {
+            warn!(
+                "Ignoring RTU frame with bad CRC: expected {:04X}, got {:04X}",
+                calculated_crc, received_crc
+            );
+            return None;
         }
 
-        let response_pdu = match function_code {
-            0x01 => Self::handle_read_01(pdu_data, &self.register_bank).await?,
-            0x02 => Self::handle_read_02(pdu_data, &self.register_bank).await?,
-            0x03 => Self::handle_read_03(pdu_data, &self.register_bank).await?,
-            0x04 => Self::handle_read_04(pdu_data, &self.register_bank).await?,
-            0x05 => Self::handle_write_05(pdu_data, &self.register_bank).await?,
-            0x06 => Self::handle_write_06(pdu_data, &self.register_bank).await?,
-            0x0F => Self::handle_write_0f(pdu_data, &self.register_bank).await?,
-            0x10 => Self::handle_write_10(pdu_data, &self.register_bank).await?,
-            _ => {
-                return Err(ModbusError::invalid_function(function_code));
-            }
+        let slave_id = frame[0];
+        if slave_id != 0 && slave_id != own_slave_id {
+            return None;
+        }
+
+        let function_code = frame[1];
+        let pdu_data = &frame[2..crc_split];
+
+        let result = match function_code {
+            0x01 => ModbusTcpServer::handle_read_01(pdu_data, register_bank).await,
+            0x02 => ModbusTcpServer::handle_read_02(pdu_data, register_bank).await,
+            0x03 => ModbusTcpServer::handle_read_03(pdu_data, register_bank).await,
+            0x04 => ModbusTcpServer::handle_read_04(pdu_data, register_bank).await,
+            0x05 => ModbusTcpServer::handle_write_05(pdu_data, register_bank).await,
+            0x06 => ModbusTcpServer::handle_write_06(pdu_data, register_bank).await,
+            0x0F => ModbusTcpServer::handle_write_0f(pdu_data, register_bank).await,
+            0x10 => ModbusTcpServer::handle_write_10(pdu_data, register_bank).await,
+            _ => Err(ModbusError::invalid_function(function_code)),
         };
 
-        // Build RTU response: slave_id + function_code + response_data
-        let mut response = vec![slave_id, function_code];
-        response.extend_from_slice(&response_pdu[1..]); // Skip function code from PDU
+        // Broadcast: executed above, but never answered
+        if slave_id == 0 {
+            return None;
+        }
 
-        Ok(response)
+        match result {
+            Ok(pdu) => {
+                let mut response = Vec::with_capacity(1 + pdu.len() + 2);
+                response.push(slave_id);
+                response.extend_from_slice(&pdu);
+                let crc = Self::calculate_crc(&response);
+                response.extend_from_slice(&crc.to_le_bytes());
+                Some(response)
+            }
+            Err(e) => {
+                let exception_code = ModbusTcpServer::exception_code_for_error(&e);
+                Self::create_rtu_error_response(slave_id, function_code, exception_code).ok()
+            }
+        }
     }
 
     /// Create RTU error response
-    #[allow(dead_code)]
     fn create_rtu_error_response(
         slave_id: u8,
         function_code: u8,
@@ -885,6 +925,7 @@ impl ModbusRtuServer {
     /// Handle RTU communication loop
     async fn handle_rtu_communication(
         mut port: tokio_serial::SerialStream,
+        own_slave_id: u8,
         register_bank: Arc<ModbusRegisterBank>,
         stats: Arc<Mutex<ServerStats>>,
         mut shutdown_rx: broadcast::Receiver<()>,
@@ -914,6 +955,7 @@ impl ModbusRtuServer {
                                 Self::process_accumulated_frame(
                                     &frame_buffer,
                                     &mut port,
+                                    own_slave_id,
                                     &register_bank,
                                     &stats
                                 ).await;
@@ -943,6 +985,7 @@ impl ModbusRtuServer {
                                 Self::process_accumulated_frame(
                                     &frame_buffer,
                                     &mut port,
+                                    own_slave_id,
                                     &register_bank,
                                     &stats
                                 ).await;
@@ -961,6 +1004,7 @@ impl ModbusRtuServer {
     async fn process_accumulated_frame(
         frame: &[u8],
         port: &mut tokio_serial::SerialStream,
+        own_slave_id: u8,
         register_bank: &Arc<ModbusRegisterBank>,
         stats: &Arc<Mutex<ServerStats>>,
     ) {
@@ -969,104 +1013,23 @@ impl ModbusRtuServer {
             stats.total_requests += 1;
         }
 
-        // Create a temporary server instance for processing
-        let mut temp_server = ModbusRtuServer {
-            config: ModbusRtuServerConfig::default(),
-            register_bank: register_bank.clone(),
-            stats: stats.clone(),
-            shutdown_tx: None,
-            is_running: Arc::new(AtomicBool::new(false)),
-            start_time: None,
+        // None = frame must stay unanswered (noise, bad CRC, other slave, broadcast)
+        let Some(response) = Self::process_frame(frame, own_slave_id, register_bank).await else {
+            return;
         };
 
-        match temp_server.handle_request(frame).await {
-            Ok(response) => {
-                // Calculate CRC for response
-                let mut response_with_crc = response;
-                let crc = Self::calculate_crc(&response_with_crc);
-                response_with_crc.extend_from_slice(&crc.to_le_bytes());
-
-                if let Err(e) = port.write_all(&response_with_crc).await {
-                    error!("Failed to write response: {}", e);
-                    if let Ok(mut stats) = stats.lock() {
-                        stats.failed_requests += 1;
-                    }
-                } else if let Ok(mut stats) = stats.lock() {
-                    stats.successful_requests += 1;
-                    stats.bytes_sent += response_with_crc.len() as u64;
-                }
+        if let Err(e) = port.write_all(&response).await {
+            error!("Failed to write response: {}", e);
+            if let Ok(mut stats) = stats.lock() {
+                stats.failed_requests += 1;
             }
-            Err(e) => {
-                error!("Error processing request: {}", e);
-                if let Ok(mut stats) = stats.lock() {
-                    stats.failed_requests += 1;
-                }
-                // Send exception response if needed
-            }
+        } else if let Ok(mut stats) = stats.lock() {
+            stats.successful_requests += 1;
+            stats.bytes_sent += response.len() as u64;
         }
-    }
-
-    // Reuse the same handler methods from TCP server
-    async fn handle_read_01(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_read_01(data, register_bank).await
-    }
-
-    async fn handle_read_02(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_read_02(data, register_bank).await
-    }
-
-    async fn handle_read_03(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_read_03(data, register_bank).await
-    }
-
-    async fn handle_read_04(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_read_04(data, register_bank).await
-    }
-
-    async fn handle_write_05(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_write_05(data, register_bank).await
-    }
-
-    async fn handle_write_06(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_write_06(data, register_bank).await
-    }
-
-    async fn handle_write_0f(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_write_0f(data, register_bank).await
-    }
-
-    async fn handle_write_10(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
-        ModbusTcpServer::handle_write_10(data, register_bank).await
     }
 }
 
-/// Modbus RTU server implementation
-///
-/// Note: This is a placeholder for future implementation
 #[cfg(feature = "rtu")]
 impl ModbusServer for ModbusRtuServer {
     async fn start(&mut self) -> ModbusResult<()> {
@@ -1101,6 +1064,7 @@ impl ModbusServer for ModbusRtuServer {
         info!("📊 Server configuration:");
         info!("   - Port: {}", self.config.port);
         info!("   - Baud rate: {}", self.config.baud_rate);
+        info!("   - Slave ID: {}", self.config.slave_id);
         info!("   - Data bits: {:?}", self.config.data_bits);
         info!("   - Stop bits: {:?}", self.config.stop_bits);
         info!("   - Parity: {:?}", self.config.parity);
@@ -1109,12 +1073,20 @@ impl ModbusServer for ModbusRtuServer {
         let register_bank = self.register_bank.clone();
         let stats = self.stats.clone();
         let frame_gap = self.config.frame_gap;
+        let own_slave_id = self.config.slave_id;
         let is_running_flag = self.is_running.clone();
         let shutdown_rx = shutdown_tx.subscribe();
 
         tokio::spawn(async move {
-            Self::handle_rtu_communication(port, register_bank, stats, shutdown_rx, frame_gap)
-                .await;
+            Self::handle_rtu_communication(
+                port,
+                own_slave_id,
+                register_bank,
+                stats,
+                shutdown_rx,
+                frame_gap,
+            )
+            .await;
 
             is_running_flag.store(false, Ordering::Relaxed);
         });
@@ -1270,6 +1242,7 @@ mod tests {
         let config = ModbusRtuServerConfig {
             port: "/dev/ttyUSB0".to_string(),
             baud_rate: 19200,
+            slave_id: 17,
             data_bits: tokio_serial::DataBits::Eight,
             stop_bits: tokio_serial::StopBits::Two,
             parity: tokio_serial::Parity::Even,
@@ -1325,6 +1298,121 @@ mod tests {
         let test_data2 = vec![0x01, 0x04, 0x00, 0x00, 0x00, 0x01];
         let crc2 = ModbusRtuServer::calculate_crc(&test_data2);
         assert_ne!(crc, crc2);
+    }
+
+    /// Build a valid RTU frame by appending the CRC to a body.
+    #[cfg(feature = "rtu")]
+    fn rtu_frame(body: &[u8]) -> Vec<u8> {
+        let mut frame = body.to_vec();
+        let crc = ModbusRtuServer::calculate_crc(&frame);
+        frame.extend_from_slice(&crc.to_le_bytes());
+        frame
+    }
+
+    /// C1 regression: short noise bursts (including the 3-byte case that used
+    /// to panic via `&data[2..len-2]`) must be ignored, never panic.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_ignores_short_noise() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        for noise in [
+            &[][..],
+            &[0x01][..],
+            &[0x01, 0x03][..],
+            &[0x01, 0x03, 0x00][..],
+        ] {
+            assert!(
+                ModbusRtuServer::process_frame(noise, 1, &bank)
+                    .await
+                    .is_none(),
+                "noise frame {noise:02X?} must be ignored"
+            );
+        }
+    }
+
+    /// C2 regression: frames with a corrupted CRC must be dropped, not executed.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_ignores_bad_crc() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        // Corrupted broadcast write: must NOT reach the register bank
+        let mut frame = rtu_frame(&[0x00, 0x06, 0x00, 0x05, 0xAB, 0xCD]);
+        let last = frame.len() - 1;
+        frame[last] ^= 0xFF;
+
+        assert!(ModbusRtuServer::process_frame(&frame, 1, &bank)
+            .await
+            .is_none());
+        assert_eq!(bank.read_03(5, 1).unwrap(), vec![0x0000]);
+    }
+
+    /// C3 regression: the answered slave address comes from configuration,
+    /// not a hardcoded `1`.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_respects_configured_slave_id() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let frame = rtu_frame(&[0x02, 0x03, 0x00, 0x00, 0x00, 0x01]);
+
+        // Addressed to slave 2: ignored when we are slave 1, answered when we are slave 2
+        assert!(ModbusRtuServer::process_frame(&frame, 1, &bank)
+            .await
+            .is_none());
+        assert!(ModbusRtuServer::process_frame(&frame, 2, &bank)
+            .await
+            .is_some());
+    }
+
+    /// C4 regression: broadcast writes are executed but never answered.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_broadcast_write_executes_silently() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let frame = rtu_frame(&[0x00, 0x06, 0x00, 0x05, 0xAB, 0xCD]);
+
+        let response = ModbusRtuServer::process_frame(&frame, 1, &bank).await;
+        assert!(response.is_none(), "broadcast must never be answered");
+        assert_eq!(bank.read_03(5, 1).unwrap(), vec![0xABCD]);
+    }
+
+    /// Valid unicast read produces a CRC-terminated response frame.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_valid_read_response() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let frame = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+
+        let response = ModbusRtuServer::process_frame(&frame, 1, &bank)
+            .await
+            .expect("valid unicast read must be answered");
+
+        // slave, fc, byte_count, data hi, data lo
+        assert_eq!(&response[..5], &[0x01, 0x03, 0x02, 0x12, 0x34]);
+        let split = response.len() - 2;
+        let crc = u16::from_le_bytes([response[split], response[split + 1]]);
+        assert_eq!(crc, ModbusRtuServer::calculate_crc(&response[..split]));
+    }
+
+    /// W4 regression: processing errors yield a Modbus exception response
+    /// instead of leaving the master to time out.
+    #[cfg(feature = "rtu")]
+    #[tokio::test]
+    async fn test_rtu_process_frame_error_yields_exception_response() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        // FC03 with quantity 0 → Illegal Data Value (0x03)
+        let frame = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
+
+        let response = ModbusRtuServer::process_frame(&frame, 1, &bank)
+            .await
+            .expect("error must produce an exception response");
+
+        assert_eq!(response[0], 0x01); // slave id
+        assert_eq!(response[1], 0x83); // fc | 0x80
+        assert_eq!(response[2], 0x03); // Illegal Data Value
+        let split = response.len() - 2;
+        let crc = u16::from_le_bytes([response[split], response[split + 1]]);
+        assert_eq!(crc, ModbusRtuServer::calculate_crc(&response[..split]));
     }
 
     #[cfg(feature = "rtu")]
