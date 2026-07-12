@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-12
+
+### Fixed
+- `validate_response_matches_request`'s Diagnostics (FC 0x08) branch indexed `request.data[0..2]` after only checking the *response*'s length, panicking if `request.data` was shorter than 2 bytes. Not reachable through the public client API (`ModbusRequest::validate()` already rejects a too-short Diagnostics request before this code runs), but a real latent panic found by fuzzing on its first run in CI.
+
+### Added
+- Five new fuzz targets covering code added in 0.7.0 that the original fuzz corpus never exercised: the length-aware RTU frame reader (including the FC 0x2B per-object read loop), `DeviceIdentification::parse`, the RTU server's frame-processing entry point, the server-side FC 0x2B `DeviceIdentity` responder, and `validate_response_matches_request` itself. Runs daily in CI (`.github/workflows/fuzz.yml`) with corpus caching and crash-artifact upload.
+
 ## [0.7.0] - 2026-07-12
 
 ### Added
