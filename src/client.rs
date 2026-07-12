@@ -942,7 +942,7 @@ fn validate_response_matches_request(
         ModbusFunction::Diagnostics => {
             // Response echoes the sub-function, followed by echo/counter data
             let data = response.data();
-            if data.len() < 4 || data[0..2] != request.data[0..2] {
+            if data.len() < 4 || request.data.len() < 2 || data[0..2] != request.data[0..2] {
                 return Err(ModbusError::frame("Invalid diagnostics response"));
             }
             Ok(())
@@ -3272,6 +3272,33 @@ mod tests {
         )));
         let mut client = GenericModbusClient::new(mock);
         assert_eq!(client.diagnostics(1, 0x0000, 0xA537).await.unwrap(), 0xA537);
+    }
+
+    /// Regression test for a crash found by `fuzz_response_validation`:
+    /// `validate_response_matches_request`'s Diagnostics branch indexed
+    /// `request.data[0..2]` after checking only the *response*'s length,
+    /// panicking when `request.data` itself was shorter than 2 bytes.
+    ///
+    /// `ModbusRequest::validate()` normally rejects a Diagnostics request
+    /// with `data.len() < 4` before this code ever runs, so this can't be
+    /// triggered through the public client API today — but the fuzz target
+    /// calls this function directly (bypassing `validate()`, matching how a
+    /// future refactor could plausibly do the same), which is exactly how
+    /// it found this.
+    #[test]
+    fn test_diagnostics_validation_rejects_short_request_data_without_panicking() {
+        let request = ModbusRequest {
+            slave_id: 1,
+            function: ModbusFunction::Diagnostics,
+            address: 0,
+            quantity: 0,
+            data: vec![0x00], // 1 byte — too short to index [0..2]
+        };
+        let response =
+            ModbusResponse::new_success(1, ModbusFunction::Diagnostics, vec![0x00, 0x00, 0, 0]);
+
+        let err = validate_response_matches_request_fuzz(&request, &response).unwrap_err();
+        assert!(err.to_string().contains("Invalid diagnostics response"));
     }
 
     #[tokio::test]
