@@ -1,0 +1,79 @@
+name: Fuzz
+
+on:
+  schedule:
+    # Daily at 03:00 UTC. Scheduled (not per-push) because each run compiles
+    # cargo-fuzz from scratch and burns real wall-clock fuzzing time.
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      duration_secs:
+        description: 'Seconds to fuzz each target'
+        required: false
+        default: '120'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - fuzz_response_frame
+          - fuzz_rtu_decode
+          - fuzz_pdu_builder
+          - fuzz_rtu_frame_reader
+          - fuzz_device_identification
+          - fuzz_rtu_server_frame
+    env:
+      FUZZ_TARGET: ${{ matrix.target }}
+      FUZZ_DURATION_SECS: ${{ github.event.inputs.duration_secs || '120' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable as of 2026-06-30
+        with:
+          toolchain: nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      # Corpus persistence: without this every run starts from an empty
+      # corpus and re-discovers the same coverage from scratch. The cache key
+      # is unique per run so it never collides mid-write; restore-keys falls
+      # back to the most recent corpus for this target.
+      - name: Restore corpus cache
+        uses: actions/cache/restore@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Run fuzz target
+        working-directory: fuzz
+        run: cargo +nightly fuzz run "$FUZZ_TARGET" -- -max_total_time="$FUZZ_DURATION_SECS"
+
+      - name: Save corpus cache
+        if: always()
+        uses: actions/cache/save@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      # A crash leaves a reproducer under fuzz/artifacts/<target>/. Upload it
+      # so it can be downloaded and replayed locally with:
+      #   cd fuzz && cargo +nightly fuzz run <target> fuzz/artifacts/<target>/<crash-file>
+      - name: Upload crash artifact
+        if: failure()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

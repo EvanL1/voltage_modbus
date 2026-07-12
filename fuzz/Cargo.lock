@@ -668,12 +668,13 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "libfuzzer-sys",
+ "tokio",
  "voltage_modbus",
 ]
 
 [[package]]
 name = "voltage_modbus"
-version = "0.5.1"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "chrono",

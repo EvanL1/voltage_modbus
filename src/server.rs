@@ -1239,6 +1239,19 @@ impl ModbusRtuServer {
         }
     }
 
+    /// Thin public wrapper around [`Self::process_frame`] for fuzz testing.
+    ///
+    /// Dispatches into a real [`ModbusRegisterBank`] (the default service) so
+    /// fuzzed frames exercise the full CRC-check → slave-filter → FC-dispatch
+    /// → register-bank path, including the register read/write handlers.
+    ///
+    /// Not part of the public API — subject to change without notice.
+    #[doc(hidden)]
+    pub async fn process_frame_fuzz(frame: &[u8], own_slave_id: u8) -> Option<Vec<u8>> {
+        let bank = ModbusRegisterBank::new();
+        Self::process_frame(frame, own_slave_id, &bank).await
+    }
+
     /// Create RTU error response
     fn create_rtu_error_response(
         slave_id: u8,

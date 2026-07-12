@@ -236,7 +236,28 @@ where
     let mut header = [0u8; 2];
     reader.read_exact(&mut header).await?;
     let func = header[1];
+    read_rtu_frame_body(reader, header, func).await
+}
 
+/// Thin public wrapper around the length-derivation body of [`read_rtu_frame`]
+/// for fuzz testing — takes the already-read 2-byte header directly so the
+/// fuzzer can drive the length-derivation branches (including the FC 0x2B
+/// per-object read loop) without needing a real stream handshake.
+///
+/// Not part of the public API — subject to change without notice.
+#[doc(hidden)]
+pub async fn read_rtu_frame_fuzz<R>(reader: &mut R, header: [u8; 2]) -> ModbusResult<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
+    let func = header[1];
+    read_rtu_frame_body(reader, header, func).await
+}
+
+async fn read_rtu_frame_body<R>(reader: &mut R, header: [u8; 2], func: u8) -> ModbusResult<Vec<u8>>
+where
+    R: tokio::io::AsyncRead + Unpin + Send,
+{
     // Exception response: [slave, func|0x80, exception, crc(2)] = 5 bytes
     let remaining = if func & 0x80 != 0 {
         3

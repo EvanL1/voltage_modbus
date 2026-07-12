@@ -13,6 +13,9 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = { version = "0.4", features = ["arbitrary-derive"] }
 arbitrary = { version = "1", features = ["derive"] }
+# Async fuzz targets (RTU frame reader, RTU server dispatch) run the library's
+# async fns inside a minimal current-thread runtime.
+tokio = { version = "1", features = ["rt"] }
 
 [dependencies.voltage_modbus]
 path = ".."
@@ -37,5 +40,23 @@ doc = false
 [[bin]]
 name = "fuzz_pdu_builder"
 path = "fuzz_targets/fuzz_pdu_builder.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_rtu_frame_reader"
+path = "fuzz_targets/fuzz_rtu_frame_reader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_device_identification"
+path = "fuzz_targets/fuzz_device_identification.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_rtu_server_frame"
+path = "fuzz_targets/fuzz_rtu_server_frame.rs"
 test = false
 doc = false
