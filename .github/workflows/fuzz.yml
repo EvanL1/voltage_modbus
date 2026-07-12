@@ -29,6 +29,8 @@ jobs:
           - fuzz_rtu_frame_reader
           - fuzz_device_identification
           - fuzz_rtu_server_frame
+          - fuzz_device_identity_request
+          - fuzz_response_validation
     env:
       FUZZ_TARGET: ${{ matrix.target }}
       FUZZ_DURATION_SECS: ${{ github.event.inputs.duration_secs || '120' }}

@@ -832,6 +832,21 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
     }
 }
 
+/// Thin public wrapper around [`validate_response_matches_request`] for fuzz
+/// testing — every response-validation branch (including the byte indexing
+/// backing `get_comm_event_log`/`report_server_id`/`diagnostics`, which rely
+/// on this function having already bounds-checked the response) is otherwise
+/// only reachable through a live transport round trip.
+///
+/// Not part of the public API — subject to change without notice.
+#[doc(hidden)]
+pub fn validate_response_matches_request_fuzz(
+    request: &ModbusRequest,
+    response: &ModbusResponse,
+) -> ModbusResult<()> {
+    validate_response_matches_request(request, response)
+}
+
 fn validate_response_matches_request(
     request: &ModbusRequest,
     response: &ModbusResponse,

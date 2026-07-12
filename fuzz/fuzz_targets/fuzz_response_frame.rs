@@ -41,8 +41,7 @@ fuzz_target!(|data: &[u8]| {
     };
 
     // Primary target: zero-copy frame constructor.
-    let response =
-        ModbusResponse::new_from_frame(frame, slave_id, function, data_start, data_len);
+    let response = ModbusResponse::new_from_frame(frame, slave_id, function, data_start, data_len);
 
     // Exercise the slice-indexing path (`data()`) which can panic if
     // data_offset + data_len > buffer.len().

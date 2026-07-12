@@ -178,6 +178,14 @@ impl DeviceIdentity {
         stream_level | 0x80
     }
 
+    /// Thin public wrapper around [`Self::handle_request`] for fuzz testing.
+    ///
+    /// Not part of the public API — subject to change without notice.
+    #[doc(hidden)]
+    pub fn handle_request_fuzz(&self, data: &[u8]) -> ModbusResult<Vec<u8>> {
+        self.handle_request(data)
+    }
+
     /// Handle an FC 0x2B request payload (bytes after the function code).
     fn handle_request(&self, data: &[u8]) -> ModbusResult<Vec<u8>> {
         use crate::constants::{MAX_PDU_SIZE, MEI_READ_DEVICE_ID};

@@ -60,3 +60,15 @@ name = "fuzz_rtu_server_frame"
 path = "fuzz_targets/fuzz_rtu_server_frame.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_device_identity_request"
+path = "fuzz_targets/fuzz_device_identity_request.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_response_validation"
+path = "fuzz_targets/fuzz_response_validation.rs"
+test = false
+doc = false
