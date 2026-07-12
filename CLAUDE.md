@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build (default features = "std": TCP client/server + async runtime)
 cargo build
 cargo build --features rtu                 # Add RTU serial support
+cargo build --features tls                 # Add Modbus/TCP Security (TLS client)
 cargo build --features "rtu,igw"           # All std features
 cargo build --no-default-features          # no_std build (core modules only: constants, error, pdu, protocol)
 
@@ -71,6 +72,7 @@ Client methods use function-code naming as primary (`read_03`, `write_06`) with 
 
 - **`std`** (default): enables `tokio`, `thiserror`, `bytes`, `chrono` — full async TCP client/server
 - **`rtu`**: implies `std`; adds `tokio-serial` for `ModbusRtuClient` / `RtuTransport`
+- **`tls`**: implies `std`; adds `tokio-rustls` (ring provider) for `ModbusTlsClient` / `TlsTransport` — Modbus/TCP Security, caller supplies the `rustls::ClientConfig`
 - **`igw`**: implies `std`; optional IGW integration
 - **no_std**: `cargo build --no-default-features` — only `constants`, `error`, `pdu`, `protocol` compile. Keep these four modules `alloc`/`core`-only; guard any `std`-dependent code behind `#[cfg(feature = "std")]`.
 

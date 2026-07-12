@@ -10,7 +10,8 @@
 //! ## Features
 //!
 //! - **High Performance**: Async/await support with Tokio, stack-allocated PDU
-//! - **Complete Protocol Support**: Modbus TCP and RTU protocols
+//! - **Complete Protocol Support**: Modbus TCP, RTU, ASCII, RTU-over-TCP —
+//!   plus Modbus/TCP Security (TLS) with the `tls` feature
 //! - **Memory Safe**: Pure Rust implementation with zero unsafe code
 //! - **Zero-Copy Operations**: Optimized for minimal memory allocations
 //! - **Industrial Features**: Command batching, read merging, device limits
@@ -282,6 +283,16 @@ pub use server::{ModbusRtuServer, ModbusRtuServerConfig};
 
 #[cfg(feature = "rtu")]
 pub use transport::{AsciiTransport, RtuTransport};
+
+#[cfg(feature = "tls")]
+pub use client::ModbusTlsClient;
+
+#[cfg(feature = "tls")]
+pub use transport::TlsTransport;
+
+/// Re-exported for building `rustls::ClientConfig` without adding a direct dependency
+#[cfg(feature = "tls")]
+pub use tokio_rustls;
 
 #[cfg(feature = "embedded")]
 pub use embedded::EmbeddedRtuTransport;

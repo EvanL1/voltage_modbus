@@ -299,6 +299,183 @@ where
     Ok(frame)
 }
 
+/// Encode a Modbus TCP frame (MBAP header + unit id + shared PDU) into a
+/// stack buffer. Shared by the plain-TCP and TLS transports.
+///
+/// Frames are at most 260 bytes (MBAP 6 + Unit ID 1 + PDU 253), so
+/// `[u8; 260]` on the stack is always sufficient.
+fn encode_mbap_frame(
+    transaction_id: u16,
+    request: &ModbusRequest,
+) -> ModbusResult<([u8; MAX_TCP_FRAME_SIZE], usize)> {
+    let pdu = request.encode_pdu()?;
+    let pdu_bytes = pdu.as_slice();
+    let mbap_length = (1 + pdu_bytes.len()) as u16; // unit id + PDU
+
+    let mut frame = [0u8; MAX_TCP_FRAME_SIZE];
+    frame[0..2].copy_from_slice(&transaction_id.to_be_bytes());
+    frame[2..4].copy_from_slice(&0u16.to_be_bytes()); // protocol id, always 0
+    frame[4..6].copy_from_slice(&mbap_length.to_be_bytes());
+    frame[6] = request.slave_id;
+    frame[7..7 + pdu_bytes.len()].copy_from_slice(pdu_bytes);
+
+    Ok((frame, 7 + pdu_bytes.len()))
+}
+
+/// Decode a complete Modbus TCP frame into a response (zero-copy).
+///
+/// Transaction ID validation happens in `read_mbap_frame` before this is
+/// called. Shared by the plain-TCP and TLS transports.
+fn decode_mbap_response(frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
+    if frame.len() < MBAP_HEADER_SIZE + 2 {
+        return Err(ModbusError::frame("Frame too short"));
+    }
+
+    let length = u16::from_be_bytes([frame[4], frame[5]]);
+    let slave_id = frame[6];
+
+    if frame.len() < MBAP_HEADER_SIZE + length as usize {
+        return Err(ModbusError::frame("Incomplete frame"));
+    }
+
+    let function_code = frame[7];
+
+    // Check for exception response
+    if function_code & 0x80 != 0 {
+        if frame.len() < MBAP_HEADER_SIZE + 3 {
+            return Err(ModbusError::frame("Invalid exception response"));
+        }
+
+        let original_function = function_code & 0x7F;
+        let exception_code = frame[8];
+
+        return Ok(ModbusResponse::new_exception(
+            slave_id,
+            ModbusFunction::from_u8(original_function)?,
+            exception_code,
+        ));
+    }
+
+    let function = ModbusFunction::from_u8(function_code)?;
+    // Zero-copy: pass frame ownership with offset/length instead of to_vec()
+    let data_start = MBAP_HEADER_SIZE + 2;
+    let data_len = (length as usize).saturating_sub(2); // length includes slave_id + function
+
+    Ok(ModbusResponse::new_from_frame(
+        frame, slave_id, function, data_start, data_len,
+    ))
+}
+
+/// Read MBAP frames from `stream` until one carries `expected_tid` and
+/// `expected_unit`, discarding stale frames from interleaved responses.
+///
+/// `on_frame` sees every complete frame received — including discarded stale
+/// ones — so callers hook packet logging and byte counters there. On any
+/// error the caller must treat the connection as broken.
+///
+/// Shared by the plain-TCP and TLS transports.
+async fn read_mbap_frame<S, F>(
+    stream: &mut S,
+    read_buf: &mut [u8; 512],
+    io_timeout: Duration,
+    expected_tid: u16,
+    expected_unit: u8,
+    mut on_frame: F,
+) -> ModbusResult<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin + Send,
+    F: FnMut(&[u8]),
+{
+    const MAX_STALE_RESPONSES: usize = 5;
+    let mut stale_count = 0usize;
+
+    loop {
+        if stale_count >= MAX_STALE_RESPONSES {
+            return Err(ModbusError::protocol(
+                "too many mismatched responses; possible bus conflict",
+            ));
+        }
+
+        // Read MBAP header + function code into the persistent buffer
+        let read_result = timeout(
+            io_timeout,
+            stream.read_exact(&mut read_buf[..MBAP_HEADER_SIZE + 1]),
+        )
+        .await;
+        if !matches!(read_result, Ok(Ok(_))) {
+            return Err(ModbusError::timeout(
+                "read response header",
+                io_timeout.as_millis() as u64,
+            ));
+        }
+
+        // L1: Validate Length field (must be in valid range [2, 254])
+        let length = u16::from_be_bytes([read_buf[4], read_buf[5]]);
+        if !(2..=254).contains(&length) {
+            return Err(ModbusError::frame(format!(
+                "Invalid MBAP length: {} (must be 2-254)",
+                length
+            )));
+        }
+
+        // L2: Validate Protocol ID (must be 0 for Modbus TCP)
+        let protocol_id = u16::from_be_bytes([read_buf[2], read_buf[3]]);
+        if protocol_id != 0 {
+            return Err(ModbusError::frame(format!(
+                "Invalid protocol ID: {:04X} (expected 0000)",
+                protocol_id
+            )));
+        }
+
+        // L3: Read remaining data
+        let remaining_bytes = (length as usize).saturating_sub(1); // -1: function code already read
+        let total_len = MBAP_HEADER_SIZE + 1 + remaining_bytes;
+        if remaining_bytes > 0 {
+            let read_result = timeout(
+                io_timeout,
+                stream.read_exact(&mut read_buf[MBAP_HEADER_SIZE + 1..total_len]),
+            )
+            .await;
+            if !matches!(read_result, Ok(Ok(_))) {
+                return Err(ModbusError::timeout(
+                    "read response data",
+                    io_timeout.as_millis() as u64,
+                ));
+            }
+        }
+
+        on_frame(&read_buf[..total_len]);
+
+        // L4: Validate Transaction ID
+        let actual_tid = u16::from_be_bytes([read_buf[0], read_buf[1]]);
+        if actual_tid != expected_tid {
+            debug!(
+                actual_tid = actual_tid,
+                expected_tid = expected_tid,
+                kind = "transaction_id_mismatch",
+                "modbus.response.stale"
+            );
+            stale_count += 1;
+            continue;
+        }
+
+        // L5: Validate Unit ID (slave ID)
+        let actual_unit_id = read_buf[6];
+        if actual_unit_id != expected_unit {
+            debug!(
+                actual_unit_id = actual_unit_id,
+                expected_slave_id = expected_unit,
+                kind = "slave_id_mismatch",
+                "modbus.response.stale"
+            );
+            stale_count += 1;
+            continue;
+        }
+
+        return Ok(read_buf[..total_len].to_vec());
+    }
+}
+
 /// Format raw bytes as hex string for packet logging
 ///
 /// Uses direct string writing for efficiency (avoids intermediate allocations).
@@ -655,75 +832,13 @@ impl TcpTransport {
         self.transaction_id
     }
 
-    /// Encode request to TCP frame
-    ///
-    /// Returns a stack-allocated buffer and the number of valid bytes.
-    /// Modbus TCP frames are at most 260 bytes (MBAP 6 + Unit ID 1 + PDU 253),
-    /// so [u8; 260] on the stack is always sufficient.
+    /// Encode request to TCP frame with the next transaction ID
     fn encode_request(
         &mut self,
         request: &ModbusRequest,
     ) -> ModbusResult<([u8; MAX_TCP_FRAME_SIZE], usize)> {
         let transaction_id = self.next_transaction_id();
-        let pdu = request.encode_pdu()?;
-        let pdu_bytes = pdu.as_slice();
-        let mbap_length = (1 + pdu_bytes.len()) as u16; // unit id + PDU
-
-        let mut frame = [0u8; MAX_TCP_FRAME_SIZE];
-        frame[0..2].copy_from_slice(&transaction_id.to_be_bytes());
-        frame[2..4].copy_from_slice(&0u16.to_be_bytes()); // protocol id, always 0
-        frame[4..6].copy_from_slice(&mbap_length.to_be_bytes());
-        frame[6] = request.slave_id;
-        frame[7..7 + pdu_bytes.len()].copy_from_slice(pdu_bytes);
-
-        Ok((frame, 7 + pdu_bytes.len()))
-    }
-
-    /// Decode response from TCP frame (zero-copy)
-    ///
-    /// Takes ownership of the frame buffer to avoid copying payload data.
-    fn decode_response(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
-        if frame.len() < MBAP_HEADER_SIZE + 2 {
-            return Err(ModbusError::frame("Frame too short"));
-        }
-
-        // Parse MBAP header
-        // Note: Transaction ID validation is done in request() before calling this method
-        let _protocol_id = u16::from_be_bytes([frame[2], frame[3]]);
-        let length = u16::from_be_bytes([frame[4], frame[5]]);
-        let slave_id = frame[6];
-
-        if frame.len() < MBAP_HEADER_SIZE + length as usize {
-            return Err(ModbusError::frame("Incomplete frame"));
-        }
-
-        // Parse PDU
-        let function_code = frame[7];
-
-        // Check for exception response
-        if function_code & 0x80 != 0 {
-            if frame.len() < MBAP_HEADER_SIZE + 3 {
-                return Err(ModbusError::frame("Invalid exception response"));
-            }
-
-            let original_function = function_code & 0x7F;
-            let exception_code = frame[8];
-
-            return Ok(ModbusResponse::new_exception(
-                slave_id,
-                ModbusFunction::from_u8(original_function)?,
-                exception_code,
-            ));
-        }
-
-        let function = ModbusFunction::from_u8(function_code)?;
-        // Zero-copy: pass frame ownership with offset/length instead of to_vec()
-        let data_start = MBAP_HEADER_SIZE + 2;
-        let data_len = (length as usize).saturating_sub(2); // length includes slave_id + function
-
-        Ok(ModbusResponse::new_from_frame(
-            frame, slave_id, function, data_start, data_len,
-        ))
+        encode_mbap_frame(transaction_id, request)
     }
 
     /// Encode a request and assign a specific transaction ID (without auto-incrementing).
@@ -924,7 +1039,7 @@ impl TcpTransport {
             }
 
             let tid = u16::from_be_bytes([response_buf[0], response_buf[1]]);
-            let decode_result = self.decode_response(response_buf);
+            let decode_result = decode_mbap_response(response_buf);
 
             let entry = match decode_result {
                 Ok(response) => {
@@ -1007,138 +1122,265 @@ impl ModbusTransport for TcpTransport {
             return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
-        // Read response with TID validation loop
-        // When multiple clients connect to the same device, responses may be interleaved.
-        // We discard responses with mismatched TID and continue reading until we find ours.
-        //
-        // Use persistent read_buf to avoid per-request heap allocation.
-        // The final validated response is copied into a response-sized Vec for decode_response.
-        const MAX_STALE_RESPONSES: usize = 5;
-        let mut stale_count = 0usize;
-        let response_buf = loop {
-            if stale_count >= MAX_STALE_RESPONSES {
-                self.stats.errors += 1;
-                self.stream = None;
-                return Err(ModbusError::protocol(
-                    "too many mismatched responses; possible bus conflict",
-                ));
-            }
-            // Read response header first (MBAP header + function code) into persistent buf
-            let read_result = timeout(
-                self.timeout,
-                stream.read_exact(&mut self.read_buf[..MBAP_HEADER_SIZE + 1]),
-            )
-            .await;
-
-            if !matches!(read_result, Ok(Ok(_))) {
-                self.stats.timeouts += 1;
-                self.stats.errors += 1;
-                self.stream = None;
-                return Err(ModbusError::timeout(
-                    "read response header",
-                    self.timeout.as_millis() as u64,
-                ));
-            }
-
-            // L1: Validate Length field (must be in valid range [2, 254])
-            let length = u16::from_be_bytes([self.read_buf[4], self.read_buf[5]]);
-            if !(2..=254).contains(&length) {
-                self.stats.errors += 1;
-                self.stream = None;
-                return Err(ModbusError::frame(format!(
-                    "Invalid MBAP length: {} (must be 2-254)",
-                    length
-                )));
-            }
-
-            // L2: Validate Protocol ID (must be 0 for Modbus TCP)
-            let protocol_id = u16::from_be_bytes([self.read_buf[2], self.read_buf[3]]);
-            if protocol_id != 0 {
-                self.stats.errors += 1;
-                self.stream = None;
-                return Err(ModbusError::frame(format!(
-                    "Invalid protocol ID: {:04X} (expected 0000)",
-                    protocol_id
-                )));
-            }
-
-            // L3: Read remaining data into persistent buf
-            let remaining_bytes = (length as usize).saturating_sub(1); // -1 for function code already read
-            let total_len = MBAP_HEADER_SIZE + 1 + remaining_bytes;
-
-            if remaining_bytes > 0 {
-                let read_result = timeout(
-                    self.timeout,
-                    stream.read_exact(&mut self.read_buf[MBAP_HEADER_SIZE + 1..total_len]),
-                )
-                .await;
-
-                if !matches!(read_result, Ok(Ok(_))) {
-                    self.stats.timeouts += 1;
-                    self.stats.errors += 1;
-                    self.stream = None;
-                    return Err(ModbusError::timeout(
-                        "read response data",
-                        self.timeout.as_millis() as u64,
-                    ));
+        // Read response — read_mbap_frame validates length/protocol/TID/unit
+        // and discards stale interleaved responses. Packet logging and byte
+        // counting happen in the on_frame hook so discarded frames are still
+        // observed.
+        let stats = &mut self.stats;
+        let packet_callback = self.packet_callback.clone();
+        let packet_logging = self.packet_logging;
+        let slave_id = request.slave_id;
+        let result = read_mbap_frame(
+            stream,
+            &mut self.read_buf,
+            self.timeout,
+            expected_transaction_id,
+            request.slave_id,
+            |frame_bytes| {
+                stats.bytes_received += frame_bytes.len() as u64;
+                if let Some(ref callback) = packet_callback {
+                    callback(PacketDirection::Receive, frame_bytes);
                 }
+                if packet_logging {
+                    log_packet("receive", frame_bytes, "TCP", Some(slave_id));
+                }
+            },
+        )
+        .await;
+
+        let response_buf = match result {
+            Ok(buf) => buf,
+            Err(error) => {
+                if matches!(error, ModbusError::Timeout { .. }) {
+                    self.stats.timeouts += 1;
+                }
+                self.stats.errors += 1;
+                self.stream = None; // Mark connection as broken
+                return Err(error);
             }
-
-            self.stats.bytes_received += total_len as u64;
-
-            // Callback with REAL packet data (after receiving)
-            if let Some(ref callback) = self.packet_callback {
-                callback(PacketDirection::Receive, &self.read_buf[..total_len]);
-            }
-
-            // Log incoming packet (built-in tracing)
-            if self.packet_logging {
-                log_packet(
-                    "receive",
-                    &self.read_buf[..total_len],
-                    "TCP",
-                    Some(request.slave_id),
-                );
-            }
-
-            // L4: Validate Transaction ID
-            let actual_tid = u16::from_be_bytes([self.read_buf[0], self.read_buf[1]]);
-            if actual_tid != expected_transaction_id {
-                debug!(
-                    actual_tid = actual_tid,
-                    expected_tid = expected_transaction_id,
-                    kind = "transaction_id_mismatch",
-                    "modbus.response.stale"
-                );
-                // Discard this response and continue reading the next one
-                stale_count += 1;
-                continue;
-            }
-
-            // L5: Validate Unit ID (slave ID)
-            let actual_unit_id = self.read_buf[6];
-            if actual_unit_id != request.slave_id {
-                debug!(
-                    actual_unit_id = actual_unit_id,
-                    expected_slave_id = request.slave_id,
-                    kind = "slave_id_mismatch",
-                    "modbus.response.stale"
-                );
-                // Discard this response and continue reading the next one
-                stale_count += 1;
-                continue;
-            }
-
-            // All validations passed — copy to response-sized Vec for decode_response
-            break self.read_buf[..total_len].to_vec();
         };
 
         self.stats.responses_received += 1;
 
         // Decode response (takes ownership of buffer for zero-copy)
-        let response = self.decode_response(response_buf)?;
+        let response = decode_mbap_response(response_buf)?;
 
         // Check for exception
+        if let Some(error) = response.get_exception() {
+            self.stats.errors += 1;
+            return Err(error);
+        }
+
+        Ok(response)
+    }
+
+    fn is_connected(&self) -> bool {
+        self.stream.is_some()
+    }
+
+    async fn close(&mut self) -> ModbusResult<()> {
+        if let Some(mut stream) = self.stream.take() {
+            let _ = stream.shutdown().await;
+        }
+        Ok(())
+    }
+
+    fn get_stats(&self) -> TransportStats {
+        self.stats
+    }
+}
+
+/// Modbus/TCP Security transport — Modbus TCP over TLS (IANA port 802).
+///
+/// Same MBAP framing as [`TcpTransport`], carried inside a TLS session.
+/// Certificate handling stays in the caller's hands: build a
+/// [`rustls::ClientConfig`](tokio_rustls::rustls::ClientConfig) with your CA
+/// roots (and client certificate — the Modbus Security spec mandates mutual
+/// TLS in production) and pass it in.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// use voltage_modbus::transport::TlsTransport;
+/// use voltage_modbus::tokio_rustls::rustls;
+///
+/// # async fn example(root_store: rustls::RootCertStore) -> voltage_modbus::ModbusResult<()> {
+/// let config = rustls::ClientConfig::builder()
+///     .with_root_certificates(root_store)
+///     .with_no_client_auth(); // production: use with_client_auth_cert(...)
+///
+/// let transport = TlsTransport::new(
+///     "192.168.1.10:802".parse().unwrap(),
+///     "plc.example.com", // must match the server certificate
+///     Arc::new(config),
+///     Duration::from_secs(5),
+/// )
+/// .await?;
+/// # let _ = transport;
+/// # Ok(())
+/// # }
+/// ```
+#[cfg(feature = "tls")]
+pub struct TlsTransport {
+    stream: Option<tokio_rustls::client::TlsStream<TcpStream>>,
+    /// Remote address
+    pub address: SocketAddr,
+    server_name: tokio_rustls::rustls::pki_types::ServerName<'static>,
+    connector: tokio_rustls::TlsConnector,
+    timeout: Duration,
+    transaction_id: u16,
+    stats: TransportStats,
+    /// Persistent read buffer — reused across requests
+    read_buf: Box<[u8; 512]>,
+}
+
+#[cfg(feature = "tls")]
+impl TlsTransport {
+    /// Connect and complete the TLS handshake.
+    ///
+    /// `server_name` must match the server certificate (SNI + verification).
+    pub async fn new(
+        address: SocketAddr,
+        server_name: &str,
+        config: Arc<tokio_rustls::rustls::ClientConfig>,
+        timeout: Duration,
+    ) -> ModbusResult<Self> {
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from(server_name.to_string())
+                .map_err(|e| {
+                    ModbusError::configuration(format!("Invalid TLS server name: {}", e))
+                })?;
+
+        let mut transport = Self {
+            stream: None,
+            address,
+            server_name,
+            connector: tokio_rustls::TlsConnector::from(config),
+            timeout,
+            transaction_id: 1,
+            stats: TransportStats::default(),
+            read_buf: Box::new([0u8; 512]),
+        };
+        transport.reconnect().await?;
+        Ok(transport)
+    }
+
+    /// Parse an address string and connect (e.g. `"192.168.1.10:802"`).
+    pub async fn from_address(
+        address: &str,
+        server_name: &str,
+        config: Arc<tokio_rustls::rustls::ClientConfig>,
+        timeout: Duration,
+    ) -> ModbusResult<Self> {
+        let addr: SocketAddr = address
+            .parse()
+            .map_err(|e| ModbusError::connection(format!("Invalid address {}: {}", address, e)))?;
+        Self::new(addr, server_name, config, timeout).await
+    }
+
+    async fn reconnect(&mut self) -> ModbusResult<()> {
+        self.stream = None;
+
+        let tcp = TcpStream::connect(self.address).await.map_err(|e| {
+            ModbusError::connection(format!("Failed to connect to {}: {}", self.address, e))
+        })?;
+        tcp.set_nodelay(true).ok();
+
+        let tls = timeout(
+            self.timeout,
+            self.connector.connect(self.server_name.clone(), tcp),
+        )
+        .await
+        .map_err(|_| ModbusError::timeout("TLS handshake", self.timeout.as_millis() as u64))?
+        .map_err(|e| ModbusError::connection(format!("TLS handshake failed: {}", e)))?;
+
+        self.stream = Some(tls);
+        Ok(())
+    }
+
+    fn next_transaction_id(&mut self) -> u16 {
+        self.transaction_id = self.transaction_id.wrapping_add(1);
+        if self.transaction_id == 0 {
+            self.transaction_id = 1;
+        }
+        self.transaction_id
+    }
+}
+
+#[cfg(feature = "tls")]
+impl ModbusTransport for TlsTransport {
+    async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
+        tracing::trace!(
+            protocol = "tls",
+            slave_id = request.slave_id,
+            function_code = request.function.to_u8(),
+            "modbus.request.start"
+        );
+
+        request.validate()?;
+
+        if self.stream.is_none() {
+            self.reconnect().await?;
+        }
+
+        let tid = self.next_transaction_id();
+        let (frame_buf, frame_len) = encode_mbap_frame(tid, request)?;
+        let frame = &frame_buf[..frame_len];
+        self.stats.requests_sent += 1;
+        self.stats.bytes_sent += frame_len as u64;
+
+        let stream = self
+            .stream
+            .as_mut()
+            .ok_or_else(|| ModbusError::connection("TLS stream not connected"))?;
+
+        let send_result = timeout(self.timeout, stream.write_all(frame)).await;
+        if !matches!(send_result, Ok(Ok(_))) {
+            self.stats.timeouts += 1;
+            self.stats.errors += 1;
+            self.stream = None;
+            return Err(ModbusError::timeout(
+                "send request",
+                self.timeout.as_millis() as u64,
+            ));
+        }
+
+        // Broadcast (slave_id = 0): per Modbus spec no response is expected.
+        if request.slave_id == 0 {
+            self.stats.responses_received += 1;
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
+        }
+
+        let stats = &mut self.stats;
+        let result = read_mbap_frame(
+            stream,
+            &mut self.read_buf,
+            self.timeout,
+            tid,
+            request.slave_id,
+            |frame_bytes| {
+                stats.bytes_received += frame_bytes.len() as u64;
+            },
+        )
+        .await;
+
+        let response_buf = match result {
+            Ok(buf) => buf,
+            Err(error) => {
+                if matches!(error, ModbusError::Timeout { .. }) {
+                    self.stats.timeouts += 1;
+                }
+                self.stats.errors += 1;
+                self.stream = None;
+                return Err(error);
+            }
+        };
+
+        self.stats.responses_received += 1;
+
+        let response = decode_mbap_response(response_buf)?;
         if let Some(error) = response.get_exception() {
             self.stats.errors += 1;
             return Err(error);
@@ -2376,6 +2618,103 @@ mod rtu_over_tcp_tests {
         assert_eq!(stats.bytes_sent, 8);
         assert_eq!(stats.bytes_received, 7);
 
+        server.await.unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "tls"))]
+mod tls_tests {
+    use super::*;
+    use tokio_rustls::rustls;
+
+    /// Full MBAP round trip through a real TLS session with a self-signed
+    /// certificate: handshake, FC03 request, TID-matched response.
+    #[tokio::test]
+    async fn tls_roundtrip_fc03() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = certified.cert.der().clone();
+        let key_der = rustls::pki_types::PrivateKeyDer::from(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(certified.key_pair.serialize_der()),
+        );
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.clone()], key_der)
+            .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.unwrap();
+
+            // FC03 request: MBAP(6) + unit + fc + addr(2) + qty(2) = 12 bytes
+            let mut request = [0u8; 12];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(request[7], 0x03);
+
+            // Respond with one register, echoing TID and unit id
+            let response = [
+                request[0], request[1], // transaction id
+                0x00, 0x00, // protocol id
+                0x00, 0x05,       // length
+                request[6], // unit id
+                0x03, 0x02, 0x12, 0x34, // fc + byte count + register
+            ];
+            tls.write_all(&response).await.unwrap();
+        });
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+
+        let mut transport = TlsTransport::new(
+            address,
+            "localhost",
+            Arc::new(client_config),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+        let request = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+        let response = transport.request(&request).await.unwrap();
+        assert_eq!(response.parse_registers().unwrap(), vec![0x1234]);
+
+        let stats = transport.get_stats();
+        assert_eq!(stats.requests_sent, 1);
+        assert_eq!(stats.responses_received, 1);
+
+        server.await.unwrap();
+    }
+
+    /// Handshake against a plain-TCP endpoint must fail cleanly, not hang.
+    #[tokio::test]
+    async fn tls_handshake_failure_is_reported() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Accept and immediately close without speaking TLS
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+
+        let result = TlsTransport::new(
+            address,
+            "localhost",
+            Arc::new(client_config),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(result.is_err());
         server.await.unwrap();
     }
 }

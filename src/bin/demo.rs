@@ -5,7 +5,7 @@
 //! - Industrial Enhancement features (ModbusValue, ByteOrder, ModbusCodec)
 //! - Simplified API with function code naming (read_03, write_06, etc.)
 //!
-//! Usage: cargo run --bin demo [server_address]
+//! Usage: cargo run --bin demo \[server_address\]
 //! Example: cargo run --bin demo 127.0.0.1:502
 
 use std::time::Duration;

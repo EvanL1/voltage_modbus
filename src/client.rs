@@ -2120,7 +2120,7 @@ impl ModbusClient for ModbusRtuOverTcpClient {
 
 /// Modbus ASCII client implementation using the generic client.
 ///
-/// Thin wrapper over [`GenericModbusClient`]`<`[`AsciiTransport`]`>` — all
+/// Thin wrapper over [`GenericModbusClient`]`<`[`AsciiTransport`](crate::transport::AsciiTransport)`>` — all
 /// protocol logic is shared with TCP and RTU; only the framing differs.
 #[cfg(feature = "rtu")]
 pub struct ModbusAsciiClient {
@@ -2137,7 +2137,7 @@ impl ModbusAsciiClient {
         })
     }
 
-    /// Create from an existing [`AsciiTransport`].
+    /// Create from an existing [`AsciiTransport`](crate::transport::AsciiTransport).
     pub fn from_transport(transport: crate::transport::AsciiTransport) -> Self {
         Self {
             inner: GenericModbusClient::new(transport),
@@ -2353,6 +2353,140 @@ impl ModbusClient for ModbusRtuClient {
         self.inner.close().await
     }
 
+    fn get_stats(&self) -> TransportStats {
+        self.inner.get_stats()
+    }
+}
+
+/// Modbus/TCP Security client — Modbus TCP over TLS (IANA port 802).
+///
+/// Thin wrapper over [`GenericModbusClient`]`<`[`TlsTransport`](crate::transport::TlsTransport)`>`;
+/// all protocol logic is shared with the other transports. Build a
+/// `rustls::ClientConfig` with your CA roots (and client certificate — the
+/// Modbus Security spec mandates mutual TLS in production) and pass it in.
+#[cfg(feature = "tls")]
+pub struct ModbusTlsClient {
+    inner: GenericModbusClient<crate::transport::TlsTransport>,
+}
+
+#[cfg(feature = "tls")]
+impl ModbusTlsClient {
+    /// Connect and complete the TLS handshake.
+    pub async fn new(
+        addr: SocketAddr,
+        server_name: &str,
+        config: Arc<tokio_rustls::rustls::ClientConfig>,
+        timeout: Duration,
+    ) -> ModbusResult<Self> {
+        let transport =
+            crate::transport::TlsTransport::new(addr, server_name, config, timeout).await?;
+        Ok(Self {
+            inner: GenericModbusClient::new(transport),
+        })
+    }
+
+    /// Parse an address string and connect (e.g. `"192.168.1.10:802"`).
+    pub async fn from_address(
+        address: &str,
+        server_name: &str,
+        config: Arc<tokio_rustls::rustls::ClientConfig>,
+        timeout: Duration,
+    ) -> ModbusResult<Self> {
+        let transport =
+            crate::transport::TlsTransport::from_address(address, server_name, config, timeout)
+                .await?;
+        Ok(Self {
+            inner: GenericModbusClient::new(transport),
+        })
+    }
+
+    /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.inner.set_retry_policy(policy);
+    }
+
+    /// Access the underlying generic client — exposes the full method set
+    /// (extended FCs, serial diagnostics, coalesced reads, ...)
+    pub fn generic_mut(&mut self) -> &mut GenericModbusClient<crate::transport::TlsTransport> {
+        &mut self.inner
+    }
+
+    /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
+    pub fn into_shared(self) -> SharedModbusClient<crate::transport::TlsTransport> {
+        SharedModbusClient::new(self.inner)
+    }
+
+    /// Execute a raw request.
+    pub async fn execute_request(
+        &mut self,
+        request: ModbusRequest,
+    ) -> ModbusResult<ModbusResponse> {
+        self.inner.execute_request(request).await
+    }
+}
+
+#[cfg(feature = "tls")]
+impl ModbusClient for ModbusTlsClient {
+    async fn read_01(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
+        self.inner.read_01(slave_id, address, quantity).await
+    }
+    async fn read_02(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
+        self.inner.read_02(slave_id, address, quantity).await
+    }
+    async fn read_03(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner.read_03(slave_id, address, quantity).await
+    }
+    async fn read_04(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner.read_04(slave_id, address, quantity).await
+    }
+    async fn write_05(&mut self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
+        self.inner.write_05(slave_id, address, value).await
+    }
+    async fn write_06(&mut self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
+        self.inner.write_06(slave_id, address, value).await
+    }
+    async fn write_0f(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[bool],
+    ) -> ModbusResult<()> {
+        self.inner.write_0f(slave_id, address, values).await
+    }
+    async fn write_10(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[u16],
+    ) -> ModbusResult<()> {
+        self.inner.write_10(slave_id, address, values).await
+    }
+    fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+    async fn close(&mut self) -> ModbusResult<()> {
+        self.inner.close().await
+    }
     fn get_stats(&self) -> TransportStats {
         self.inner.get_stats()
     }
