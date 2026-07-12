@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-12
+
+### Added
+- **Extended function codes**: FC 0x16 (Mask Write Register), FC 0x17 (Read/Write Multiple Registers), FC 0x2B/MEI 0x0E (Read Device Identification, client + server via `DeviceIdentity`/`set_device_identity`). All PDU bodies now flow through a single shared `ModbusRequest::encode_pdu()` used by every transport.
+- **Serial-line diagnostics**: FC 0x07 (Read Exception Status), FC 0x08 (Diagnostics, sub 0x0000 echo test), FC 0x0B (Get Comm Event Counter), FC 0x0C (Get Comm Event Log), FC 0x11 (Report Server ID), with `CommEventLog`/`ServerIdReport` response types.
+- **`RetryPolicy`**: opt-in exponential-backoff retry on the client for recoverable errors (timeouts, connection loss, device-busy); default is no retries, so existing behavior is unchanged.
+- **`ModbusService` trait**: TCP/RTU servers now dispatch raw PDUs through a pluggable service; `ModbusRegisterBank` remains the default in-memory implementation, `set_service()` swaps in custom backends (live sensors, gateways, simulations).
+- **`SharedModbusClient`**: cloneable, task-shareable client handle over one connection (async-mutex serialized); available via `into_shared()` on every client type.
+- **`tls` feature**: Modbus/TCP Security client transport (`TlsTransport` + `ModbusTlsClient`) — MBAP over TLS on IANA port 802, via `tokio-rustls` (ring provider). Certificate policy is caller-supplied through `rustls::ClientConfig`.
+- RTU server slave address is now configurable (`ModbusRtuServerConfig::slave_id`, previously hardcoded to `1`).
+
+### Fixed
+- **RTU server protocol compliance**: validates CRC-16 on incoming frames (previously executed corrupted writes), never answers broadcast frames, replies with Modbus exceptions on processing errors instead of leaving the master to time out, and no longer panics on sub-4-byte noise bursts.
+- **RTU framing**: t3.5 inter-frame gap now follows MODBUS over Serial Line V1.02 (fixed 1750µs above 19200 baud, was under-computed at high baud rates); serial reads are now length-aware (derived from function code) instead of relying on inter-byte silence, so bursty USB-serial delivery no longer truncates frames; stale serial input is purged before each request; broadcast writes wait a turnaround delay before the next request.
+- Fixed a latent panic in the TCP server's `peer_addr` fallback path.
+
+### Changed
+- Broadcast (slave_id = 0) requests are now validated against `is_write_function()` (pure writes only) rather than the inverse of `is_read_function()`, correctly rejecting broadcast for FC 0x17/0x2B which return data.
+
 ## [0.6.2] - 2026-05-15
 
 ### Added
