@@ -135,10 +135,20 @@ pub enum ModbusFunction {
     WriteSingleCoil = 0x05,
     /// Write Single Register (0x06)
     WriteSingleRegister = 0x06,
+    /// Read Exception Status (0x07, serial line) — 8 device-defined status bits
+    ReadExceptionStatus = 0x07,
+    /// Diagnostics (0x08, serial line) — sub-function 0x0000 is the echo test
+    Diagnostics = 0x08,
+    /// Get Comm Event Counter (0x0B, serial line)
+    GetCommEventCounter = 0x0B,
+    /// Get Comm Event Log (0x0C, serial line)
+    GetCommEventLog = 0x0C,
     /// Write Multiple Coils (0x0F)
     WriteMultipleCoils = 0x0F,
     /// Write Multiple Registers (0x10)
     WriteMultipleRegisters = 0x10,
+    /// Report Server ID (0x11, serial line)
+    ReportServerId = 0x11,
     /// Mask Write Register (0x16)
     MaskWriteRegister = 0x16,
     /// Read/Write Multiple Registers (0x17) — write is performed before read
@@ -157,8 +167,13 @@ impl ModbusFunction {
             0x04 => Ok(ModbusFunction::ReadInputRegisters),
             0x05 => Ok(ModbusFunction::WriteSingleCoil),
             0x06 => Ok(ModbusFunction::WriteSingleRegister),
+            0x07 => Ok(ModbusFunction::ReadExceptionStatus),
+            0x08 => Ok(ModbusFunction::Diagnostics),
+            0x0B => Ok(ModbusFunction::GetCommEventCounter),
+            0x0C => Ok(ModbusFunction::GetCommEventLog),
             0x0F => Ok(ModbusFunction::WriteMultipleCoils),
             0x10 => Ok(ModbusFunction::WriteMultipleRegisters),
+            0x11 => Ok(ModbusFunction::ReportServerId),
             0x16 => Ok(ModbusFunction::MaskWriteRegister),
             0x17 => Ok(ModbusFunction::ReadWriteMultipleRegisters),
             0x2B => Ok(ModbusFunction::ReadDeviceIdentification),
@@ -210,8 +225,13 @@ impl fmt::Display for ModbusFunction {
             ModbusFunction::ReadInputRegisters => "Read Input Registers",
             ModbusFunction::WriteSingleCoil => "Write Single Coil",
             ModbusFunction::WriteSingleRegister => "Write Single Register",
+            ModbusFunction::ReadExceptionStatus => "Read Exception Status",
+            ModbusFunction::Diagnostics => "Diagnostics",
+            ModbusFunction::GetCommEventCounter => "Get Comm Event Counter",
+            ModbusFunction::GetCommEventLog => "Get Comm Event Log",
             ModbusFunction::WriteMultipleCoils => "Write Multiple Coils",
             ModbusFunction::WriteMultipleRegisters => "Write Multiple Registers",
+            ModbusFunction::ReportServerId => "Report Server ID",
             ModbusFunction::MaskWriteRegister => "Mask Write Register",
             ModbusFunction::ReadWriteMultipleRegisters => "Read/Write Multiple Registers",
             ModbusFunction::ReadDeviceIdentification => "Read Device Identification",
@@ -405,6 +425,36 @@ impl ModbusRequest {
         }
     }
 
+    /// Create a request that carries only the function code — used by the
+    /// serial-line diagnostic functions FC 0x07 / 0x0B / 0x0C / 0x11.
+    pub fn new_no_data(slave_id: SlaveId, function: ModbusFunction) -> Self {
+        Self {
+            slave_id,
+            function,
+            address: 0,
+            quantity: 0,
+            data: Vec::new(),
+        }
+    }
+
+    /// Create a diagnostics request (FC 0x08).
+    ///
+    /// `sub_function` 0x0000 is the Return Query Data echo test; the device
+    /// must echo `data` back unchanged. Other sub-functions return counters
+    /// or control line diagnostics (device-dependent support).
+    pub fn new_diagnostics(slave_id: SlaveId, sub_function: u16, data: u16) -> Self {
+        let mut payload = Vec::with_capacity(4);
+        payload.extend_from_slice(&sub_function.to_be_bytes());
+        payload.extend_from_slice(&data.to_be_bytes());
+        Self {
+            slave_id,
+            function: ModbusFunction::Diagnostics,
+            address: 0,
+            quantity: 0,
+            data: payload,
+        }
+    }
+
     /// Create a read-device-identification request (FC 0x2B / MEI 0x0E).
     ///
     /// `read_code`: 1 = basic objects, 2 = regular, 3 = extended,
@@ -483,6 +533,18 @@ impl ModbusRequest {
 
             ModbusFunction::ReadDeviceIdentification => {
                 // data = MEI type(1) + ReadDeviceId code(1) + object id(1)
+                pdu.extend(&self.data)?;
+            }
+
+            ModbusFunction::ReadExceptionStatus
+            | ModbusFunction::GetCommEventCounter
+            | ModbusFunction::GetCommEventLog
+            | ModbusFunction::ReportServerId => {
+                // Function code only, no payload
+            }
+
+            ModbusFunction::Diagnostics => {
+                // data = sub-function(2) + data field(2N)
                 pdu.extend(&self.data)?;
             }
         }
@@ -646,6 +708,24 @@ impl ModbusRequest {
                         "Invalid ReadDeviceId code: {} (must be 1-4)",
                         self.data[1]
                     )));
+                }
+            }
+            ModbusFunction::ReadExceptionStatus
+            | ModbusFunction::GetCommEventCounter
+            | ModbusFunction::GetCommEventLog
+            | ModbusFunction::ReportServerId => {
+                if !self.data.is_empty() {
+                    return Err(ModbusError::invalid_data(
+                        "This diagnostic function takes no request payload",
+                    ));
+                }
+            }
+            ModbusFunction::Diagnostics => {
+                // data = sub-function(2) + data field(2N)
+                if self.data.len() < 4 || self.data.len() % 2 != 0 {
+                    return Err(ModbusError::invalid_data(
+                        "Invalid diagnostics payload (expect sub-function + 16-bit data)",
+                    ));
                 }
             }
             _ => {}
@@ -849,6 +929,49 @@ impl ModbusResponse {
         }
 
         Ok(bits)
+    }
+}
+
+/// Parsed get-comm-event-log response (FC 0x0C)
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommEventLog {
+    /// Device status word (0x0000 ready, 0xFFFF busy)
+    pub status: u16,
+    /// Event counter
+    pub event_count: u16,
+    /// Bus message counter
+    pub message_count: u16,
+    /// Raw event bytes, newest first (0-64 entries, device-defined encoding)
+    pub events: Vec<u8>,
+}
+
+/// Parsed report-server-id response (FC 0x11)
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerIdReport {
+    /// Device-specific server id bytes
+    pub server_id: Vec<u8>,
+    /// Run indicator: `Some(true)` = ON (0xFF), `Some(false)` = OFF (0x00),
+    /// `None` if the device omits it or uses a non-standard trailer
+    pub run_indicator_on: Option<bool>,
+}
+
+impl ServerIdReport {
+    /// Parse from a response payload (bytes after the byte-count prefix)
+    pub fn parse(payload: &[u8]) -> Self {
+        match payload.split_last() {
+            Some((&0xFF, id)) => Self {
+                server_id: id.to_vec(),
+                run_indicator_on: Some(true),
+            },
+            Some((&0x00, id)) => Self {
+                server_id: id.to_vec(),
+                run_indicator_on: Some(false),
+            },
+            _ => Self {
+                server_id: payload.to_vec(),
+                run_indicator_on: None,
+            },
+        }
     }
 }
 
@@ -1293,6 +1416,59 @@ mod tests {
         let values = [0u16; 122];
         let req = ModbusRequest::new_read_write_multiple(1, 0, 1, 0, &values);
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_encode_pdu_serial_diagnostics() {
+        // No-payload functions encode as the bare function code
+        for (function, code) in [
+            (ModbusFunction::ReadExceptionStatus, 0x07),
+            (ModbusFunction::GetCommEventCounter, 0x0B),
+            (ModbusFunction::GetCommEventLog, 0x0C),
+            (ModbusFunction::ReportServerId, 0x11),
+        ] {
+            let req = ModbusRequest::new_no_data(1, function);
+            assert!(req.validate().is_ok());
+            assert_eq!(req.encode_pdu().unwrap().as_slice(), &[code]);
+        }
+
+        // Diagnostics: sub-function + data
+        let req = ModbusRequest::new_diagnostics(1, 0x0000, 0xA537);
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x08, 0x00, 0x00, 0xA5, 0x37]
+        );
+    }
+
+    #[test]
+    fn test_serial_diagnostics_broadcast_rejected() {
+        // All diagnostic functions require a response → no broadcast
+        for function in [
+            ModbusFunction::ReadExceptionStatus,
+            ModbusFunction::GetCommEventCounter,
+            ModbusFunction::GetCommEventLog,
+            ModbusFunction::ReportServerId,
+        ] {
+            assert!(ModbusRequest::new_no_data(0, function).validate().is_err());
+        }
+        assert!(ModbusRequest::new_diagnostics(0, 0, 0).validate().is_err());
+    }
+
+    #[test]
+    fn test_server_id_report_parse() {
+        let report = ServerIdReport::parse(&[b'P', b'M', b'1', 0xFF]);
+        assert_eq!(report.server_id, b"PM1");
+        assert_eq!(report.run_indicator_on, Some(true));
+
+        let report = ServerIdReport::parse(&[0x42, 0x00]);
+        assert_eq!(report.server_id, vec![0x42]);
+        assert_eq!(report.run_indicator_on, Some(false));
+
+        // Non-standard trailer: keep everything as id
+        let report = ServerIdReport::parse(&[0x01, 0x02]);
+        assert_eq!(report.server_id, vec![0x01, 0x02]);
+        assert_eq!(report.run_indicator_on, None);
     }
 
     #[test]

@@ -221,6 +221,8 @@ where
             | ModbusFunction::ReadDiscreteInputs
             | ModbusFunction::ReadHoldingRegisters
             | ModbusFunction::ReadInputRegisters
+            | ModbusFunction::GetCommEventLog
+            | ModbusFunction::ReportServerId
             | ModbusFunction::ReadWriteMultipleRegisters => {
                 let mut byte_count = [0u8; 1];
                 self.io
@@ -250,6 +252,24 @@ where
             ModbusFunction::MaskWriteRegister => {
                 // Echo: addr(2) + and(2) + or(2) + crc(2)
                 let mut tail = [0u8; 8];
+                self.io
+                    .read_exact(&mut tail)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&tail);
+            }
+            ModbusFunction::ReadExceptionStatus => {
+                // status(1) + crc(2)
+                let mut tail = [0u8; 3];
+                self.io
+                    .read_exact(&mut tail)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&tail);
+            }
+            ModbusFunction::Diagnostics | ModbusFunction::GetCommEventCounter => {
+                // 2×u16 + crc(2)
+                let mut tail = [0u8; 6];
                 self.io
                     .read_exact(&mut tail)
                     .await

@@ -242,7 +242,7 @@ where
         3
     } else {
         match func {
-            0x01..=0x04 | 0x17 => {
+            0x01..=0x04 | 0x0C | 0x11 | 0x17 => {
                 // [byte_count, data..., crc(2)]: read byte_count first
                 let mut bc = [0u8; 1];
                 reader.read_exact(&mut bc).await?;
@@ -255,7 +255,12 @@ where
                 return Ok(out);
             }
             0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
-            0x16 => 8,                      // echo: addr(2) + and(2) + or(2) + crc(2)
+            0x07 => 3,                      // status(1) + crc(2)
+            // Diagnostics echo / event counter: 2×u16 + crc. Note: FC08 sub 0x00
+            // with a data field longer than 2 bytes is not length-recoverable
+            // here; this library always sends 2-byte diagnostic data.
+            0x08 | 0x0B => 6,
+            0x16 => 8, // echo: addr(2) + and(2) + or(2) + crc(2)
             0x2B => {
                 // MEI header after fc: mei_type, read_code, conformity,
                 // more_follows, next_object_id, object_count — then objects

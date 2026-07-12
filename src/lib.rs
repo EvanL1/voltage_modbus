@@ -27,11 +27,16 @@
 //! | 0x04 | Read Input Registers | ✅ | ✅ |
 //! | 0x05 | Write Single Coil | ✅ | ✅ |
 //! | 0x06 | Write Single Register | ✅ | ✅ |
+//! | 0x07 | Read Exception Status | ✅ | — |
+//! | 0x08 | Diagnostics | ✅ | ✅ (sub 0x00 echo) |
+//! | 0x0B | Get Comm Event Counter | ✅ | — |
+//! | 0x0C | Get Comm Event Log | ✅ | — |
 //! | 0x0F | Write Multiple Coils | ✅ | ✅ |
 //! | 0x10 | Write Multiple Registers | ✅ | ✅ |
+//! | 0x11 | Report Server ID | ✅ | — |
 //! | 0x16 | Mask Write Register | ✅ | ✅ |
 //! | 0x17 | Read/Write Multiple Registers | ✅ | ✅ |
-//! | 0x2B | Read Device Identification | ✅ | — |
+//! | 0x2B | Read Device Identification | ✅ | ✅ (`set_device_identity`) |
 //!
 //! ## Quick Start (std)
 //!
@@ -181,7 +186,8 @@ pub use constants::{
 pub use error::{ModbusError, ModbusResult};
 pub use pdu::{ModbusPdu, PduBuilder};
 pub use protocol::{
-    DeviceIdObject, DeviceIdentification, ModbusFunction, ModbusRequest, ModbusResponse, SlaveId,
+    CommEventLog, DeviceIdObject, DeviceIdentification, ModbusFunction, ModbusRequest,
+    ModbusResponse, ServerIdReport, SlaveId,
 };
 
 // === std-only re-exports ===
@@ -190,7 +196,9 @@ pub use protocol::{
 pub use tokio;
 
 #[cfg(feature = "std")]
-pub use client::{GenericModbusClient, ModbusClient, ModbusTcpClient, RetryPolicy};
+pub use client::{
+    GenericModbusClient, ModbusClient, ModbusTcpClient, RetryPolicy, SharedModbusClient,
+};
 
 #[cfg(feature = "std")]
 pub use bytes::ByteOrder;
@@ -233,7 +241,8 @@ pub use register_bank::{ModbusRegisterBank, RegisterBankStats};
 
 #[cfg(feature = "std")]
 pub use server::{
-    ModbusServer, ModbusService, ModbusTcpServer, ModbusTcpServerConfig, ServerStats, ServiceFuture,
+    DeviceIdentity, ModbusServer, ModbusService, ModbusTcpServer, ModbusTcpServerConfig,
+    ServerStats, ServiceFuture,
 };
 
 // === Hidden but preserved (backward compatibility, std-only) ===

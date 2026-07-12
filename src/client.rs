@@ -54,6 +54,7 @@
 //! }
 //! ```
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::coalescer::ReadCoalescer;
@@ -915,6 +916,46 @@ fn validate_response_matches_request(
             }
             Ok(())
         }
+        ModbusFunction::ReadExceptionStatus => {
+            if response.data().len() != 1 {
+                return Err(ModbusError::frame(
+                    "Invalid exception status response length",
+                ));
+            }
+            Ok(())
+        }
+        ModbusFunction::Diagnostics => {
+            // Response echoes the sub-function, followed by echo/counter data
+            let data = response.data();
+            if data.len() < 4 || data[0..2] != request.data[0..2] {
+                return Err(ModbusError::frame("Invalid diagnostics response"));
+            }
+            Ok(())
+        }
+        ModbusFunction::GetCommEventCounter => {
+            if response.data().len() != 4 {
+                return Err(ModbusError::frame(
+                    "Invalid comm event counter response length",
+                ));
+            }
+            Ok(())
+        }
+        ModbusFunction::GetCommEventLog => {
+            // byte_count + status(2) + event count(2) + message count(2) + events
+            let data = response.data();
+            if data.len() < 7 || usize::from(data[0]) != data.len() - 1 {
+                return Err(ModbusError::frame("Invalid comm event log response"));
+            }
+            Ok(())
+        }
+        ModbusFunction::ReportServerId => {
+            // byte_count + device-specific payload
+            let data = response.data();
+            if data.len() < 2 || usize::from(data[0]) != data.len() - 1 {
+                return Err(ModbusError::frame("Invalid report server id response"));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1381,6 +1422,75 @@ impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
     }
 }
 
+/// Serial-line diagnostic functions (FC 0x07 / 0x08 / 0x0B / 0x0C / 0x11)
+impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
+    /// Read exception status (FC 0x07) — 8 device-defined status bits.
+    pub async fn read_exception_status(&mut self, slave_id: SlaveId) -> ModbusResult<u8> {
+        let request = ModbusRequest::new_no_data(slave_id, ModbusFunction::ReadExceptionStatus);
+        let response = self.execute_request(request).await?;
+        Ok(response.data()[0]) // length validated to 1 by response validation
+    }
+
+    /// Diagnostics (FC 0x08).
+    ///
+    /// Sub-function `0x0000` is the Return Query Data echo test: the device
+    /// must return `data` unchanged, making this the standard link health
+    /// check. Returns the 16-bit data field from the response (echo or
+    /// counter value depending on the sub-function).
+    pub async fn diagnostics(
+        &mut self,
+        slave_id: SlaveId,
+        sub_function: u16,
+        data: u16,
+    ) -> ModbusResult<u16> {
+        let request = ModbusRequest::new_diagnostics(slave_id, sub_function, data);
+        let response = self.execute_request(request).await?;
+        let payload = response.data(); // length >= 4 validated
+        Ok(u16::from_be_bytes([payload[2], payload[3]]))
+    }
+
+    /// Get comm event counter (FC 0x0B) — returns `(status, event_count)`.
+    /// Status 0xFFFF means the device is busy with a long-running command.
+    pub async fn get_comm_event_counter(&mut self, slave_id: SlaveId) -> ModbusResult<(u16, u16)> {
+        let request = ModbusRequest::new_no_data(slave_id, ModbusFunction::GetCommEventCounter);
+        let response = self.execute_request(request).await?;
+        let payload = response.data(); // length validated to 4
+        Ok((
+            u16::from_be_bytes([payload[0], payload[1]]),
+            u16::from_be_bytes([payload[2], payload[3]]),
+        ))
+    }
+
+    /// Get comm event log (FC 0x0C) — status, counters and the raw event bytes.
+    pub async fn get_comm_event_log(
+        &mut self,
+        slave_id: SlaveId,
+    ) -> ModbusResult<crate::protocol::CommEventLog> {
+        let request = ModbusRequest::new_no_data(slave_id, ModbusFunction::GetCommEventLog);
+        let response = self.execute_request(request).await?;
+        let payload = response.data(); // byte count + >= 6 bytes validated
+        Ok(crate::protocol::CommEventLog {
+            status: u16::from_be_bytes([payload[1], payload[2]]),
+            event_count: u16::from_be_bytes([payload[3], payload[4]]),
+            message_count: u16::from_be_bytes([payload[5], payload[6]]),
+            events: payload[7..].to_vec(),
+        })
+    }
+
+    /// Report server id (FC 0x11) — device-specific id bytes plus the run
+    /// indicator when present.
+    pub async fn report_server_id(
+        &mut self,
+        slave_id: SlaveId,
+    ) -> ModbusResult<crate::protocol::ServerIdReport> {
+        let request = ModbusRequest::new_no_data(slave_id, ModbusFunction::ReportServerId);
+        let response = self.execute_request(request).await?;
+        Ok(crate::protocol::ServerIdReport::parse(
+            &response.data()[1..],
+        ))
+    }
+}
+
 /// Modbus TCP client implementation using the generic client
 pub struct ModbusTcpClient {
     inner: GenericModbusClient<TcpTransport>,
@@ -1439,6 +1549,17 @@ impl ModbusTcpClient {
     /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
     pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
         self.inner.set_retry_policy(policy);
+    }
+
+    /// Access the underlying generic client — exposes the full method set
+    /// (serial diagnostics FC 0x07/0x08/0x0B/0x0C/0x11, coalesced reads, ...)
+    pub fn generic_mut(&mut self) -> &mut GenericModbusClient<TcpTransport> {
+        &mut self.inner
+    }
+
+    /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
+    pub fn into_shared(self) -> SharedModbusClient<TcpTransport> {
+        SharedModbusClient::new(self.inner)
     }
 
     /// Execute a raw request
@@ -1777,6 +1898,17 @@ impl ModbusRtuClient {
         self.inner.set_retry_policy(policy);
     }
 
+    /// Access the underlying generic client — exposes the full method set
+    /// (serial diagnostics FC 0x07/0x08/0x0B/0x0C/0x11, coalesced reads, ...)
+    pub fn generic_mut(&mut self) -> &mut GenericModbusClient<RtuTransport> {
+        &mut self.inner
+    }
+
+    /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
+    pub fn into_shared(self) -> SharedModbusClient<RtuTransport> {
+        SharedModbusClient::new(self.inner)
+    }
+
     /// Execute a raw request
     pub async fn execute_request(
         &mut self,
@@ -1856,6 +1988,19 @@ impl ModbusRtuOverTcpClient {
     /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
     pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
         self.inner.set_retry_policy(policy);
+    }
+
+    /// Access the underlying generic client — exposes the full method set
+    /// (serial diagnostics FC 0x07/0x08/0x0B/0x0C/0x11, coalesced reads, ...)
+    pub fn generic_mut(
+        &mut self,
+    ) -> &mut GenericModbusClient<crate::transport::RtuOverTcpTransport> {
+        &mut self.inner
+    }
+
+    /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
+    pub fn into_shared(self) -> SharedModbusClient<crate::transport::RtuOverTcpTransport> {
+        SharedModbusClient::new(self.inner)
     }
 
     /// Execute a raw request.
@@ -2007,6 +2152,17 @@ impl ModbusAsciiClient {
     /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
     pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
         self.inner.set_retry_policy(policy);
+    }
+
+    /// Access the underlying generic client — exposes the full method set
+    /// (serial diagnostics FC 0x07/0x08/0x0B/0x0C/0x11, coalesced reads, ...)
+    pub fn generic_mut(&mut self) -> &mut GenericModbusClient<crate::transport::AsciiTransport> {
+        &mut self.inner
+    }
+
+    /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
+    pub fn into_shared(self) -> SharedModbusClient<crate::transport::AsciiTransport> {
+        SharedModbusClient::new(self.inner)
     }
 
     /// Execute a raw request.
@@ -2199,6 +2355,221 @@ impl ModbusClient for ModbusRtuClient {
 
     fn get_stats(&self) -> TransportStats {
         self.inner.get_stats()
+    }
+}
+
+/// Cloneable, task-shareable Modbus client handle.
+///
+/// Wraps a [`GenericModbusClient`] in an async mutex so multiple tokio tasks
+/// can issue requests over one connection through `&self` methods — no
+/// external locking or `&mut` juggling required. Requests are serialized,
+/// which is what Modbus mandates anyway: one outstanding transaction per
+/// serial bus, and per-connection ordering on TCP.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use voltage_modbus::{ModbusTcpClient, ModbusResult};
+/// use std::time::Duration;
+///
+/// # async fn example() -> ModbusResult<()> {
+/// let client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+/// let shared = client.into_shared();
+///
+/// let handle = shared.clone();
+/// let task = tokio::spawn(async move { handle.read_03(1, 0, 10).await });
+///
+/// let regs = shared.read_03(1, 100, 5).await?;
+/// let other = task.await.unwrap()?;
+/// # let _ = (regs, other);
+/// # Ok(())
+/// # }
+/// ```
+pub struct SharedModbusClient<T: ModbusTransport> {
+    inner: Arc<tokio::sync::Mutex<GenericModbusClient<T>>>,
+}
+
+impl<T: ModbusTransport> Clone for SharedModbusClient<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: ModbusTransport + Send + Sync> SharedModbusClient<T> {
+    /// Wrap a generic client for shared use
+    pub fn new(client: GenericModbusClient<T>) -> Self {
+        Self {
+            inner: Arc::new(tokio::sync::Mutex::new(client)),
+        }
+    }
+
+    /// Read coils (FC 0x01)
+    pub async fn read_01(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
+        self.inner
+            .lock()
+            .await
+            .read_01(slave_id, address, quantity)
+            .await
+    }
+
+    /// Read discrete inputs (FC 0x02)
+    pub async fn read_02(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<bool>> {
+        self.inner
+            .lock()
+            .await
+            .read_02(slave_id, address, quantity)
+            .await
+    }
+
+    /// Read holding registers (FC 0x03)
+    pub async fn read_03(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .lock()
+            .await
+            .read_03(slave_id, address, quantity)
+            .await
+    }
+
+    /// Read input registers (FC 0x04)
+    pub async fn read_04(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .lock()
+            .await
+            .read_04(slave_id, address, quantity)
+            .await
+    }
+
+    /// Write single coil (FC 0x05)
+    pub async fn write_05(&self, slave_id: SlaveId, address: u16, value: bool) -> ModbusResult<()> {
+        self.inner
+            .lock()
+            .await
+            .write_05(slave_id, address, value)
+            .await
+    }
+
+    /// Write single register (FC 0x06)
+    pub async fn write_06(&self, slave_id: SlaveId, address: u16, value: u16) -> ModbusResult<()> {
+        self.inner
+            .lock()
+            .await
+            .write_06(slave_id, address, value)
+            .await
+    }
+
+    /// Write multiple coils (FC 0x0F)
+    pub async fn write_0f(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[bool],
+    ) -> ModbusResult<()> {
+        self.inner
+            .lock()
+            .await
+            .write_0f(slave_id, address, values)
+            .await
+    }
+
+    /// Write multiple registers (FC 0x10)
+    pub async fn write_10(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        values: &[u16],
+    ) -> ModbusResult<()> {
+        self.inner
+            .lock()
+            .await
+            .write_10(slave_id, address, values)
+            .await
+    }
+
+    /// Mask write register (FC 0x16)
+    pub async fn write_16(
+        &self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .lock()
+            .await
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17)
+    pub async fn read_write_17(
+        &self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .lock()
+            .await
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E)
+    pub async fn read_device_identification(
+        &self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .lock()
+            .await
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
+    }
+
+    /// Execute a raw request
+    pub async fn execute_request(&self, request: ModbusRequest) -> ModbusResult<ModbusResponse> {
+        self.inner.lock().await.execute_request(request).await
+    }
+
+    /// Set the retry policy — see [`RetryPolicy`]
+    pub async fn set_retry_policy(&self, policy: RetryPolicy) {
+        self.inner.lock().await.set_retry_policy(policy);
+    }
+
+    /// Get transport statistics
+    pub async fn get_stats(&self) -> TransportStats {
+        self.inner.lock().await.get_stats()
+    }
+
+    /// Close the underlying connection
+    pub async fn close(&self) -> ModbusResult<()> {
+        self.inner.lock().await.close().await
     }
 }
 
@@ -2724,6 +3095,118 @@ mod tests {
         assert_eq!(ident.objects.len(), 1);
         assert_eq!(ident.object(0x00), Some(&b"ACME"[..]));
         assert!(!ident.more_follows);
+    }
+
+    // =========================================================================
+    // Serial-line diagnostic functions (FC 0x07 / 0x08 / 0x0B / 0x0C / 0x11)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_read_exception_status() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadExceptionStatus,
+            vec![0b0110_0001],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert_eq!(client.read_exception_status(1).await.unwrap(), 0b0110_0001);
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_echo() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::Diagnostics,
+            vec![0x00, 0x00, 0xA5, 0x37],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert_eq!(client.diagnostics(1, 0x0000, 0xA537).await.unwrap(), 0xA537);
+    }
+
+    #[tokio::test]
+    async fn test_diagnostics_rejects_wrong_subfunction_echo() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::Diagnostics,
+            vec![0x00, 0x01, 0xA5, 0x37], // echoes sub-function 1, we sent 0
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert!(client.diagnostics(1, 0x0000, 0xA537).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_comm_event_counter() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::GetCommEventCounter,
+            vec![0x00, 0x00, 0x01, 0x08],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert_eq!(
+            client.get_comm_event_counter(1).await.unwrap(),
+            (0x0000, 0x0108)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_comm_event_log() {
+        let mock = MockTransport::new();
+        // byte_count=8: status(2) + event(2) + message(2) + 2 event bytes
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::GetCommEventLog,
+            vec![8, 0x00, 0x00, 0x01, 0x08, 0x01, 0x21, 0x20, 0x00],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        let log = client.get_comm_event_log(1).await.unwrap();
+        assert_eq!(log.status, 0x0000);
+        assert_eq!(log.event_count, 0x0108);
+        assert_eq!(log.message_count, 0x0121);
+        assert_eq!(log.events, vec![0x20, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_report_server_id() {
+        let mock = MockTransport::new();
+        // byte_count=4: id "PM1" + run indicator ON
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReportServerId,
+            vec![4, b'P', b'M', b'1', 0xFF],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        let report = client.report_server_id(1).await.unwrap();
+        assert_eq!(report.server_id, b"PM1");
+        assert_eq!(report.run_indicator_on, Some(true));
+    }
+
+    // =========================================================================
+    // SharedModbusClient tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_shared_client_concurrent_reads() {
+        let mock = MockTransport::new();
+        for _ in 0..4 {
+            mock.add_response(Ok(create_register_response(1, &[0x1234])));
+        }
+        let shared = SharedModbusClient::new(GenericModbusClient::new(mock));
+
+        let tasks: Vec<_> = (0..4)
+            .map(|_| {
+                let handle = shared.clone();
+                tokio::spawn(async move { handle.read_03(1, 0, 1).await })
+            })
+            .collect();
+
+        for task in tasks {
+            assert_eq!(task.await.unwrap().unwrap(), vec![0x1234]);
+        }
+        assert_eq!(shared.get_stats().await.requests_sent, 0); // mock stats stay default
     }
 
     // =========================================================================

@@ -112,12 +112,174 @@ impl ModbusService for ModbusRegisterBank {
                 0x10 => ModbusTcpServer::handle_write_10(data, self).await,
                 0x16 => ModbusTcpServer::handle_write_16(data, self).await,
                 0x17 => ModbusTcpServer::handle_read_write_17(data, self).await,
+                // Diagnostics: sub-function 0x0000 (Return Query Data) echo test
+                0x08 if data.len() >= 4 && data[0] == 0 && data[1] == 0 => {
+                    let mut response = Vec::with_capacity(1 + data.len());
+                    response.push(0x08);
+                    response.extend_from_slice(data);
+                    Ok(response)
+                }
                 _ => {
                     warn!("Unsupported function code: 0x{:02X}", function_code);
                     Err(ModbusError::invalid_function(function_code))
                 }
             }
         })
+    }
+}
+
+/// Device identification objects served for FC 0x2B / MEI 0x0E requests.
+///
+/// Install on a server with [`ModbusTcpServer::set_device_identity`] /
+/// [`ModbusRtuServer::set_device_identity`]; FC 0x2B requests are then
+/// answered from these objects while all other function codes continue to
+/// flow to the active [`ModbusService`].
+#[derive(Debug, Clone, Default)]
+pub struct DeviceIdentity {
+    /// `(object id, value)` pairs, kept sorted by id
+    objects: Vec<(u8, Vec<u8>)>,
+}
+
+impl DeviceIdentity {
+    /// Basic identity from the three mandatory objects:
+    /// VendorName (0x00), ProductCode (0x01), MajorMinorRevision (0x02)
+    pub fn basic(vendor_name: &str, product_code: &str, revision: &str) -> Self {
+        Self::default()
+            .with_object(0x00, vendor_name.as_bytes())
+            .with_object(0x01, product_code.as_bytes())
+            .with_object(0x02, revision.as_bytes())
+    }
+
+    /// Add or replace an object (values longer than 255 bytes are truncated,
+    /// as object lengths are encoded in one byte)
+    pub fn with_object(mut self, id: u8, value: &[u8]) -> Self {
+        let value = value[..value.len().min(255)].to_vec();
+        match self
+            .objects
+            .binary_search_by_key(&id, |(obj_id, _)| *obj_id)
+        {
+            Ok(pos) => self.objects[pos].1 = value,
+            Err(pos) => self.objects.insert(pos, (id, value)),
+        }
+        self
+    }
+
+    /// Conformity level: basic/regular/extended stream, plus the individual
+    /// access bit (0x80) — code 4 single-object reads are always supported
+    fn conformity_level(&self) -> u8 {
+        let max_id = self.objects.last().map(|(id, _)| *id).unwrap_or(0);
+        let stream_level = if max_id <= 0x02 {
+            0x01
+        } else if max_id <= 0x06 {
+            0x02
+        } else {
+            0x03
+        };
+        stream_level | 0x80
+    }
+
+    /// Handle an FC 0x2B request payload (bytes after the function code).
+    fn handle_request(&self, data: &[u8]) -> ModbusResult<Vec<u8>> {
+        use crate::constants::{MAX_PDU_SIZE, MEI_READ_DEVICE_ID};
+
+        if data.len() != 3 || data[0] != MEI_READ_DEVICE_ID {
+            return Err(ModbusError::invalid_data(
+                "Invalid device identification request",
+            ));
+        }
+        let read_code = data[1];
+        let object_id = data[2];
+
+        let selected: Vec<&(u8, Vec<u8>)> = match read_code {
+            1..=3 => {
+                let max_id = match read_code {
+                    1 => 0x02,
+                    2 => 0x06,
+                    _ => 0xFF,
+                };
+                // Stream read starts at object_id; per spec, restart from the
+                // first object when the requested id is not present
+                let start = if self.objects.iter().any(|(id, _)| *id == object_id) {
+                    object_id
+                } else {
+                    0
+                };
+                self.objects
+                    .iter()
+                    .filter(|(id, _)| *id >= start && *id <= max_id)
+                    .collect()
+            }
+            4 => match self.objects.iter().find(|(id, _)| *id == object_id) {
+                Some(object) => vec![object],
+                // Unknown object id → exception 0x02 (Illegal Data Address)
+                None => return Err(ModbusError::invalid_address(u16::from(object_id), 1)),
+            },
+            _ => {
+                return Err(ModbusError::invalid_data(
+                    "Invalid ReadDeviceId code (must be 1-4)",
+                ))
+            }
+        };
+
+        // Header: fc, mei, read code, conformity, more, next id, count
+        let mut response = vec![
+            0x2B,
+            MEI_READ_DEVICE_ID,
+            read_code,
+            self.conformity_level(),
+            0x00, // more follows — patched below
+            0x00, // next object id — patched below
+            0x00, // object count — patched below
+        ];
+
+        let mut count: u8 = 0;
+        for (id, value) in selected {
+            if response.len() + 2 + value.len() > MAX_PDU_SIZE {
+                response[4] = 0xFF; // more follows
+                response[5] = *id; // continue from this object
+                break;
+            }
+            response.push(*id);
+            response.push(value.len() as u8);
+            response.extend_from_slice(value);
+            count += 1;
+        }
+        response[6] = count;
+
+        Ok(response)
+    }
+}
+
+/// Service wrapper installed by `set_device_identity`: answers FC 0x2B from
+/// the configured identity, forwards everything else to the inner service.
+struct WithDeviceIdentity {
+    inner: Arc<dyn ModbusService>,
+    identity: Arc<DeviceIdentity>,
+}
+
+impl ModbusService for WithDeviceIdentity {
+    fn handle_pdu<'a>(&'a self, function_code: u8, data: &'a [u8]) -> ServiceFuture<'a> {
+        if function_code == 0x2B {
+            let result = self.identity.handle_request(data);
+            Box::pin(async move { result })
+        } else {
+            self.inner.handle_pdu(function_code, data)
+        }
+    }
+}
+
+/// Compose the service handed to the accept/serve loop: wrap with the device
+/// identity responder when one is configured.
+fn effective_service(
+    service: &Arc<dyn ModbusService>,
+    identity: &Option<Arc<DeviceIdentity>>,
+) -> Arc<dyn ModbusService> {
+    match identity {
+        Some(identity) => Arc::new(WithDeviceIdentity {
+            inner: service.clone(),
+            identity: identity.clone(),
+        }),
+        None => service.clone(),
     }
 }
 
@@ -160,6 +322,8 @@ pub struct ModbusTcpServer {
     register_bank: Arc<ModbusRegisterBank>,
     /// Request handler; defaults to the register bank itself
     service: Arc<dyn ModbusService>,
+    /// FC 0x2B responder, when configured
+    device_identity: Option<Arc<DeviceIdentity>>,
     stats: Arc<Mutex<ServerStats>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     is_running: Arc<AtomicBool>,
@@ -192,6 +356,7 @@ impl ModbusTcpServer {
             config,
             service: register_bank.clone(),
             register_bank,
+            device_identity: None,
             stats: Arc::new(Mutex::new(ServerStats::default())),
             shutdown_tx: None,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -213,6 +378,12 @@ impl ModbusTcpServer {
     /// no longer consulted while a custom service is installed.
     pub fn set_service(&mut self, service: Arc<dyn ModbusService>) {
         self.service = service;
+    }
+
+    /// Serve FC 0x2B (Read Device Identification) from these objects.
+    /// Takes effect from the next [`Self::start`].
+    pub fn set_device_identity(&mut self, identity: DeviceIdentity) {
+        self.device_identity = Some(Arc::new(identity));
     }
 
     /// Handle client connection
@@ -813,7 +984,7 @@ impl ModbusServer for ModbusTcpServer {
         info!("   - Max connections: {}", self.config.max_connections);
         info!("   - Request timeout: {:?}", self.config.request_timeout);
 
-        let service = self.service.clone();
+        let service = effective_service(&self.service, &self.device_identity);
         let stats = self.stats.clone();
         let request_timeout = self.config.request_timeout;
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections));
@@ -943,6 +1114,8 @@ pub struct ModbusRtuServer {
     register_bank: Arc<ModbusRegisterBank>,
     /// Request handler; defaults to the register bank itself
     service: Arc<dyn ModbusService>,
+    /// FC 0x2B responder, when configured
+    device_identity: Option<Arc<DeviceIdentity>>,
     stats: Arc<Mutex<ServerStats>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     is_running: Arc<AtomicBool>,
@@ -974,6 +1147,7 @@ impl ModbusRtuServer {
             config,
             service: register_bank.clone(),
             register_bank,
+            device_identity: None,
             stats: Arc::new(Mutex::new(ServerStats::default())),
             shutdown_tx: None,
             is_running: Arc::new(AtomicBool::new(false)),
@@ -991,6 +1165,12 @@ impl ModbusRtuServer {
     /// default in-memory register bank — see [`ModbusTcpServer::set_service`].
     pub fn set_service(&mut self, service: Arc<dyn ModbusService>) {
         self.service = service;
+    }
+
+    /// Serve FC 0x2B (Read Device Identification) from these objects.
+    /// Takes effect from the next [`Self::start`].
+    pub fn set_device_identity(&mut self, identity: DeviceIdentity) {
+        self.device_identity = Some(Arc::new(identity));
     }
 
     /// Calculate CRC for RTU frames
@@ -1224,7 +1404,7 @@ impl ModbusServer for ModbusRtuServer {
         info!("   - Parity: {:?}", self.config.parity);
         info!("   - Timeout: {:?}", self.config.timeout);
 
-        let service = self.service.clone();
+        let service = effective_service(&self.service, &self.device_identity);
         let stats = self.stats.clone();
         let frame_gap = self.config.frame_gap;
         let own_slave_id = self.config.slave_id;
@@ -1527,6 +1707,88 @@ mod tests {
         assert!(ModbusTcpServer::handle_request(&bad, &FixedService)
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handle_request_diagnostics_echo() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, //
+            0x01, 0x08, 0x00, 0x00, 0xA5, 0x37, // sub 0x0000 echo test
+        ];
+        let response = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(&response[7..], &[0x08, 0x00, 0x00, 0xA5, 0x37]);
+
+        // Unsupported sub-function must error
+        let bad = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, //
+            0x01, 0x08, 0x00, 0x01, 0x00, 0x00,
+        ];
+        assert!(
+            ModbusTcpServer::handle_request(&bad, register_bank.as_ref())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_device_identity_stream_read() {
+        let identity = DeviceIdentity::basic("VendorX", "PC-1", "V2.1");
+        // Basic stream read from object 0
+        let response = identity.handle_request(&[0x0E, 0x01, 0x00]).unwrap();
+        assert_eq!(&response[..3], &[0x2B, 0x0E, 0x01]);
+        assert_eq!(response[3], 0x81); // basic + individual access
+        assert_eq!(response[4], 0x00); // no more follows
+        assert_eq!(response[6], 3); // three objects
+        assert_eq!(&response[7..9], &[0x00, 7]); // VendorName, len 7
+        assert_eq!(&response[9..16], b"VendorX");
+    }
+
+    #[tokio::test]
+    async fn test_device_identity_individual_read() {
+        let identity = DeviceIdentity::basic("VendorX", "PC-1", "V2.1");
+
+        // Code 4: read one specific object
+        let response = identity.handle_request(&[0x0E, 0x04, 0x01]).unwrap();
+        assert_eq!(response[6], 1);
+        assert_eq!(&response[7..9], &[0x01, 4]);
+        assert_eq!(&response[9..13], b"PC-1");
+
+        // Unknown object id → error (maps to exception 0x02)
+        let err = identity.handle_request(&[0x0E, 0x04, 0x77]).unwrap_err();
+        assert_eq!(ModbusTcpServer::exception_code_for_error(&err), 0x02);
+    }
+
+    #[tokio::test]
+    async fn test_device_identity_served_through_service_wrapper() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let service: Arc<dyn ModbusService> = bank.clone();
+        let identity = Some(Arc::new(DeviceIdentity::basic("V", "P", "1.0")));
+        let wrapped = effective_service(&service, &identity);
+
+        // FC 0x2B answered from the identity
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x05, //
+            0x01, 0x2B, 0x0E, 0x01, 0x00,
+        ];
+        let response = ModbusTcpServer::handle_request(&request, wrapped.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(response[7], 0x2B);
+        assert_eq!(response[13], 3); // object count field: all three basic objects
+
+        // Other function codes still reach the register bank
+        let read = [
+            0x00, 0x02, 0x00, 0x00, 0x00, 0x06, //
+            0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let response = ModbusTcpServer::handle_request(&read, wrapped.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(&response[7..], &[0x03, 0x02, 0x12, 0x34]);
     }
 
     /// Build a valid RTU frame by appending the CRC to a body.
