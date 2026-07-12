@@ -120,48 +120,11 @@ where
     pub fn encode_request(&self, request: &ModbusRequest) -> ModbusResult<HVec<u8, MAX_FRAME>> {
         request.validate()?;
 
+        let pdu = request.encode_pdu()?;
+
         let mut frame: HVec<u8, MAX_FRAME> = HVec::new();
-
         push(&mut frame, request.slave_id)?;
-        push(&mut frame, request.function.to_u8())?;
-
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                extend(&mut frame, &request.address.to_be_bytes())?;
-                extend(&mut frame, &request.quantity.to_be_bytes())?;
-            }
-
-            ModbusFunction::WriteSingleCoil => {
-                extend(&mut frame, &request.address.to_be_bytes())?;
-                let coil_value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                extend(&mut frame, &coil_value.to_be_bytes())?;
-            }
-
-            ModbusFunction::WriteSingleRegister => {
-                extend(&mut frame, &request.address.to_be_bytes())?;
-                if request.data.len() >= 2 {
-                    extend(&mut frame, &request.data[0..2])?;
-                } else {
-                    extend(&mut frame, &[0u8, 0u8])?;
-                }
-            }
-
-            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                extend(&mut frame, &request.address.to_be_bytes())?;
-                extend(&mut frame, &request.quantity.to_be_bytes())?;
-                let byte_count = u8::try_from(request.data.len())
-                    .map_err(|_| ModbusError::invalid_data("data payload too large"))?;
-                push(&mut frame, byte_count)?;
-                extend(&mut frame, &request.data)?;
-            }
-        }
+        extend(&mut frame, pdu.as_slice())?;
 
         let crc = CRC_MODBUS.checksum(&frame);
         extend(&mut frame, &crc.to_le_bytes())?; // CRC is little-endian in RTU
@@ -257,7 +220,8 @@ where
             ModbusFunction::ReadCoils
             | ModbusFunction::ReadDiscreteInputs
             | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
+            | ModbusFunction::ReadInputRegisters
+            | ModbusFunction::ReadWriteMultipleRegisters => {
                 let mut byte_count = [0u8; 1];
                 self.io
                     .read_exact(&mut byte_count)
@@ -282,6 +246,44 @@ where
                     .await
                     .map_err(|_| ModbusError::io("embedded read error"))?;
                 frame.extend_from_slice(&tail);
+            }
+            ModbusFunction::MaskWriteRegister => {
+                // Echo: addr(2) + and(2) + or(2) + crc(2)
+                let mut tail = [0u8; 8];
+                self.io
+                    .read_exact(&mut tail)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&tail);
+            }
+            ModbusFunction::ReadDeviceIdentification => {
+                // MEI header: mei_type, read_code, conformity, more, next, count
+                let mut mei = [0u8; 6];
+                self.io
+                    .read_exact(&mut mei)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&mei);
+                for _ in 0..mei[5] {
+                    let mut obj_header = [0u8; 2]; // object id + length
+                    self.io
+                        .read_exact(&mut obj_header)
+                        .await
+                        .map_err(|_| ModbusError::io("embedded read error"))?;
+                    frame.extend_from_slice(&obj_header);
+                    let mut value = vec![0u8; usize::from(obj_header[1])];
+                    self.io
+                        .read_exact(&mut value)
+                        .await
+                        .map_err(|_| ModbusError::io("embedded read error"))?;
+                    frame.extend_from_slice(&value);
+                }
+                let mut crc = [0u8; 2];
+                self.io
+                    .read_exact(&mut crc)
+                    .await
+                    .map_err(|_| ModbusError::io("embedded read error"))?;
+                frame.extend_from_slice(&crc);
             }
         }
 

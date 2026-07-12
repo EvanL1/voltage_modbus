@@ -114,6 +114,32 @@ pub const FC_WRITE_MULTIPLE_COILS: u8 = 0x0F;
 /// Write Multiple Registers (FC16)
 pub const FC_WRITE_MULTIPLE_REGISTERS: u8 = 0x10;
 
+/// Mask Write Register (FC22)
+pub const FC_MASK_WRITE_REGISTER: u8 = 0x16;
+
+/// Read/Write Multiple Registers (FC23)
+pub const FC_READ_WRITE_MULTIPLE_REGISTERS: u8 = 0x17;
+
+/// Encapsulated Interface Transport (FC43), carrier for Read Device Identification
+pub const FC_ENCAPSULATED_INTERFACE: u8 = 0x2B;
+
+/// MEI type for Read Device Identification (FC43 / MEI 14)
+pub const MEI_READ_DEVICE_ID: u8 = 0x0E;
+
+/// Maximum read quantity for FC23 (Read/Write Multiple Registers), read side
+///
+/// Calculation for response PDU (same shape as FC03):
+/// - Function Code: 1 byte + Byte Count: 1 byte + N × 2 bytes ≤ 253
+/// - Spec defines: N ≤ 0x7D = 125
+pub const MAX_RW_READ_REGISTERS: usize = 125;
+
+/// Maximum write quantity for FC23 (Read/Write Multiple Registers), write side
+///
+/// Calculation for request PDU:
+/// - FC(1) + ReadAddr(2) + ReadQty(2) + WriteAddr(2) + WriteQty(2) + ByteCount(1) + N × 2 ≤ 253
+/// - Spec defines: N ≤ 0x79 = 121
+pub const MAX_RW_WRITE_REGISTERS: usize = 121;
+
 // ============================================================================
 // Modbus Exception Codes
 // ============================================================================

@@ -2,7 +2,9 @@
 //!
 //! This module provides complete server-side implementations for both TCP and RTU protocols.
 
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +17,10 @@ use tokio::time::timeout;
 use tokio_serial;
 use tracing::{debug, error, info, warn};
 
-use crate::constants::{MAX_READ_COILS, MAX_READ_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS};
+use crate::constants::{
+    MAX_READ_COILS, MAX_READ_REGISTERS, MAX_RW_READ_REGISTERS, MAX_RW_WRITE_REGISTERS,
+    MAX_WRITE_COILS, MAX_WRITE_REGISTERS,
+};
 use crate::error::{ModbusError, ModbusResult};
 
 use crate::register_bank::{ModbusRegisterBank, RegisterBankStats};
@@ -42,6 +47,78 @@ pub trait ModbusServer: Send + Sync {
 
     /// Get register bank reference
     fn get_register_bank(&self) -> Option<Arc<ModbusRegisterBank>>;
+}
+
+/// Boxed future returned by [`ModbusService::handle_pdu`]
+pub type ServiceFuture<'a> = Pin<Box<dyn Future<Output = ModbusResult<Vec<u8>>> + Send + 'a>>;
+
+/// Server-side PDU handler.
+///
+/// The TCP and RTU servers strip the transport framing (MBAP header, or
+/// slave id + CRC) off each request and delegate the raw PDU here. Implement
+/// this trait to back a server with your own data source — live sensor
+/// values, a downstream gateway, a simulation — instead of static storage.
+/// [`ModbusRegisterBank`] provides the default in-memory implementation.
+///
+/// Return the response PDU starting with the function code (no unit id, MBAP
+/// header or CRC — the server adds the framing). Returning `Err` makes the
+/// server reply with the matching Modbus exception, e.g.
+/// `ModbusError::InvalidAddress` → exception 0x02, `InvalidFunction` → 0x01.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use std::sync::Arc;
+/// use voltage_modbus::server::{ModbusService, ModbusTcpServer, ServiceFuture};
+/// use voltage_modbus::ModbusError;
+///
+/// struct LiveSensors;
+///
+/// impl ModbusService for LiveSensors {
+///     fn handle_pdu<'a>(&'a self, function_code: u8, data: &'a [u8]) -> ServiceFuture<'a> {
+///         Box::pin(async move {
+///             match function_code {
+///                 // FC04: answer every input-register read with one value
+///                 0x04 => Ok(vec![0x04, 0x02, 0x12, 0x34]),
+///                 other => Err(ModbusError::invalid_function(other)),
+///             }
+///         })
+///     }
+/// }
+///
+/// # fn example() -> voltage_modbus::ModbusResult<()> {
+/// let mut server = ModbusTcpServer::new("0.0.0.0:502")?;
+/// server.set_service(Arc::new(LiveSensors));
+/// # Ok(())
+/// # }
+/// ```
+pub trait ModbusService: Send + Sync {
+    /// Handle one request PDU (`function_code` + payload `data`)
+    fn handle_pdu<'a>(&'a self, function_code: u8, data: &'a [u8]) -> ServiceFuture<'a>;
+}
+
+/// Default service: dispatch onto the in-memory register bank
+impl ModbusService for ModbusRegisterBank {
+    fn handle_pdu<'a>(&'a self, function_code: u8, data: &'a [u8]) -> ServiceFuture<'a> {
+        Box::pin(async move {
+            match function_code {
+                0x01 => ModbusTcpServer::handle_read_01(data, self).await,
+                0x02 => ModbusTcpServer::handle_read_02(data, self).await,
+                0x03 => ModbusTcpServer::handle_read_03(data, self).await,
+                0x04 => ModbusTcpServer::handle_read_04(data, self).await,
+                0x05 => ModbusTcpServer::handle_write_05(data, self).await,
+                0x06 => ModbusTcpServer::handle_write_06(data, self).await,
+                0x0F => ModbusTcpServer::handle_write_0f(data, self).await,
+                0x10 => ModbusTcpServer::handle_write_10(data, self).await,
+                0x16 => ModbusTcpServer::handle_write_16(data, self).await,
+                0x17 => ModbusTcpServer::handle_read_write_17(data, self).await,
+                _ => {
+                    warn!("Unsupported function code: 0x{:02X}", function_code);
+                    Err(ModbusError::invalid_function(function_code))
+                }
+            }
+        })
+    }
 }
 
 /// Server statistics
@@ -81,6 +158,8 @@ impl Default for ModbusTcpServerConfig {
 pub struct ModbusTcpServer {
     config: ModbusTcpServerConfig,
     register_bank: Arc<ModbusRegisterBank>,
+    /// Request handler; defaults to the register bank itself
+    service: Arc<dyn ModbusService>,
     stats: Arc<Mutex<ServerStats>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     is_running: Arc<AtomicBool>,
@@ -111,6 +190,7 @@ impl ModbusTcpServer {
 
         Ok(Self {
             config,
+            service: register_bank.clone(),
             register_bank,
             stats: Arc::new(Mutex::new(ServerStats::default())),
             shutdown_tx: None,
@@ -119,15 +199,26 @@ impl ModbusTcpServer {
         })
     }
 
-    /// Set custom register bank
+    /// Set custom register bank (also makes it the active request handler)
     pub fn set_register_bank(&mut self, register_bank: Arc<ModbusRegisterBank>) {
+        self.service = register_bank.clone();
         self.register_bank = register_bank;
+    }
+
+    /// Back this server with a custom [`ModbusService`] instead of the
+    /// default in-memory register bank.
+    ///
+    /// Takes effect for connections accepted after the next [`Self::start`].
+    /// [`Self::get_register_bank`] keeps returning the default bank, which is
+    /// no longer consulted while a custom service is installed.
+    pub fn set_service(&mut self, service: Arc<dyn ModbusService>) {
+        self.service = service;
     }
 
     /// Handle client connection
     async fn handle_client(
         mut stream: TcpStream,
-        register_bank: Arc<ModbusRegisterBank>,
+        service: Arc<dyn ModbusService>,
         stats: Arc<Mutex<ServerStats>>,
         mut shutdown_rx: broadcast::Receiver<()>,
         request_timeout: Duration,
@@ -162,7 +253,7 @@ impl ModbusTcpServer {
                             }
 
                             // Process request
-                            match Self::handle_request(&frame, &register_bank).await {
+                            match Self::handle_request(&frame, service.as_ref()).await {
                                 Ok(response_data) => {
                                     if let Err(e) = stream.write_all(&response_data).await {
                                         error!("Failed to send response to {}: {}", peer_addr, e);
@@ -244,10 +335,7 @@ impl ModbusTcpServer {
     }
 
     /// Process Modbus request
-    async fn handle_request(
-        data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
-    ) -> ModbusResult<Vec<u8>> {
+    async fn handle_request(data: &[u8], service: &dyn ModbusService) -> ModbusResult<Vec<u8>> {
         if data.len() < MBAP_HEADER_SIZE + 2 {
             return Err(ModbusError::frame("Invalid TCP frame length"));
         }
@@ -273,20 +361,7 @@ impl ModbusTcpServer {
 
         debug!("Processing function code: 0x{:02X}", function_code);
 
-        let pdu_response = match function_code {
-            0x01 => Self::handle_read_01(pdu_data, register_bank).await,
-            0x02 => Self::handle_read_02(pdu_data, register_bank).await,
-            0x03 => Self::handle_read_03(pdu_data, register_bank).await,
-            0x04 => Self::handle_read_04(pdu_data, register_bank).await,
-            0x05 => Self::handle_write_05(pdu_data, register_bank).await,
-            0x06 => Self::handle_write_06(pdu_data, register_bank).await,
-            0x0F => Self::handle_write_0f(pdu_data, register_bank).await,
-            0x10 => Self::handle_write_10(pdu_data, register_bank).await,
-            _ => {
-                warn!("Unsupported function code: 0x{:02X}", function_code);
-                Err(ModbusError::invalid_function(function_code))
-            }
-        }?;
+        let pdu_response = service.handle_pdu(function_code, pdu_data).await?;
 
         Self::create_success_response(transaction_id, unit_id, &pdu_response)
     }
@@ -323,7 +398,7 @@ impl ModbusTcpServer {
     /// Handle read coils (0x01)
     async fn handle_read_01(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("Invalid read coils request"));
@@ -363,7 +438,7 @@ impl ModbusTcpServer {
     /// Handle read discrete inputs (0x02)
     async fn handle_read_02(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("Invalid read discrete inputs request"));
@@ -406,7 +481,7 @@ impl ModbusTcpServer {
     /// Handle read holding registers (0x03)
     async fn handle_read_03(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
@@ -441,7 +516,7 @@ impl ModbusTcpServer {
     /// Handle read input registers (0x04)
     async fn handle_read_04(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
@@ -476,7 +551,7 @@ impl ModbusTcpServer {
     /// Handle write single coil (0x05)
     async fn handle_write_05(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
@@ -500,7 +575,7 @@ impl ModbusTcpServer {
     /// Handle write single register (0x06)
     async fn handle_write_06(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() != 4 {
             return Err(ModbusError::frame("invalid frame"));
@@ -520,7 +595,7 @@ impl ModbusTcpServer {
     /// Handle write multiple coils (0x0F)
     async fn handle_write_0f(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() < 5 {
             return Err(ModbusError::frame("invalid frame"));
@@ -564,7 +639,7 @@ impl ModbusTcpServer {
     /// Handle write multiple registers (0x10)
     async fn handle_write_10(
         data: &[u8],
-        register_bank: &Arc<ModbusRegisterBank>,
+        register_bank: &ModbusRegisterBank,
     ) -> ModbusResult<Vec<u8>> {
         if data.len() < 5 {
             return Err(ModbusError::frame("invalid frame"));
@@ -598,6 +673,85 @@ impl ModbusTcpServer {
         response.push(0x10);
         response.extend_from_slice(&address.to_be_bytes());
         response.extend_from_slice(&quantity.to_be_bytes());
+        Ok(response)
+    }
+
+    /// Handle mask write register (0x16)
+    ///
+    /// `result = (current & and_mask) | (or_mask & !and_mask)`
+    async fn handle_write_16(
+        data: &[u8],
+        register_bank: &ModbusRegisterBank,
+    ) -> ModbusResult<Vec<u8>> {
+        if data.len() != 6 {
+            return Err(ModbusError::frame("invalid frame"));
+        }
+
+        let address = u16::from_be_bytes([data[0], data[1]]);
+        let and_mask = u16::from_be_bytes([data[2], data[3]]);
+        let or_mask = u16::from_be_bytes([data[4], data[5]]);
+
+        let current = register_bank.read_03(address, 1)?[0];
+        let result = (current & and_mask) | (or_mask & !and_mask);
+        register_bank.write_06(address, result)?;
+
+        // Response echoes the request
+        let mut response = Vec::with_capacity(7);
+        response.push(0x16);
+        response.extend_from_slice(data);
+        Ok(response)
+    }
+
+    /// Handle read/write multiple registers (0x17)
+    ///
+    /// Per spec the write is performed before the read.
+    async fn handle_read_write_17(
+        data: &[u8],
+        register_bank: &ModbusRegisterBank,
+    ) -> ModbusResult<Vec<u8>> {
+        if data.len() < 9 {
+            return Err(ModbusError::frame("invalid frame"));
+        }
+
+        let read_address = u16::from_be_bytes([data[0], data[1]]);
+        let read_quantity = u16::from_be_bytes([data[2], data[3]]);
+        let write_address = u16::from_be_bytes([data[4], data[5]]);
+        let write_quantity = u16::from_be_bytes([data[6], data[7]]);
+        let byte_count = usize::from(data[8]);
+
+        if read_quantity == 0 || usize::from(read_quantity) > MAX_RW_READ_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "Invalid read/write multiple read quantity",
+            ));
+        }
+        if write_quantity == 0 || usize::from(write_quantity) > MAX_RW_WRITE_REGISTERS {
+            return Err(ModbusError::invalid_data(
+                "Invalid read/write multiple write quantity",
+            ));
+        }
+        if byte_count != usize::from(write_quantity) * 2 || data.len() != 9 + byte_count {
+            return Err(ModbusError::frame("invalid frame"));
+        }
+
+        let values: Vec<u16> = data[9..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .collect();
+
+        // Write first, then read (spec-mandated ordering)
+        register_bank.write_10(write_address, &values)?;
+        let registers = register_bank.read_03(read_address, read_quantity)?;
+
+        let data_len = registers.len() * 2;
+        let mut response = Vec::with_capacity(2 + data_len);
+        response.push(0x17);
+        response.push(
+            u8::try_from(data_len)
+                .map_err(|_| ModbusError::invalid_data("Read/write response too large"))?,
+        );
+        for &register in &registers {
+            response.extend_from_slice(&register.to_be_bytes());
+        }
         Ok(response)
     }
 
@@ -659,7 +813,7 @@ impl ModbusServer for ModbusTcpServer {
         info!("   - Max connections: {}", self.config.max_connections);
         info!("   - Request timeout: {:?}", self.config.request_timeout);
 
-        let register_bank = self.register_bank.clone();
+        let service = self.service.clone();
         let stats = self.stats.clone();
         let request_timeout = self.config.request_timeout;
         let connection_limit = Arc::new(Semaphore::new(self.config.max_connections));
@@ -684,13 +838,13 @@ impl ModbusServer for ModbusTcpServer {
                                     }
                                 };
 
-                                let register_bank = register_bank.clone();
+                                let service = service.clone();
                                 let stats = stats.clone();
                                 let shutdown_rx = shutdown_tx.subscribe();
 
                                 tokio::spawn(async move {
                                     let _permit = permit;
-                                    Self::handle_client(stream, register_bank, stats, shutdown_rx, request_timeout).await;
+                                    Self::handle_client(stream, service, stats, shutdown_rx, request_timeout).await;
                                 });
                             }
                             Err(e) => {
@@ -787,6 +941,8 @@ impl Default for ModbusRtuServerConfig {
 pub struct ModbusRtuServer {
     config: ModbusRtuServerConfig,
     register_bank: Arc<ModbusRegisterBank>,
+    /// Request handler; defaults to the register bank itself
+    service: Arc<dyn ModbusService>,
     stats: Arc<Mutex<ServerStats>>,
     shutdown_tx: Option<broadcast::Sender<()>>,
     is_running: Arc<AtomicBool>,
@@ -816,6 +972,7 @@ impl ModbusRtuServer {
 
         Ok(Self {
             config,
+            service: register_bank.clone(),
             register_bank,
             stats: Arc::new(Mutex::new(ServerStats::default())),
             shutdown_tx: None,
@@ -824,9 +981,16 @@ impl ModbusRtuServer {
         })
     }
 
-    /// Set custom register bank
+    /// Set custom register bank (also makes it the active request handler)
     pub fn set_register_bank(&mut self, register_bank: Arc<ModbusRegisterBank>) {
+        self.service = register_bank.clone();
         self.register_bank = register_bank;
+    }
+
+    /// Back this server with a custom [`ModbusService`] instead of the
+    /// default in-memory register bank — see [`ModbusTcpServer::set_service`].
+    pub fn set_service(&mut self, service: Arc<dyn ModbusService>) {
+        self.service = service;
     }
 
     /// Calculate CRC for RTU frames
@@ -846,7 +1010,7 @@ impl ModbusRtuServer {
     async fn process_frame(
         frame: &[u8],
         own_slave_id: u8,
-        register_bank: &Arc<ModbusRegisterBank>,
+        service: &dyn ModbusService,
     ) -> Option<Vec<u8>> {
         // Minimum RTU frame: slave(1) + function(1) + CRC(2)
         if frame.len() < 4 {
@@ -872,17 +1036,7 @@ impl ModbusRtuServer {
         let function_code = frame[1];
         let pdu_data = &frame[2..crc_split];
 
-        let result = match function_code {
-            0x01 => ModbusTcpServer::handle_read_01(pdu_data, register_bank).await,
-            0x02 => ModbusTcpServer::handle_read_02(pdu_data, register_bank).await,
-            0x03 => ModbusTcpServer::handle_read_03(pdu_data, register_bank).await,
-            0x04 => ModbusTcpServer::handle_read_04(pdu_data, register_bank).await,
-            0x05 => ModbusTcpServer::handle_write_05(pdu_data, register_bank).await,
-            0x06 => ModbusTcpServer::handle_write_06(pdu_data, register_bank).await,
-            0x0F => ModbusTcpServer::handle_write_0f(pdu_data, register_bank).await,
-            0x10 => ModbusTcpServer::handle_write_10(pdu_data, register_bank).await,
-            _ => Err(ModbusError::invalid_function(function_code)),
-        };
+        let result = service.handle_pdu(function_code, pdu_data).await;
 
         // Broadcast: executed above, but never answered
         if slave_id == 0 {
@@ -926,7 +1080,7 @@ impl ModbusRtuServer {
     async fn handle_rtu_communication(
         mut port: tokio_serial::SerialStream,
         own_slave_id: u8,
-        register_bank: Arc<ModbusRegisterBank>,
+        service: Arc<dyn ModbusService>,
         stats: Arc<Mutex<ServerStats>>,
         mut shutdown_rx: broadcast::Receiver<()>,
         frame_gap: Duration,
@@ -956,7 +1110,7 @@ impl ModbusRtuServer {
                                     &frame_buffer,
                                     &mut port,
                                     own_slave_id,
-                                    &register_bank,
+                                    service.as_ref(),
                                     &stats
                                 ).await;
                                 frame_buffer.clear();
@@ -986,7 +1140,7 @@ impl ModbusRtuServer {
                                     &frame_buffer,
                                     &mut port,
                                     own_slave_id,
-                                    &register_bank,
+                                    service.as_ref(),
                                     &stats
                                 ).await;
                                 frame_buffer.clear();
@@ -1005,7 +1159,7 @@ impl ModbusRtuServer {
         frame: &[u8],
         port: &mut tokio_serial::SerialStream,
         own_slave_id: u8,
-        register_bank: &Arc<ModbusRegisterBank>,
+        service: &dyn ModbusService,
         stats: &Arc<Mutex<ServerStats>>,
     ) {
         // Update request stats
@@ -1014,7 +1168,7 @@ impl ModbusRtuServer {
         }
 
         // None = frame must stay unanswered (noise, bad CRC, other slave, broadcast)
-        let Some(response) = Self::process_frame(frame, own_slave_id, register_bank).await else {
+        let Some(response) = Self::process_frame(frame, own_slave_id, service).await else {
             return;
         };
 
@@ -1070,7 +1224,7 @@ impl ModbusServer for ModbusRtuServer {
         info!("   - Parity: {:?}", self.config.parity);
         info!("   - Timeout: {:?}", self.config.timeout);
 
-        let register_bank = self.register_bank.clone();
+        let service = self.service.clone();
         let stats = self.stats.clone();
         let frame_gap = self.config.frame_gap;
         let own_slave_id = self.config.slave_id;
@@ -1081,7 +1235,7 @@ impl ModbusServer for ModbusRtuServer {
             Self::handle_rtu_communication(
                 port,
                 own_slave_id,
-                register_bank,
+                service,
                 stats,
                 shutdown_rx,
                 frame_gap,
@@ -1161,7 +1315,7 @@ mod tests {
             0x00, 0x01, // quantity
         ];
 
-        let response = ModbusTcpServer::handle_request(&request, &register_bank)
+        let response = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
             .await
             .unwrap();
 
@@ -1194,7 +1348,7 @@ mod tests {
             0x99, // invalid trailing byte
         ];
 
-        let err = ModbusTcpServer::handle_request(&request, &register_bank)
+        let err = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
             .await
             .unwrap_err();
         assert!(matches!(err, ModbusError::Frame { .. }));
@@ -1217,7 +1371,7 @@ mod tests {
             0x99, // invalid trailing byte
         ];
 
-        let err = ModbusTcpServer::handle_request(&request, &register_bank)
+        let err = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
             .await
             .unwrap_err();
         assert!(matches!(err, ModbusError::Frame { .. }));
@@ -1300,6 +1454,81 @@ mod tests {
         assert_ne!(crc, crc2);
     }
 
+    #[tokio::test]
+    async fn test_tcp_handle_request_mask_write() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+        register_bank.write_06(4, 0x0012).unwrap();
+
+        // Spec example: current=0x12, and=0xF2, or=0x25 → (0x12 & 0xF2) | (0x25 & !0xF2) = 0x17
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x08, // MBAP, len = unit+fc+addr+and+or
+            0x01, 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25,
+        ];
+        let response = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
+            .await
+            .unwrap();
+
+        // Response echoes the request PDU
+        assert_eq!(&response[7..], &[0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25]);
+        assert_eq!(register_bank.read_03(4, 1).unwrap(), vec![0x0017]);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_handle_request_read_write_multiple() {
+        let register_bank = Arc::new(ModbusRegisterBank::new());
+        register_bank.write_06(0, 0x0AAA).unwrap();
+
+        // Read 1 reg from address 0, write 0x1234 to address 10
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x0D, // MBAP, len = 1+1+2+2+2+2+1+2
+            0x01, 0x17, //
+            0x00, 0x00, 0x00, 0x01, // read addr 0, qty 1
+            0x00, 0x0A, 0x00, 0x01, // write addr 10, qty 1
+            0x02, 0x12, 0x34, // byte count + value
+        ];
+        let response = ModbusTcpServer::handle_request(&request, register_bank.as_ref())
+            .await
+            .unwrap();
+
+        assert_eq!(&response[7..], &[0x17, 0x02, 0x0A, 0xAA]);
+        assert_eq!(register_bank.read_03(10, 1).unwrap(), vec![0x1234]);
+    }
+
+    /// Minimal custom service: serves a fixed FC03 payload, rejects the rest.
+    struct FixedService;
+
+    impl ModbusService for FixedService {
+        fn handle_pdu<'a>(&'a self, function_code: u8, _data: &'a [u8]) -> ServiceFuture<'a> {
+            Box::pin(async move {
+                match function_code {
+                    0x03 => Ok(vec![0x03, 0x02, 0xBE, 0xEF]),
+                    other => Err(ModbusError::invalid_function(other)),
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_custom_service_backs_tcp_dispatch() {
+        let request = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, //
+            0x01, 0x03, 0x00, 0x00, 0x00, 0x01,
+        ];
+        let response = ModbusTcpServer::handle_request(&request, &FixedService)
+            .await
+            .unwrap();
+        assert_eq!(&response[7..], &[0x03, 0x02, 0xBE, 0xEF]);
+
+        // Unsupported FC surfaces as an error (mapped to exception upstream)
+        let bad = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, //
+            0x01, 0x04, 0x00, 0x00, 0x00, 0x01,
+        ];
+        assert!(ModbusTcpServer::handle_request(&bad, &FixedService)
+            .await
+            .is_err());
+    }
+
     /// Build a valid RTU frame by appending the CRC to a body.
     #[cfg(feature = "rtu")]
     fn rtu_frame(body: &[u8]) -> Vec<u8> {
@@ -1322,7 +1551,7 @@ mod tests {
             &[0x01, 0x03, 0x00][..],
         ] {
             assert!(
-                ModbusRtuServer::process_frame(noise, 1, &bank)
+                ModbusRtuServer::process_frame(noise, 1, bank.as_ref())
                     .await
                     .is_none(),
                 "noise frame {noise:02X?} must be ignored"
@@ -1340,7 +1569,7 @@ mod tests {
         let last = frame.len() - 1;
         frame[last] ^= 0xFF;
 
-        assert!(ModbusRtuServer::process_frame(&frame, 1, &bank)
+        assert!(ModbusRtuServer::process_frame(&frame, 1, bank.as_ref())
             .await
             .is_none());
         assert_eq!(bank.read_03(5, 1).unwrap(), vec![0x0000]);
@@ -1355,10 +1584,10 @@ mod tests {
         let frame = rtu_frame(&[0x02, 0x03, 0x00, 0x00, 0x00, 0x01]);
 
         // Addressed to slave 2: ignored when we are slave 1, answered when we are slave 2
-        assert!(ModbusRtuServer::process_frame(&frame, 1, &bank)
+        assert!(ModbusRtuServer::process_frame(&frame, 1, bank.as_ref())
             .await
             .is_none());
-        assert!(ModbusRtuServer::process_frame(&frame, 2, &bank)
+        assert!(ModbusRtuServer::process_frame(&frame, 2, bank.as_ref())
             .await
             .is_some());
     }
@@ -1370,7 +1599,7 @@ mod tests {
         let bank = Arc::new(ModbusRegisterBank::new());
         let frame = rtu_frame(&[0x00, 0x06, 0x00, 0x05, 0xAB, 0xCD]);
 
-        let response = ModbusRtuServer::process_frame(&frame, 1, &bank).await;
+        let response = ModbusRtuServer::process_frame(&frame, 1, bank.as_ref()).await;
         assert!(response.is_none(), "broadcast must never be answered");
         assert_eq!(bank.read_03(5, 1).unwrap(), vec![0xABCD]);
     }
@@ -1383,7 +1612,7 @@ mod tests {
         bank.write_06(0, 0x1234).unwrap();
         let frame = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
 
-        let response = ModbusRtuServer::process_frame(&frame, 1, &bank)
+        let response = ModbusRtuServer::process_frame(&frame, 1, bank.as_ref())
             .await
             .expect("valid unicast read must be answered");
 
@@ -1403,7 +1632,7 @@ mod tests {
         // FC03 with quantity 0 → Illegal Data Value (0x03)
         let frame = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x00]);
 
-        let response = ModbusRtuServer::process_frame(&frame, 1, &bank)
+        let response = ModbusRtuServer::process_frame(&frame, 1, bank.as_ref())
             .await
             .expect("error must produce an exception response");
 

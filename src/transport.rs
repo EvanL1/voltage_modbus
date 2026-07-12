@@ -191,6 +191,7 @@ const MAX_TCP_FRAME_SIZE: usize = 260;
 const MBAP_HEADER_SIZE: usize = 6;
 
 /// Maximum frame size for Modbus RTU
+#[cfg(feature = "rtu")]
 const MAX_RTU_FRAME_SIZE: usize = 256;
 
 /// CRC calculator shared by RTU and RTU-over-TCP transports
@@ -241,7 +242,7 @@ where
         3
     } else {
         match func {
-            0x01..=0x04 => {
+            0x01..=0x04 | 0x17 => {
                 // [byte_count, data..., crc(2)]: read byte_count first
                 let mut bc = [0u8; 1];
                 reader.read_exact(&mut bc).await?;
@@ -254,6 +255,28 @@ where
                 return Ok(out);
             }
             0x05 | 0x06 | 0x0F | 0x10 => 6, // echo: addr(2) + val(2) + crc(2)
+            0x16 => 8,                      // echo: addr(2) + and(2) + or(2) + crc(2)
+            0x2B => {
+                // MEI header after fc: mei_type, read_code, conformity,
+                // more_follows, next_object_id, object_count — then objects
+                let mut mei = [0u8; 6];
+                reader.read_exact(&mut mei).await?;
+                let mut out = Vec::with_capacity(2 + 6 + 16);
+                out.extend_from_slice(&header);
+                out.extend_from_slice(&mei);
+                for _ in 0..mei[5] {
+                    let mut obj_header = [0u8; 2]; // object id + length
+                    reader.read_exact(&mut obj_header).await?;
+                    out.extend_from_slice(&obj_header);
+                    let mut value = vec![0u8; obj_header[1] as usize];
+                    reader.read_exact(&mut value).await?;
+                    out.extend_from_slice(&value);
+                }
+                let mut crc = [0u8; 2];
+                reader.read_exact(&mut crc).await?;
+                out.extend_from_slice(&crc);
+                return Ok(out);
+            }
             _ => {
                 return Err(ModbusError::frame(format!(
                     "Unsupported function code 0x{:02X}",
@@ -630,112 +653,25 @@ impl TcpTransport {
     /// Encode request to TCP frame
     ///
     /// Returns a stack-allocated buffer and the number of valid bytes.
-    /// Modbus TCP frames are at most 260 bytes (MBAP 6 + PDU max 254),
+    /// Modbus TCP frames are at most 260 bytes (MBAP 6 + Unit ID 1 + PDU 253),
     /// so [u8; 260] on the stack is always sufficient.
     fn encode_request(
         &mut self,
         request: &ModbusRequest,
     ) -> ModbusResult<([u8; MAX_TCP_FRAME_SIZE], usize)> {
         let transaction_id = self.next_transaction_id();
-        let protocol_id = 0u16; // Always 0 for Modbus
-
-        // Calculate PDU length (unit_id + function_code + data)
-        let pdu_length = 1
-            + 1
-            + match request.function {
-                ModbusFunction::ReadCoils
-                | ModbusFunction::ReadDiscreteInputs
-                | ModbusFunction::ReadHoldingRegisters
-                | ModbusFunction::ReadInputRegisters => 4, // address (2) + quantity (2)
-
-                ModbusFunction::WriteSingleCoil | ModbusFunction::WriteSingleRegister => 4, // address (2) + value (2)
-
-                ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                    5 + request.data.len()
-                } // address (2) + quantity (2) + byte_count (1) + data
-            };
+        let pdu = request.encode_pdu()?;
+        let pdu_bytes = pdu.as_slice();
+        let mbap_length = (1 + pdu_bytes.len()) as u16; // unit id + PDU
 
         let mut frame = [0u8; MAX_TCP_FRAME_SIZE];
-        let mut pos = 0usize;
+        frame[0..2].copy_from_slice(&transaction_id.to_be_bytes());
+        frame[2..4].copy_from_slice(&0u16.to_be_bytes()); // protocol id, always 0
+        frame[4..6].copy_from_slice(&mbap_length.to_be_bytes());
+        frame[6] = request.slave_id;
+        frame[7..7 + pdu_bytes.len()].copy_from_slice(pdu_bytes);
 
-        // MBAP Header: Transaction ID (2) + Protocol ID (2) + Length (2)
-        let tid_bytes = transaction_id.to_be_bytes();
-        frame[pos] = tid_bytes[0];
-        frame[pos + 1] = tid_bytes[1];
-        pos += 2;
-        let pid_bytes = protocol_id.to_be_bytes();
-        frame[pos] = pid_bytes[0];
-        frame[pos + 1] = pid_bytes[1];
-        pos += 2;
-        let len_bytes = (pdu_length as u16).to_be_bytes();
-        frame[pos] = len_bytes[0];
-        frame[pos + 1] = len_bytes[1];
-        pos += 2;
-
-        // PDU: Unit ID + Function Code + Data
-        frame[pos] = request.slave_id;
-        pos += 1;
-        frame[pos] = request.function.to_u8();
-        pos += 1;
-        let addr_bytes = request.address.to_be_bytes();
-        frame[pos] = addr_bytes[0];
-        frame[pos + 1] = addr_bytes[1];
-        pos += 2;
-
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                let qty_bytes = request.quantity.to_be_bytes();
-                frame[pos] = qty_bytes[0];
-                frame[pos + 1] = qty_bytes[1];
-                pos += 2;
-            }
-
-            ModbusFunction::WriteSingleCoil => {
-                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                let val_bytes = value.to_be_bytes();
-                frame[pos] = val_bytes[0];
-                frame[pos + 1] = val_bytes[1];
-                pos += 2;
-            }
-
-            ModbusFunction::WriteSingleRegister => {
-                if request.data.len() >= 2 {
-                    frame[pos] = request.data[0];
-                    frame[pos + 1] = request.data[1];
-                } else {
-                    frame[pos] = 0;
-                    frame[pos + 1] = 0;
-                }
-                pos += 2;
-            }
-
-            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                let qty_bytes = request.quantity.to_be_bytes();
-                frame[pos] = qty_bytes[0];
-                frame[pos + 1] = qty_bytes[1];
-                pos += 2;
-                debug_assert!(
-                    request.data.len() <= 246,
-                    "data payload too large for Modbus frame"
-                );
-                frame[pos] = u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?;
-                pos += 1;
-                let data_len = request.data.len();
-                frame[pos..pos + data_len].copy_from_slice(&request.data);
-                pos += data_len;
-            }
-        }
-
-        Ok((frame, pos))
+        Ok((frame, 7 + pdu_bytes.len()))
     }
 
     /// Decode response from TCP frame (zero-copy)
@@ -790,63 +726,15 @@ impl TcpTransport {
     /// Returns `(frame_bytes, transaction_id)`.  The transaction ID is assigned by the
     /// caller so that we can track which response belongs to which request in pipelining.
     fn encode_request_with_tid(&self, request: &ModbusRequest, tid: u16) -> ModbusResult<Vec<u8>> {
-        let protocol_id = 0u16;
+        let pdu = request.encode_pdu()?;
+        let pdu_bytes = pdu.as_slice();
 
-        let pdu_length = 1
-            + 1
-            + match request.function {
-                ModbusFunction::ReadCoils
-                | ModbusFunction::ReadDiscreteInputs
-                | ModbusFunction::ReadHoldingRegisters
-                | ModbusFunction::ReadInputRegisters => 4,
-
-                ModbusFunction::WriteSingleCoil | ModbusFunction::WriteSingleRegister => 4,
-
-                ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                    5 + request.data.len()
-                }
-            };
-
-        let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + pdu_length);
-
+        let mut frame = Vec::with_capacity(MBAP_HEADER_SIZE + 1 + pdu_bytes.len());
         frame.extend_from_slice(&tid.to_be_bytes());
-        frame.extend_from_slice(&protocol_id.to_be_bytes());
-        frame.extend_from_slice(&(pdu_length as u16).to_be_bytes());
-
+        frame.extend_from_slice(&0u16.to_be_bytes()); // protocol id, always 0
+        frame.extend_from_slice(&((1 + pdu_bytes.len()) as u16).to_be_bytes());
         frame.push(request.slave_id);
-        frame.push(request.function.to_u8());
-        frame.extend_from_slice(&request.address.to_be_bytes());
-
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-            }
-            ModbusFunction::WriteSingleCoil => {
-                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                frame.extend_from_slice(&value.to_be_bytes());
-            }
-            ModbusFunction::WriteSingleRegister => {
-                if request.data.len() >= 2 {
-                    frame.extend_from_slice(&request.data[0..2]);
-                } else {
-                    frame.extend_from_slice(&[0, 0]);
-                }
-            }
-            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?);
-                frame.extend_from_slice(&request.data);
-            }
-        }
+        frame.extend_from_slice(pdu_bytes);
 
         Ok(frame)
     }
@@ -1422,73 +1310,14 @@ impl RtuTransport {
         CRC_MODBUS.checksum(data)
     }
 
-    /// Encode request to RTU frame
+    /// Encode request to RTU frame: slave id + shared PDU + CRC-16 (LE)
     fn encode_request(&self, request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
-        let mut frame = Vec::with_capacity(256);
-
-        // Slave ID
+        let pdu = request.encode_pdu()?;
+        let mut frame = Vec::with_capacity(1 + pdu.len() + 2);
         frame.push(request.slave_id);
-
-        // Function code
-        frame.push(request.function.to_u8());
-
-        // Function-specific data
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                // Address (2 bytes) + Quantity (2 bytes)
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-            }
-
-            ModbusFunction::WriteSingleCoil => {
-                // Address (2 bytes) + Value (2 bytes: 0x0000 or 0xFF00)
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                frame.extend_from_slice(&value.to_be_bytes());
-            }
-
-            ModbusFunction::WriteSingleRegister => {
-                // Address (2 bytes) + Value (2 bytes)
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                if request.data.len() >= 2 {
-                    frame.extend_from_slice(&request.data[0..2]);
-                } else {
-                    frame.extend_from_slice(&[0, 0]);
-                }
-            }
-
-            ModbusFunction::WriteMultipleCoils => {
-                // Address (2 bytes) + Quantity (2 bytes) + Byte count (1 byte) + Data
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?);
-                frame.extend_from_slice(&request.data);
-            }
-
-            ModbusFunction::WriteMultipleRegisters => {
-                // Address (2 bytes) + Quantity (2 bytes) + Byte count (1 byte) + Data
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?);
-                frame.extend_from_slice(&request.data);
-            }
-        }
-
-        // Calculate and append CRC
+        frame.extend_from_slice(pdu.as_slice());
         let crc = Self::calculate_crc(&frame);
         frame.extend_from_slice(&crc.to_le_bytes()); // CRC is little-endian in RTU
-
         Ok(frame)
     }
 
@@ -1970,49 +1799,11 @@ impl AsciiTransport {
     /// - `LRC` - Checksum (2 ASCII chars)
     /// - `CRLF` - End characters (0x0D, 0x0A)
     fn encode_request(&self, request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
-        // Build raw data for LRC calculation
-        let mut raw_data = Vec::new();
+        // Build raw data (slave id + shared PDU) for LRC calculation
+        let pdu = request.encode_pdu()?;
+        let mut raw_data = Vec::with_capacity(1 + pdu.len());
         raw_data.push(request.slave_id);
-        raw_data.push(request.function.to_u8());
-
-        // Add function-specific data
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                raw_data.extend_from_slice(&request.address.to_be_bytes());
-                raw_data.extend_from_slice(&request.quantity.to_be_bytes());
-            }
-
-            ModbusFunction::WriteSingleCoil => {
-                raw_data.extend_from_slice(&request.address.to_be_bytes());
-                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                raw_data.extend_from_slice(&value.to_be_bytes());
-            }
-
-            ModbusFunction::WriteSingleRegister => {
-                raw_data.extend_from_slice(&request.address.to_be_bytes());
-                if request.data.len() >= 2 {
-                    raw_data.extend_from_slice(&request.data[0..2]);
-                } else {
-                    raw_data.extend_from_slice(&[0, 0]);
-                }
-            }
-
-            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                raw_data.extend_from_slice(&request.address.to_be_bytes());
-                raw_data.extend_from_slice(&request.quantity.to_be_bytes());
-                raw_data.push(u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?);
-                raw_data.extend_from_slice(&request.data);
-            }
-        }
+        raw_data.extend_from_slice(pdu.as_slice());
 
         // Calculate LRC
         let lrc = Self::calculate_lrc(&raw_data);
@@ -2350,43 +2141,10 @@ impl RtuOverTcpTransport {
     fn encode_request(request: &ModbusRequest) -> ModbusResult<Vec<u8>> {
         request.validate()?;
 
-        let mut frame = Vec::with_capacity(MAX_RTU_FRAME_SIZE);
+        let pdu = request.encode_pdu()?;
+        let mut frame = Vec::with_capacity(1 + pdu.len() + 2);
         frame.push(request.slave_id);
-        frame.push(request.function.to_u8());
-        match request.function {
-            ModbusFunction::ReadCoils
-            | ModbusFunction::ReadDiscreteInputs
-            | ModbusFunction::ReadHoldingRegisters
-            | ModbusFunction::ReadInputRegisters => {
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-            }
-            ModbusFunction::WriteSingleCoil => {
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                let value: u16 = if !request.data.is_empty() && request.data[0] != 0 {
-                    0xFF00
-                } else {
-                    0x0000
-                };
-                frame.extend_from_slice(&value.to_be_bytes());
-            }
-            ModbusFunction::WriteSingleRegister => {
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                if request.data.len() >= 2 {
-                    frame.extend_from_slice(&request.data[0..2]);
-                } else {
-                    frame.extend_from_slice(&[0, 0]);
-                }
-            }
-            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
-                frame.extend_from_slice(&request.address.to_be_bytes());
-                frame.extend_from_slice(&request.quantity.to_be_bytes());
-                frame.push(u8::try_from(request.data.len()).map_err(|_| {
-                    ModbusError::invalid_data("data payload too large for Modbus frame")
-                })?);
-                frame.extend_from_slice(&request.data);
-            }
-        }
+        frame.extend_from_slice(pdu.as_slice());
         let crc = CRC_MODBUS.checksum(&frame);
         frame.extend_from_slice(&crc.to_le_bytes());
         Ok(frame)
@@ -2670,9 +2428,46 @@ mod rtu_frame_reader_tests {
     #[tokio::test]
     async fn rejects_unknown_function_code() {
         let (mut tx, mut rx) = tokio::io::duplex(64);
-        tx.write_all(&[0x01, 0x2B]).await.unwrap();
+        tx.write_all(&[0x01, 0x2A]).await.unwrap();
         let err = read_rtu_frame(&mut rx).await.unwrap_err();
         assert!(err.is_protocol_error());
+    }
+
+    #[tokio::test]
+    async fn reads_mask_write_echo_frame() {
+        // FC 0x16 echo: addr(2) + and(2) + or(2)
+        let frame = with_crc(&[0x01, 0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25]);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&frame).await.unwrap();
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        assert_eq!(got, frame);
+    }
+
+    #[tokio::test]
+    async fn reads_read_write_multiple_frame() {
+        // FC 0x17 response has the same byte-count shape as FC03
+        let frame = with_crc(&[0x01, 0x17, 0x04, 0x12, 0x34, 0x56, 0x78]);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&frame).await.unwrap();
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        assert_eq!(got, frame);
+    }
+
+    #[tokio::test]
+    async fn reads_device_identification_frame() {
+        // FC 0x2B response with two objects: VendorName="AB", ProductCode="C"
+        let body = [
+            0x01, 0x2B, // slave, fc
+            0x0E, 0x01, 0x01, // MEI type, read code, conformity
+            0x00, 0x00, 0x02, // more follows, next id, object count
+            0x00, 0x02, b'A', b'B', // object 0: len 2
+            0x01, 0x01, b'C', // object 1: len 1
+        ];
+        let frame = with_crc(&body);
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        tx.write_all(&frame).await.unwrap();
+        let got = read_rtu_frame(&mut rx).await.unwrap();
+        assert_eq!(got, frame);
     }
 }
 

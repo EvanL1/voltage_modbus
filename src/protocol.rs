@@ -1,7 +1,7 @@
 //! # Modbus Protocol Implementation
 //!
 //! This module provides comprehensive Modbus protocol support including:
-//! - Standard Modbus function codes (0x01-0x10)  
+//! - Standard Modbus function codes (0x01-0x10, 0x16, 0x17, 0x2B)
 //! - Request and response message structures
 //! - Data type conversions and validation
 //! - Exception handling and error codes
@@ -10,15 +10,20 @@
 //!
 //! ### Read Functions
 //! - **0x01**: Read Coils - Read 1 to 2000 contiguous coils
-//! - **0x02**: Read Discrete Inputs - Read 1 to 2000 contiguous discrete inputs  
+//! - **0x02**: Read Discrete Inputs - Read 1 to 2000 contiguous discrete inputs
 //! - **0x03**: Read Holding Registers - Read 1 to 125 contiguous holding registers
 //! - **0x04**: Read Input Registers - Read 1 to 125 contiguous input registers
 //!
-//! ### Write Functions  
+//! ### Write Functions
 //! - **0x05**: Write Single Coil - Write a single coil ON or OFF
 //! - **0x06**: Write Single Register - Write a single 16-bit register
 //! - **0x0F**: Write Multiple Coils - Write multiple coils (1 to 1968)
 //! - **0x10**: Write Multiple Registers - Write multiple registers (1 to 123)
+//!
+//! ### Extended Functions
+//! - **0x16**: Mask Write Register - Atomic read-modify-write via AND/OR masks
+//! - **0x17**: Read/Write Multiple Registers - Write then read in one transaction
+//! - **0x2B**: Read Device Identification (MEI 0x0E) - Vendor/product/revision objects
 //!
 //! ## Usage Examples
 //!
@@ -96,11 +101,13 @@
 /// (required for `ModbusRequest`/`ModbusResponse` which own heap-allocated data),
 /// and `core::fmt` for `Display` implementations.
 #[cfg(not(feature = "std"))]
-use alloc::{format, string::ToString, vec::Vec};
+use alloc::{format, string::ToString, vec, vec::Vec};
 
 use core::fmt;
 
+use crate::constants::MEI_READ_DEVICE_ID;
 use crate::error::{ModbusError, ModbusResult};
+use crate::pdu::ModbusPdu;
 
 /// Modbus address type (0-65535)
 pub type ModbusAddress = u16;
@@ -132,6 +139,12 @@ pub enum ModbusFunction {
     WriteMultipleCoils = 0x0F,
     /// Write Multiple Registers (0x10)
     WriteMultipleRegisters = 0x10,
+    /// Mask Write Register (0x16)
+    MaskWriteRegister = 0x16,
+    /// Read/Write Multiple Registers (0x17) — write is performed before read
+    ReadWriteMultipleRegisters = 0x17,
+    /// Read Device Identification (0x2B, MEI type 0x0E)
+    ReadDeviceIdentification = 0x2B,
 }
 
 impl ModbusFunction {
@@ -146,6 +159,9 @@ impl ModbusFunction {
             0x06 => Ok(ModbusFunction::WriteSingleRegister),
             0x0F => Ok(ModbusFunction::WriteMultipleCoils),
             0x10 => Ok(ModbusFunction::WriteMultipleRegisters),
+            0x16 => Ok(ModbusFunction::MaskWriteRegister),
+            0x17 => Ok(ModbusFunction::ReadWriteMultipleRegisters),
+            0x2B => Ok(ModbusFunction::ReadDeviceIdentification),
             _ => Err(ModbusError::invalid_function(value)),
         }
     }
@@ -155,7 +171,11 @@ impl ModbusFunction {
         self as u8
     }
 
-    /// Check if this is a read function
+    /// Check if this function reads data (its request carries a read
+    /// address/quantity and its response returns data).
+    ///
+    /// Note: `ReadWriteMultipleRegisters` counts as a read — its primary
+    /// address/quantity fields describe the read side.
     pub fn is_read_function(self) -> bool {
         matches!(
             self,
@@ -163,10 +183,12 @@ impl ModbusFunction {
                 | ModbusFunction::ReadDiscreteInputs
                 | ModbusFunction::ReadHoldingRegisters
                 | ModbusFunction::ReadInputRegisters
+                | ModbusFunction::ReadWriteMultipleRegisters
         )
     }
 
-    /// Check if this is a write function
+    /// Check if this is a pure write function (no data returned beyond the
+    /// echo). Only pure writes may be broadcast (slave_id = 0).
     pub fn is_write_function(self) -> bool {
         matches!(
             self,
@@ -174,6 +196,7 @@ impl ModbusFunction {
                 | ModbusFunction::WriteSingleRegister
                 | ModbusFunction::WriteMultipleCoils
                 | ModbusFunction::WriteMultipleRegisters
+                | ModbusFunction::MaskWriteRegister
         )
     }
 }
@@ -189,6 +212,9 @@ impl fmt::Display for ModbusFunction {
             ModbusFunction::WriteSingleRegister => "Write Single Register",
             ModbusFunction::WriteMultipleCoils => "Write Multiple Coils",
             ModbusFunction::WriteMultipleRegisters => "Write Multiple Registers",
+            ModbusFunction::MaskWriteRegister => "Mask Write Register",
+            ModbusFunction::ReadWriteMultipleRegisters => "Read/Write Multiple Registers",
+            ModbusFunction::ReadDeviceIdentification => "Read Device Identification",
         };
         write!(f, "{} (0x{:02X})", name, *self as u8)
     }
@@ -328,6 +354,142 @@ impl ModbusRequest {
         }
     }
 
+    /// Create a mask-write-register request (FC 0x16).
+    ///
+    /// The device computes `(current & and_mask) | (or_mask & !and_mask)`
+    /// atomically, avoiding the read-modify-write race of FC03 + FC06.
+    pub fn new_mask_write(
+        slave_id: SlaveId,
+        address: ModbusAddress,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> Self {
+        let mut data = Vec::with_capacity(4);
+        data.extend_from_slice(&and_mask.to_be_bytes());
+        data.extend_from_slice(&or_mask.to_be_bytes());
+        Self {
+            slave_id,
+            function: ModbusFunction::MaskWriteRegister,
+            address,
+            quantity: 1,
+            data,
+        }
+    }
+
+    /// Create a read/write-multiple-registers request (FC 0x17).
+    ///
+    /// The device performs the write **before** the read, in a single
+    /// transaction. `address`/`quantity` fields hold the read side; the write
+    /// side is encoded into `data` as `write_address(2) + write_quantity(2) +
+    /// byte_count(1) + values`.
+    pub fn new_read_write_multiple(
+        slave_id: SlaveId,
+        read_address: ModbusAddress,
+        read_quantity: u16,
+        write_address: ModbusAddress,
+        values: &[u16],
+    ) -> Self {
+        let mut data = Vec::with_capacity(5 + values.len() * 2);
+        data.extend_from_slice(&write_address.to_be_bytes());
+        data.extend_from_slice(&(values.len() as u16).to_be_bytes());
+        data.push((values.len() * 2) as u8);
+        for &value in values {
+            data.extend_from_slice(&value.to_be_bytes());
+        }
+        Self {
+            slave_id,
+            function: ModbusFunction::ReadWriteMultipleRegisters,
+            address: read_address,
+            quantity: read_quantity,
+            data,
+        }
+    }
+
+    /// Create a read-device-identification request (FC 0x2B / MEI 0x0E).
+    ///
+    /// `read_code`: 1 = basic objects, 2 = regular, 3 = extended,
+    /// 4 = one specific object. `object_id` is the object to start from
+    /// (0x00 VendorName, 0x01 ProductCode, 0x02 MajorMinorRevision, ...).
+    pub fn new_read_device_identification(slave_id: SlaveId, read_code: u8, object_id: u8) -> Self {
+        Self {
+            slave_id,
+            function: ModbusFunction::ReadDeviceIdentification,
+            address: 0,
+            quantity: 0,
+            data: vec![MEI_READ_DEVICE_ID, read_code, object_id],
+        }
+    }
+
+    /// Encode this request's PDU — function code + payload, excluding all
+    /// transport framing (no unit/slave id, MBAP header, CRC or LRC).
+    ///
+    /// Every transport (TCP, RTU, ASCII, RTU-over-TCP, embedded) shares this
+    /// encoder, so adding a function code here enables it everywhere at once.
+    pub fn encode_pdu(&self) -> ModbusResult<ModbusPdu> {
+        let mut pdu = ModbusPdu::new();
+        pdu.push(self.function.to_u8())?;
+
+        match self.function {
+            ModbusFunction::ReadCoils
+            | ModbusFunction::ReadDiscreteInputs
+            | ModbusFunction::ReadHoldingRegisters
+            | ModbusFunction::ReadInputRegisters => {
+                pdu.push_u16(self.address)?;
+                pdu.push_u16(self.quantity)?;
+            }
+
+            ModbusFunction::WriteSingleCoil => {
+                pdu.push_u16(self.address)?;
+                let value: u16 = if !self.data.is_empty() && self.data[0] != 0 {
+                    0xFF00
+                } else {
+                    0x0000
+                };
+                pdu.push_u16(value)?;
+            }
+
+            ModbusFunction::WriteSingleRegister => {
+                pdu.push_u16(self.address)?;
+                if self.data.len() >= 2 {
+                    pdu.extend(&self.data[..2])?;
+                } else {
+                    pdu.extend(&[0, 0])?;
+                }
+            }
+
+            ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
+                pdu.push_u16(self.address)?;
+                pdu.push_u16(self.quantity)?;
+                let byte_count = u8::try_from(self.data.len()).map_err(|_| {
+                    ModbusError::invalid_data("data payload too large for Modbus frame")
+                })?;
+                pdu.push(byte_count)?;
+                pdu.extend(&self.data)?;
+            }
+
+            ModbusFunction::MaskWriteRegister => {
+                // data = and_mask(2) + or_mask(2), validated in validate()
+                pdu.push_u16(self.address)?;
+                pdu.extend(&self.data)?;
+            }
+
+            ModbusFunction::ReadWriteMultipleRegisters => {
+                // address/quantity = read side;
+                // data = write_address(2) + write_quantity(2) + byte_count(1) + values
+                pdu.push_u16(self.address)?;
+                pdu.push_u16(self.quantity)?;
+                pdu.extend(&self.data)?;
+            }
+
+            ModbusFunction::ReadDeviceIdentification => {
+                // data = MEI type(1) + ReadDeviceId code(1) + object id(1)
+                pdu.extend(&self.data)?;
+            }
+        }
+
+        Ok(pdu)
+    }
+
     /// Validate the request
     pub fn validate(&self) -> ModbusResult<()> {
         // Validate slave ID — 0 is the broadcast address (valid for write only), 1–247 are unicast
@@ -338,9 +500,9 @@ impl ModbusRequest {
             )));
         }
 
-        // Broadcast (slave_id = 0) is only valid for write operations per Modbus spec.
-        // Read operations make no sense for broadcast because there is no response.
-        if self.slave_id == 0 && self.function.is_read_function() {
+        // Broadcast (slave_id = 0) is only valid for pure write operations per
+        // the Modbus spec — any function that returns data has no way to reply.
+        if self.slave_id == 0 && !self.function.is_write_function() {
             return Err(ModbusError::invalid_data(
                 "Broadcast (slave_id=0) is only valid for write operations",
             ));
@@ -361,6 +523,14 @@ impl ModbusRequest {
                 }
                 ModbusFunction::ReadHoldingRegisters | ModbusFunction::ReadInputRegisters => {
                     if self.quantity > crate::MAX_READ_REGISTERS as u16 {
+                        return Err(ModbusError::invalid_data(format!(
+                            "Too many registers requested: {}",
+                            self.quantity
+                        )));
+                    }
+                }
+                ModbusFunction::ReadWriteMultipleRegisters => {
+                    if self.quantity > crate::constants::MAX_RW_READ_REGISTERS as u16 {
                         return Err(ModbusError::invalid_data(format!(
                             "Too many registers requested: {}",
                             self.quantity
@@ -425,6 +595,56 @@ impl ModbusRequest {
                         "Invalid register payload length: expected {}, got {}",
                         expected_bytes,
                         self.data.len()
+                    )));
+                }
+            }
+            ModbusFunction::MaskWriteRegister => {
+                validate_address_range(self.address, 1)?;
+                if self.data.len() != 4 {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid mask write payload length: expected 4 (and+or masks), got {}",
+                        self.data.len()
+                    )));
+                }
+            }
+            ModbusFunction::ReadWriteMultipleRegisters => {
+                // data = write_address(2) + write_quantity(2) + byte_count(1) + values
+                if self.data.len() < 5 {
+                    return Err(ModbusError::invalid_data(
+                        "Read/write multiple payload too short",
+                    ));
+                }
+                let write_address = u16::from_be_bytes([self.data[0], self.data[1]]);
+                let write_quantity = u16::from_be_bytes([self.data[2], self.data[3]]);
+                let byte_count = usize::from(self.data[4]);
+                if write_quantity == 0
+                    || write_quantity > crate::constants::MAX_RW_WRITE_REGISTERS as u16
+                {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid read/write multiple write quantity: {}",
+                        write_quantity
+                    )));
+                }
+                validate_address_range(write_address, write_quantity)?;
+                if byte_count != usize::from(write_quantity) * 2
+                    || self.data.len() != 5 + byte_count
+                {
+                    return Err(ModbusError::invalid_data(
+                        "Invalid read/write multiple payload length",
+                    ));
+                }
+            }
+            ModbusFunction::ReadDeviceIdentification => {
+                // data = MEI type(1) + ReadDeviceId code(1) + object id(1)
+                if self.data.len() != 3 || self.data[0] != MEI_READ_DEVICE_ID {
+                    return Err(ModbusError::invalid_data(
+                        "Invalid device identification payload (expect MEI 0x0E + code + object id)",
+                    ));
+                }
+                if !(1..=4).contains(&self.data[1]) {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Invalid ReadDeviceId code: {} (must be 1-4)",
+                        self.data[1]
                     )));
                 }
             }
@@ -597,6 +817,14 @@ impl ModbusResponse {
         Ok(registers)
     }
 
+    /// Parse response data as a device identification block (FC 0x2B / MEI 0x0E)
+    pub fn parse_device_identification(&self) -> ModbusResult<DeviceIdentification> {
+        if self.is_exception() {
+            return Err(self.get_exception().unwrap());
+        }
+        DeviceIdentification::parse(self.data())
+    }
+
     /// Parse response data as bits (bool values)
     pub fn parse_bits(&self) -> ModbusResult<Vec<bool>> {
         if self.is_exception() {
@@ -621,6 +849,96 @@ impl ModbusResponse {
         }
 
         Ok(bits)
+    }
+}
+
+/// A single device-identification object (FC 0x2B / MEI 0x0E)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceIdObject {
+    /// Object id: 0x00 VendorName, 0x01 ProductCode, 0x02 MajorMinorRevision,
+    /// 0x03 VendorUrl, 0x04 ProductName, 0x05 ModelName, 0x06 UserApplicationName,
+    /// 0x80+ device-specific
+    pub id: u8,
+    /// Raw object value (usually ASCII text)
+    pub value: Vec<u8>,
+}
+
+impl DeviceIdObject {
+    /// Object value as UTF-8 text, if valid
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.value).ok()
+    }
+}
+
+/// Parsed read-device-identification response (FC 0x2B / MEI 0x0E)
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeviceIdentification {
+    /// Conformity level reported by the device (0x01-0x03, 0x81-0x83)
+    pub conformity_level: u8,
+    /// `true` when more objects remain than fit in this response; issue a
+    /// follow-up request starting at [`Self::next_object_id`]
+    pub more_follows: bool,
+    /// Object id to continue from when `more_follows` is set
+    pub next_object_id: u8,
+    /// Objects returned in this response
+    pub objects: Vec<DeviceIdObject>,
+}
+
+impl DeviceIdentification {
+    /// Parse from a response PDU payload (the bytes after the 0x2B function code):
+    /// `MEI type(1) + read code(1) + conformity(1) + more follows(1) +
+    /// next object id(1) + object count(1) + [id(1) len(1) value(len)]...`
+    pub fn parse(data: &[u8]) -> ModbusResult<Self> {
+        if data.len() < 6 {
+            return Err(ModbusError::frame(
+                "Device identification response too short",
+            ));
+        }
+        if data[0] != MEI_READ_DEVICE_ID {
+            return Err(ModbusError::frame(format!(
+                "Unexpected MEI type: 0x{:02X} (expected 0x0E)",
+                data[0]
+            )));
+        }
+
+        let conformity_level = data[2];
+        let more_follows = data[3] == 0xFF;
+        let next_object_id = data[4];
+        let object_count = usize::from(data[5]);
+
+        let mut objects = Vec::with_capacity(object_count);
+        let mut pos = 6;
+        for _ in 0..object_count {
+            if pos + 2 > data.len() {
+                return Err(ModbusError::frame("Truncated device identification object"));
+            }
+            let id = data[pos];
+            let len = usize::from(data[pos + 1]);
+            pos += 2;
+            if pos + len > data.len() {
+                return Err(ModbusError::frame("Truncated device identification value"));
+            }
+            objects.push(DeviceIdObject {
+                id,
+                value: data[pos..pos + len].to_vec(),
+            });
+            pos += len;
+        }
+
+        Ok(Self {
+            conformity_level,
+            more_follows,
+            next_object_id,
+            objects,
+        })
+    }
+
+    /// Look up an object's raw value by id
+    pub fn object(&self, id: u8) -> Option<&[u8]> {
+        self.objects
+            .iter()
+            .find(|obj| obj.id == id)
+            .map(|obj| obj.value.as_slice())
     }
 }
 
@@ -885,5 +1203,116 @@ mod tests {
     fn test_invalid_slave_id_above_247() {
         let req = ModbusRequest::new_read(248, ModbusFunction::ReadHoldingRegisters, 0, 1);
         assert!(req.validate().is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared PDU encoder
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_encode_pdu_known_bytes() {
+        let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0x006B, 3);
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x03, 0x00, 0x6B, 0x00, 0x03]
+        );
+
+        // FC05 write coil ON normalizes to 0xFF00
+        let req = ModbusRequest::new_write(1, ModbusFunction::WriteSingleCoil, 0x00AC, vec![0x01]);
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x05, 0x00, 0xAC, 0xFF, 0x00]
+        );
+
+        let req = ModbusRequest {
+            slave_id: 1,
+            function: ModbusFunction::WriteMultipleRegisters,
+            address: 0x0001,
+            quantity: 2,
+            data: vec![0x00, 0x0A, 0x01, 0x02],
+        };
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn test_encode_pdu_mask_write() {
+        // Spec example: address 4, and 0x00F2, or 0x0025
+        let req = ModbusRequest::new_mask_write(1, 0x0004, 0x00F2, 0x0025);
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x16, 0x00, 0x04, 0x00, 0xF2, 0x00, 0x25]
+        );
+    }
+
+    #[test]
+    fn test_encode_pdu_read_write_multiple() {
+        // Spec example shape: read 6 regs from 3, write [0x00FF] at 14
+        let req = ModbusRequest::new_read_write_multiple(1, 0x0003, 6, 0x000E, &[0x00FF]);
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x17, 0x00, 0x03, 0x00, 0x06, 0x00, 0x0E, 0x00, 0x01, 0x02, 0x00, 0xFF]
+        );
+    }
+
+    #[test]
+    fn test_encode_pdu_device_identification() {
+        let req = ModbusRequest::new_read_device_identification(1, 1, 0);
+        assert!(req.validate().is_ok());
+        assert_eq!(
+            req.encode_pdu().unwrap().as_slice(),
+            &[0x2B, 0x0E, 0x01, 0x00]
+        );
+    }
+
+    #[test]
+    fn test_new_fc_broadcast_rules() {
+        // Mask write is a pure write → broadcast allowed
+        assert!(ModbusRequest::new_mask_write(0, 0, 0xFFFF, 0)
+            .validate()
+            .is_ok());
+        // FC17 and FC2B return data → broadcast rejected
+        assert!(ModbusRequest::new_read_write_multiple(0, 0, 1, 0, &[1])
+            .validate()
+            .is_err());
+        assert!(ModbusRequest::new_read_device_identification(0, 1, 0)
+            .validate()
+            .is_err());
+    }
+
+    #[test]
+    fn test_read_write_multiple_validation_limits() {
+        // Read quantity above 125 rejected
+        let req = ModbusRequest::new_read_write_multiple(1, 0, 126, 0, &[1]);
+        assert!(req.validate().is_err());
+        // Write quantity above 121 rejected
+        let values = [0u16; 122];
+        let req = ModbusRequest::new_read_write_multiple(1, 0, 1, 0, &values);
+        assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_device_identification_parse() {
+        let data = [
+            0x0E, 0x01, 0x01, 0x00, 0x00,
+            0x03, // header: mei, code, conformity, more, next, count
+            0x00, 0x07, b'V', b'e', b'n', b'd', b'o', b'r', b'X', // VendorName
+            0x01, 0x02, b'P', b'C', // ProductCode
+            0x02, 0x04, b'V', b'2', b'.', b'1', // Revision
+        ];
+        let ident = DeviceIdentification::parse(&data).unwrap();
+        assert_eq!(ident.conformity_level, 0x01);
+        assert!(!ident.more_follows);
+        assert_eq!(ident.objects.len(), 3);
+        assert_eq!(ident.object(0x00), Some(&b"VendorX"[..]));
+        assert_eq!(ident.objects[2].as_str(), Some("V2.1"));
+
+        // Truncated object must error, not panic
+        assert!(DeviceIdentification::parse(&data[..8]).is_err());
+        assert!(DeviceIdentification::parse(&data[..3]).is_err());
     }
 }

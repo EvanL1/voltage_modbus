@@ -66,6 +66,80 @@ use crate::transport::{ModbusTransport, TcpTransport, TransportStats};
 #[cfg(feature = "rtu")]
 use crate::transport::RtuTransport;
 
+/// Retry policy for recoverable request failures.
+///
+/// Applied by [`GenericModbusClient`] around every request: transient errors
+/// (timeouts, connection loss, device-busy exceptions — see
+/// [`ModbusError::is_recoverable`]) are retried with exponential backoff,
+/// while permanent errors (illegal address, CRC mismatch, response validation
+/// failures) fail immediately. The default policy performs no retries, so
+/// existing behavior is unchanged unless a policy is installed.
+///
+/// All standard write functions are idempotent (they set absolute values),
+/// so retrying a write after a timeout is safe.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use voltage_modbus::{ModbusTcpClient, RetryPolicy};
+/// use std::time::Duration;
+///
+/// # async fn example() -> voltage_modbus::ModbusResult<()> {
+/// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
+/// client.set_retry_policy(RetryPolicy::new(3)); // up to 3 retries, 100ms..2s backoff
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryPolicy {
+    /// Extra attempts after the first failure (0 = no retries)
+    pub max_retries: u32,
+    /// Backoff before the first retry; doubles on each subsequent retry
+    pub initial_backoff: Duration,
+    /// Upper bound on the backoff between attempts
+    pub max_backoff: Duration,
+}
+
+impl RetryPolicy {
+    /// No retries — every error is returned immediately (the default)
+    pub const fn none() -> Self {
+        Self {
+            max_retries: 0,
+            initial_backoff: Duration::ZERO,
+            max_backoff: Duration::ZERO,
+        }
+    }
+
+    /// Retry up to `max_retries` times, starting at 100 ms backoff and
+    /// doubling up to 2 s
+    pub const fn new(max_retries: u32) -> Self {
+        Self {
+            max_retries,
+            initial_backoff: Duration::from_millis(100),
+            max_backoff: Duration::from_secs(2),
+        }
+    }
+
+    /// Fully custom policy
+    pub const fn with_backoff(
+        max_retries: u32,
+        initial_backoff: Duration,
+        max_backoff: Duration,
+    ) -> Self {
+        Self {
+            max_retries,
+            initial_backoff,
+            max_backoff,
+        }
+    }
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self::none()
+    }
+}
+
 /// Trait defining the interface for Modbus client operations.
 ///
 /// This trait provides async methods for all standard Modbus functions,
@@ -642,6 +716,7 @@ pub trait ModbusClient: Send + Sync {
 pub struct GenericModbusClient<T: ModbusTransport> {
     transport: T,
     logger: Option<CallbackLogger>,
+    retry_policy: RetryPolicy,
 }
 
 impl<T: ModbusTransport> GenericModbusClient<T> {
@@ -650,6 +725,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         Self {
             transport,
             logger: None,
+            retry_policy: RetryPolicy::none(),
         }
     }
 
@@ -658,6 +734,7 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         Self {
             transport,
             logger: Some(logger),
+            retry_policy: RetryPolicy::none(),
         }
     }
 
@@ -671,19 +748,56 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         &mut self.transport
     }
 
-    /// Execute a raw request
+    /// Set the retry policy applied to every request
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.retry_policy = policy;
+    }
+
+    /// Builder-style variant of [`Self::set_retry_policy`]
+    pub fn with_retry_policy(mut self, policy: RetryPolicy) -> Self {
+        self.retry_policy = policy;
+        self
+    }
+
+    /// Execute a raw request, applying the configured [`RetryPolicy`] to
+    /// recoverable failures (timeouts, connection loss, device-busy).
     pub async fn execute_request(
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
-        // Reject broadcast reads early — no response would ever arrive.
-        if request.slave_id == 0 && request.function.is_read_function() {
+        // Reject broadcast for non-write functions early — no response would ever arrive.
+        if request.slave_id == 0 && !request.function.is_write_function() {
             return Err(ModbusError::invalid_data(
                 "Broadcast (slave_id=0) is only valid for write operations",
             ));
         }
         request.validate()?;
 
+        let mut attempt: u32 = 0;
+        let mut backoff = self.retry_policy.initial_backoff;
+        loop {
+            match self.try_request_once(&request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is_recoverable() && attempt < self.retry_policy.max_retries => {
+                    attempt += 1;
+                    tracing::debug!(
+                        attempt = attempt,
+                        max_retries = self.retry_policy.max_retries,
+                        error = %error,
+                        "modbus.request.retry"
+                    );
+                    if backoff > Duration::ZERO {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(self.retry_policy.max_backoff);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// One request/response attempt including response validation and logging
+    async fn try_request_once(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         // Log request if logger is available
         // Note: For accurate packet logging with real TID, use transport.set_packet_callback()
         if let Some(ref logger) = self.logger {
@@ -700,8 +814,8 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
         // For broadcast writes (slave_id = 0) the transport layer returns a synthetic
         // ack immediately without waiting for a response (Modbus spec: no reply expected).
         // Regular unicast requests wait for the real device response.
-        let response = self.transport.request(&request).await?;
-        validate_response_matches_request(&request, &response)?;
+        let response = self.transport.request(request).await?;
+        validate_response_matches_request(request, &response)?;
 
         // Log response if logger is available
         if let Some(ref logger) = self.logger {
@@ -771,6 +885,35 @@ fn validate_response_matches_request(
         }
         ModbusFunction::WriteMultipleCoils | ModbusFunction::WriteMultipleRegisters => {
             validate_write_echo(response, request.address, request.quantity)
+        }
+        ModbusFunction::MaskWriteRegister => {
+            // Response echoes the request: address(2) + and_mask(2) + or_mask(2)
+            let data = response.data();
+            if data.len() != 6 {
+                return Err(ModbusError::frame(format!(
+                    "Invalid mask write response length: expected 6, got {}",
+                    data.len()
+                )));
+            }
+            if data[0..2] != request.address.to_be_bytes() || data[2..6] != request.data[..] {
+                return Err(ModbusError::protocol(
+                    "Mask write echo mismatch: device returned different address or masks",
+                ));
+            }
+            Ok(())
+        }
+        ModbusFunction::ReadWriteMultipleRegisters => {
+            // Response carries the read side: byte_count + registers
+            validate_read_byte_count(request, response, usize::from(request.quantity) * 2)
+        }
+        ModbusFunction::ReadDeviceIdentification => {
+            let data = response.data();
+            if data.len() < 6 || data[0] != crate::constants::MEI_READ_DEVICE_ID {
+                return Err(ModbusError::frame(
+                    "Invalid device identification response header",
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -1142,6 +1285,102 @@ impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
     }
 }
 
+/// Extended function codes (FC 0x16 / 0x17 / 0x2B), available on any transport
+impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
+    /// Mask write register (function code 0x16).
+    ///
+    /// The device atomically computes
+    /// `(current & and_mask) | (or_mask & !and_mask)`, avoiding the
+    /// read-modify-write race of a separate FC03 + FC06 sequence.
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        let request = ModbusRequest::new_mask_write(slave_id, address, and_mask, or_mask);
+        self.execute_request(request).await?;
+        Ok(())
+    }
+
+    /// Alias for [`Self::write_16`] — mask write register
+    #[inline]
+    pub async fn mask_write_register(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.write_16(slave_id, address, and_mask, or_mask).await
+    }
+
+    /// Read/write multiple registers (function code 0x17).
+    ///
+    /// Writes `values` at `write_address` and reads `read_quantity` registers
+    /// from `read_address` in one transaction; per spec, the device performs
+    /// the write **before** the read.
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        if read_quantity == 0
+            || usize::from(read_quantity) > crate::constants::MAX_RW_READ_REGISTERS
+        {
+            return Err(ModbusError::invalid_data("Invalid read quantity"));
+        }
+        if values.is_empty() || values.len() > crate::constants::MAX_RW_WRITE_REGISTERS {
+            return Err(ModbusError::invalid_data("Invalid write quantity"));
+        }
+
+        let request = ModbusRequest::new_read_write_multiple(
+            slave_id,
+            read_address,
+            read_quantity,
+            write_address,
+            values,
+        );
+        let response = self.execute_request(request).await?;
+        response.parse_registers()
+    }
+
+    /// Alias for [`Self::read_write_17`] — read/write multiple registers
+    #[inline]
+    pub async fn read_write_multiple_registers(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (function code 0x2B / MEI type 0x0E).
+    ///
+    /// `read_code`: 1 = basic objects (VendorName / ProductCode / Revision),
+    /// 2 = regular, 3 = extended, 4 = one specific object. When the returned
+    /// block has `more_follows` set, issue a follow-up call starting at its
+    /// `next_object_id`.
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        let request = ModbusRequest::new_read_device_identification(slave_id, read_code, object_id);
+        let response = self.execute_request(request).await?;
+        response.parse_device_identification()
+    }
+}
+
 /// Modbus TCP client implementation using the generic client
 pub struct ModbusTcpClient {
     inner: GenericModbusClient<TcpTransport>,
@@ -1195,6 +1434,11 @@ impl ModbusTcpClient {
     /// Enable or disable packet logging on existing client
     pub fn set_packet_logging(&mut self, enabled: bool) {
         self.inner.transport_mut().set_packet_logging(enabled);
+    }
+
+    /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.inner.set_retry_policy(policy);
     }
 
     /// Execute a raw request
@@ -1346,6 +1590,46 @@ impl ModbusTcpClient {
 
         Ok(results)
     }
+
+    /// Mask write register (FC 0x16) — see [`GenericModbusClient::write_16`]
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17) — see [`GenericModbusClient::read_write_17`]
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E) —
+    /// see [`GenericModbusClient::read_device_identification`]
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
+    }
 }
 
 impl ModbusClient for ModbusTcpClient {
@@ -1488,12 +1772,57 @@ impl ModbusRtuClient {
         self.inner.transport_mut().set_packet_logging(enabled);
     }
 
+    /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.inner.set_retry_policy(policy);
+    }
+
     /// Execute a raw request
     pub async fn execute_request(
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
         self.inner.execute_request(request).await
+    }
+
+    /// Mask write register (FC 0x16) — see [`GenericModbusClient::write_16`]
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17) — see [`GenericModbusClient::read_write_17`]
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E) —
+    /// see [`GenericModbusClient::read_device_identification`]
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
     }
 }
 
@@ -1524,12 +1853,57 @@ impl ModbusRtuOverTcpClient {
         })
     }
 
+    /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.inner.set_retry_policy(policy);
+    }
+
     /// Execute a raw request.
     pub async fn execute_request(
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
         self.inner.execute_request(request).await
+    }
+
+    /// Mask write register (FC 0x16) — see [`GenericModbusClient::write_16`]
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17) — see [`GenericModbusClient::read_write_17`]
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E) —
+    /// see [`GenericModbusClient::read_device_identification`]
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
     }
 }
 
@@ -1630,12 +2004,57 @@ impl ModbusAsciiClient {
         self.inner.transport()
     }
 
+    /// Set the retry policy for recoverable failures — see [`RetryPolicy`]
+    pub fn set_retry_policy(&mut self, policy: RetryPolicy) {
+        self.inner.set_retry_policy(policy);
+    }
+
     /// Execute a raw request.
     pub async fn execute_request(
         &mut self,
         request: ModbusRequest,
     ) -> ModbusResult<ModbusResponse> {
         self.inner.execute_request(request).await
+    }
+
+    /// Mask write register (FC 0x16) — see [`GenericModbusClient::write_16`]
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17) — see [`GenericModbusClient::read_write_17`]
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E) —
+    /// see [`GenericModbusClient::read_device_identification`]
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
     }
 }
 
@@ -2233,6 +2652,136 @@ mod tests {
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].quantity, 500);
         assert_eq!(requests[1].quantity, 100);
+    }
+
+    // =========================================================================
+    // Extended function codes (FC 0x16 / 0x17 / 0x2B)
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_write_16_mask_write_echo() {
+        let mock = MockTransport::new();
+        // Correct echo: addr + and_mask + or_mask
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::MaskWriteRegister,
+            vec![0x00, 0x04, 0x00, 0xF2, 0x00, 0x25],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        client.write_16(1, 4, 0x00F2, 0x0025).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_write_16_rejects_wrong_echo() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::MaskWriteRegister,
+            vec![0x00, 0x04, 0x00, 0x00, 0x00, 0x25], // and_mask differs
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert!(client.write_16(1, 4, 0x00F2, 0x0025).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_write_17_returns_read_registers() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadWriteMultipleRegisters,
+            vec![4, 0x12, 0x34, 0x56, 0x78],
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        let regs = client.read_write_17(1, 0, 2, 100, &[0xAAAA]).await.unwrap();
+        assert_eq!(regs, vec![0x1234, 0x5678]);
+    }
+
+    #[tokio::test]
+    async fn test_read_write_17_rejects_wrong_byte_count() {
+        let mock = MockTransport::new();
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadWriteMultipleRegisters,
+            vec![2, 0x12, 0x34], // 1 register, but 2 were requested
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        assert!(client.read_write_17(1, 0, 2, 100, &[0xAAAA]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_read_device_identification_parses_objects() {
+        let mock = MockTransport::new();
+        let mut data = vec![0x0E, 0x01, 0x01, 0x00, 0x00, 0x01];
+        data.extend_from_slice(&[0x00, 0x04]);
+        data.extend_from_slice(b"ACME");
+        mock.add_response(Ok(ModbusResponse::new_success(
+            1,
+            ModbusFunction::ReadDeviceIdentification,
+            data,
+        )));
+        let mut client = GenericModbusClient::new(mock);
+        let ident = client.read_device_identification(1, 1, 0).await.unwrap();
+        assert_eq!(ident.objects.len(), 1);
+        assert_eq!(ident.object(0x00), Some(&b"ACME"[..]));
+        assert!(!ident.more_follows);
+    }
+
+    // =========================================================================
+    // RetryPolicy tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_retry_recovers_after_transient_timeout() {
+        let mock = MockTransport::new();
+        mock.add_response(Err(ModbusError::timeout("simulated", 100)));
+        mock.add_response(Ok(create_register_response(1, &[0x1234])));
+
+        let mut client = GenericModbusClient::new(mock)
+            .with_retry_policy(RetryPolicy::with_backoff(2, Duration::ZERO, Duration::ZERO));
+
+        let regs = client.read_03(1, 0, 1).await.unwrap();
+        assert_eq!(regs, vec![0x1234]);
+        assert_eq!(client.transport().get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_by_default() {
+        let mock = MockTransport::new();
+        mock.add_response(Err(ModbusError::timeout("simulated", 100)));
+        mock.add_response(Ok(create_register_response(1, &[0x1234])));
+
+        let mut client = GenericModbusClient::new(mock);
+        assert!(client.read_03(1, 0, 1).await.is_err());
+        assert_eq!(client.transport().get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_no_retry_for_permanent_errors() {
+        let mock = MockTransport::new();
+        // Illegal data address exception — not recoverable, must not be retried
+        mock.add_response(Err(ModbusError::exception(0x03, 0x02)));
+        mock.add_response(Ok(create_register_response(1, &[0x1234])));
+
+        let mut client = GenericModbusClient::new(mock)
+            .with_retry_policy(RetryPolicy::with_backoff(3, Duration::ZERO, Duration::ZERO));
+
+        assert!(client.read_03(1, 0, 1).await.is_err());
+        assert_eq!(client.transport().get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_retry_gives_up_after_max_retries() {
+        let mock = MockTransport::new();
+        for _ in 0..5 {
+            mock.add_response(Err(ModbusError::timeout("simulated", 100)));
+        }
+
+        let mut client = GenericModbusClient::new(mock)
+            .with_retry_policy(RetryPolicy::with_backoff(2, Duration::ZERO, Duration::ZERO));
+
+        assert!(client.read_03(1, 0, 1).await.is_err());
+        // 1 initial attempt + 2 retries
+        assert_eq!(client.transport().get_requests().len(), 3);
     }
 
     // =========================================================================

@@ -51,9 +51,9 @@ Client methods use function-code naming as primary (`read_03`, `write_06`) with 
 
 ### Module Responsibilities
 
-- **`client.rs`**: `ModbusClient` trait, `GenericModbusClient<T>`, `ModbusTcpClient`, `ModbusRtuClient`, batch read methods
-- **`transport.rs`**: `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID, pipelining), `RtuTransport` (CRC-16, frame gap timing), `TransportStats`, `PacketCallback`
-- **`server.rs`**: `ModbusTcpServer` — TCP server implementation backed by `RegisterBank`
+- **`client.rs`**: `ModbusClient` trait, `GenericModbusClient<T>`, `ModbusTcpClient`, `ModbusRtuClient`, batch read methods, `RetryPolicy` (opt-in retry with exponential backoff for recoverable errors), extended FCs (`write_16` mask write, `read_write_17`, `read_device_identification`)
+- **`transport.rs`**: `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID, pipelining), `RtuTransport` (CRC-16, spec t3.5 frame gap, length-aware frame reads), `TransportStats`, `PacketCallback`. PDU bodies come from the shared `ModbusRequest::encode_pdu()` — add new function codes there, not per-transport
+- **`server.rs`**: `ModbusTcpServer` / `ModbusRtuServer`, plus the `ModbusService` trait — servers dispatch raw PDUs to a service; `ModbusRegisterBank` is the default in-memory implementation, `set_service()` swaps in custom logic
 - **`register_bank.rs`**: `RegisterBank` — server-side storage for coils / discrete inputs / holding / input registers
 - **`protocol.rs`**: `ModbusFunction` enum, `ModbusRequest`/`ModbusResponse` structs, `data_utils` for register/bit conversions
 - **`pdu.rs`**: `ModbusPdu` — stack-allocated fixed-size buffer (253 bytes, no heap), `PduBuilder` fluent API

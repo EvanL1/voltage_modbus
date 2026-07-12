@@ -19,16 +19,19 @@
 //!
 //! ## Supported Function Codes
 //!
-//! | Code | Function | Client |
-//! |------|----------|--------|
-//! | 0x01 | Read Coils | ✅ |
-//! | 0x02 | Read Discrete Inputs | ✅ |
-//! | 0x03 | Read Holding Registers | ✅ |
-//! | 0x04 | Read Input Registers | ✅ |
-//! | 0x05 | Write Single Coil | ✅ |
-//! | 0x06 | Write Single Register | ✅ |
-//! | 0x0F | Write Multiple Coils | ✅ |
-//! | 0x10 | Write Multiple Registers | ✅ |
+//! | Code | Function | Client | Server |
+//! |------|----------|--------|--------|
+//! | 0x01 | Read Coils | ✅ | ✅ |
+//! | 0x02 | Read Discrete Inputs | ✅ | ✅ |
+//! | 0x03 | Read Holding Registers | ✅ | ✅ |
+//! | 0x04 | Read Input Registers | ✅ | ✅ |
+//! | 0x05 | Write Single Coil | ✅ | ✅ |
+//! | 0x06 | Write Single Register | ✅ | ✅ |
+//! | 0x0F | Write Multiple Coils | ✅ | ✅ |
+//! | 0x10 | Write Multiple Registers | ✅ | ✅ |
+//! | 0x16 | Mask Write Register | ✅ | ✅ |
+//! | 0x17 | Read/Write Multiple Registers | ✅ | ✅ |
+//! | 0x2B | Read Device Identification | ✅ | — |
 //!
 //! ## Quick Start (std)
 //!
@@ -172,11 +175,14 @@ pub mod register_bank;
 
 // === Core protocol — always available (no_std compatible) ===
 pub use constants::{
-    MAX_PDU_SIZE, MAX_READ_COILS, MAX_READ_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS,
+    MAX_PDU_SIZE, MAX_READ_COILS, MAX_READ_REGISTERS, MAX_RW_READ_REGISTERS,
+    MAX_RW_WRITE_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS,
 };
 pub use error::{ModbusError, ModbusResult};
 pub use pdu::{ModbusPdu, PduBuilder};
-pub use protocol::{ModbusFunction, ModbusRequest, ModbusResponse, SlaveId};
+pub use protocol::{
+    DeviceIdObject, DeviceIdentification, ModbusFunction, ModbusRequest, ModbusResponse, SlaveId,
+};
 
 // === std-only re-exports ===
 
@@ -184,7 +190,7 @@ pub use protocol::{ModbusFunction, ModbusRequest, ModbusResponse, SlaveId};
 pub use tokio;
 
 #[cfg(feature = "std")]
-pub use client::{GenericModbusClient, ModbusClient, ModbusTcpClient};
+pub use client::{GenericModbusClient, ModbusClient, ModbusTcpClient, RetryPolicy};
 
 #[cfg(feature = "std")]
 pub use bytes::ByteOrder;
@@ -226,7 +232,9 @@ pub use logging::{CallbackLogger, LogCallback, LogLevel, LoggingMode};
 pub use register_bank::{ModbusRegisterBank, RegisterBankStats};
 
 #[cfg(feature = "std")]
-pub use server::{ModbusServer, ModbusTcpServer, ModbusTcpServerConfig, ServerStats};
+pub use server::{
+    ModbusServer, ModbusService, ModbusTcpServer, ModbusTcpServerConfig, ServerStats, ServiceFuture,
+};
 
 // === Hidden but preserved (backward compatibility, std-only) ===
 #[cfg(feature = "std")]
