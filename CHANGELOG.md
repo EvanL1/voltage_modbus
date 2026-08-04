@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-08-04
+
+### Security
+- Updated `bytes` 1.10.1 → 1.12.1 (RUSTSEC-2026-0007: integer overflow in `BytesMut::reserve`) and `crossbeam-epoch` 0.9.18 → 0.9.20 (RUSTSEC-2026-0204: invalid pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`). `crossbeam-epoch` enters the tree only through `criterion`, a dev-dependency, so it never reached the published library build.
+
+### Changed
+- Collapsed three `match` arms whose body was a lone `if` into match guards, clearing the `clippy::collapsible_match` errors that Rust 1.97 began reporting: the FC 0x17 read-quantity check and the FC 0x08 payload check in `protocol.rs`, and FC 0x0F/0x10 response formatting in `logging.rs`. Behavior is unchanged — each of the three arms sits immediately before the catch-all it now falls through to, which is also why clippy flagged only these three of the six structurally similar arms.
+
 ## [0.7.1] - 2026-07-12
 
 ### Fixed
