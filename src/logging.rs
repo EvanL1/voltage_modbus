@@ -436,15 +436,11 @@ impl CallbackLogger {
                     format!("Data: {}", Self::hex_encode(data))
                 }
             }
-            0x0F | 0x10 => {
-                // Write multiple coils/registers response
-                if data.len() >= 4 {
-                    let address = u16::from_be_bytes([data[0], data[1]]);
-                    let quantity = u16::from_be_bytes([data[2], data[3]]);
-                    format!("Address: {}, Quantity: {}", address, quantity)
-                } else {
-                    format!("Data: {}", Self::hex_encode(data))
-                }
+            // Write multiple coils/registers response
+            0x0F | 0x10 if data.len() >= 4 => {
+                let address = u16::from_be_bytes([data[0], data[1]]);
+                let quantity = u16::from_be_bytes([data[2], data[3]]);
+                format!("Address: {}, Quantity: {}", address, quantity)
             }
             _ => {
                 format!("Data: {}", Self::hex_encode(data))

@@ -591,13 +591,13 @@ impl ModbusRequest {
                         )));
                     }
                 }
-                ModbusFunction::ReadWriteMultipleRegisters => {
-                    if self.quantity > crate::constants::MAX_RW_READ_REGISTERS as u16 {
-                        return Err(ModbusError::invalid_data(format!(
-                            "Too many registers requested: {}",
-                            self.quantity
-                        )));
-                    }
+                ModbusFunction::ReadWriteMultipleRegisters
+                    if self.quantity > crate::constants::MAX_RW_READ_REGISTERS as u16 =>
+                {
+                    return Err(ModbusError::invalid_data(format!(
+                        "Too many registers requested: {}",
+                        self.quantity
+                    )));
                 }
                 _ => {}
             }
@@ -720,13 +720,11 @@ impl ModbusRequest {
                     ));
                 }
             }
-            ModbusFunction::Diagnostics => {
-                // data = sub-function(2) + data field(2N)
-                if self.data.len() < 4 || self.data.len() % 2 != 0 {
-                    return Err(ModbusError::invalid_data(
-                        "Invalid diagnostics payload (expect sub-function + 16-bit data)",
-                    ));
-                }
+            // data = sub-function(2) + data field(2N)
+            ModbusFunction::Diagnostics if self.data.len() < 4 || self.data.len() % 2 != 0 => {
+                return Err(ModbusError::invalid_data(
+                    "Invalid diagnostics payload (expect sub-function + 16-bit data)",
+                ));
             }
             _ => {}
         }

@@ -1,7 +1,7 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.7.1
+//! **Version:** 0.7.2
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
