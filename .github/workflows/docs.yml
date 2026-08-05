@@ -58,10 +58,16 @@ jobs:
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
       uses: actions/configure-pages@v5
       with:
-        # The repository had never had Pages enabled, so this step failed with
-        # "Get Pages site failed / Not Found" on every push to main. Letting the
-        # action enable it keeps the setup reproducible instead of depending on
-        # a one-off click in repository settings.
+        # Pages is enabled on this repository (build_type=workflow), so this is
+        # a no-op that simply reads the existing site.
+        #
+        # It cannot bootstrap Pages by itself: `permissions: pages: write` only
+        # authorizes deploying to an *existing* site, while creating one goes
+        # through the repository admin API. With the default GITHUB_TOKEN this
+        # path fails with "Create Pages site failed: Resource not accessible by
+        # integration". Enabling Pages on a fresh fork stays a one-time admin
+        # action -- either in Settings > Pages, or:
+        #   gh api -X POST repos/<owner>/<repo>/pages -f build_type=workflow
         enablement: true
 
     - name: Upload Pages artifact
