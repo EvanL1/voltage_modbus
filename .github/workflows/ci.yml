@@ -82,9 +82,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Pinned: rustfmt is a style gate, so a new Rust release must not be able
+      # to redden main on its own. Bump this deliberately in its own PR.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: rustfmt
 
       - name: Check formatting
@@ -97,9 +100,16 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # Pinned: clippy gates on -D warnings, so tracking `stable` meant every
+      # Rust release could turn previously-clean code into a hard error without
+      # anyone touching it. That is what broke main from 2026-07-12 to 08-04,
+      # when 1.97 extended collapsible_match. The Check/Test/Docs/no_std/audit
+      # jobs still track stable, so genuine upstream incompatibilities surface
+      # there -- this pin only stops new lints from gating the merge.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.97.1"
           components: clippy
 
       - name: Cache cargo

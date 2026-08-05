@@ -57,6 +57,12 @@ jobs:
     - name: Setup Pages
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
       uses: actions/configure-pages@v5
+      with:
+        # The repository had never had Pages enabled, so this step failed with
+        # "Get Pages site failed / Not Found" on every push to main. Letting the
+        # action enable it keeps the setup reproducible instead of depending on
+        # a one-off click in repository settings.
+        enablement: true
 
     - name: Upload Pages artifact
       if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
@@ -102,14 +108,11 @@ jobs:
       
     - name: Test
       run: cargo test --all-features
-      
-    - name: Check formatting
-      if: matrix.rust == 'stable'
-      run: cargo fmt -- --check
-      
-    - name: Run clippy
-      if: matrix.rust == 'stable'
-      run: cargo clippy --all-features -- -D warnings
+
+    # Formatting and clippy are owned by the dedicated Rustfmt and Clippy jobs
+    # in ci.yml, which pin their toolchain. Running them here as well meant an
+    # unpinned second copy that could redden this workflow on its own whenever
+    # a new Rust release added a lint -- exactly what happened on 2026-07-12.
 
 # Required for GitHub Pages deployment
 permissions:
