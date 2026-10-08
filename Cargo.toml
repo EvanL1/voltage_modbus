@@ -1,7 +1,7 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.7.2"
+version = "0.7.3"
 edition = "2021"
 rust-version = "1.85.0"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
@@ -36,17 +36,11 @@ thiserror = { version = "1.0", optional = true }
 # Logging — tracing supports no_std via its default-features = false path
 tracing = { version = "0.1", default-features = false }
 
-# Utilities (std only — bytes requires std allocator integration)
-bytes = { version = "1.4", optional = true }
-
 # CRC — supports no_std natively
 crc = "3.0"
 
 # defmt — optional, for embedded logging
 defmt = { version = "0.3", optional = true }
-
-# Time (std only)
-chrono = { version = "0.4", optional = true }
 
 # RTU serial support (optional, requires std)
 tokio-serial = { version = "5.4", optional = true }
@@ -86,8 +80,6 @@ default = ["std"]
 std = [
     "dep:tokio",
     "dep:thiserror",
-    "dep:bytes",
-    "dep:chrono",
 ]
 rtu = ["std", "dep:tokio-serial"]
 igw = ["std", "dep:igw"]

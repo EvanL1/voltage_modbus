@@ -1,7 +1,6 @@
 //! # Voltage Modbus - High-Performance Industrial Modbus Library
 //!
 //! **Author:** Evan Liu <liuyifanz.1996@gmail.com>
-//! **Version:** 0.7.2
 //! **License:** MIT
 //!
 //! A comprehensive, high-performance Modbus TCP/RTU implementation in pure Rust
@@ -72,7 +71,7 @@
 //!
 //! Add to `Cargo.toml`:
 //! ```toml
-//! voltage_modbus = { version = "...", default-features = false }
+//! voltage_modbus = { version = "0.7", default-features = false }
 //! ```
 //!
 //! Then use the core PDU/protocol modules without any std dependency:
@@ -90,10 +89,18 @@
 // no_std support
 // ============================================================================
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+
+// Compile the README's code blocks as doctests so they cannot drift from the
+// API. Gated on `rtu` because one example uses `ModbusRtuClient`; CI runs
+// `cargo test --all-features`.
+#[cfg(all(doctest, feature = "rtu"))]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 // ============================================================================
 // Core modules — always available (no_std compatible)

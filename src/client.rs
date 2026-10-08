@@ -1256,7 +1256,7 @@ impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
+    /// ```rust,no_run
     /// use voltage_modbus::{ModbusTcpClient, ModbusResult};
     /// use std::time::Duration;
     ///
@@ -1264,7 +1264,7 @@ impl<T: ModbusTransport + Send + Sync> GenericModbusClient<T> {
     /// let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
     ///
     /// // 读取温度(0-1)、压力(2-3)、流量(10-11)，三个区域合并为一次请求
-    /// let results = client.read_holding_registers_coalesced(1, &[(0, 2), (2, 2), (10, 2)]).await?;
+    /// let results = client.generic_mut().read_holding_registers_coalesced(1, &[(0, 2), (2, 2), (10, 2)]).await?;
     /// let temperature = &results[0]; // [reg0, reg1]
     /// let pressure    = &results[1]; // [reg2, reg3]
     /// let flow        = &results[2]; // [reg10, reg11]

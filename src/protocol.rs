@@ -760,7 +760,12 @@ pub struct ModbusResponse {
     data_offset: usize,
     /// Length of payload data
     data_len: usize,
+    /// Decoded exception, `None` for success *and* for exception codes
+    /// outside [`ModbusException`]; use [`Self::is_exception`] to test.
     pub exception: Option<ModbusException>,
+    /// Raw exception code as received, kept so unknown codes still count as
+    /// exceptions and errors carry the exact code.
+    exception_code: Option<u8>,
 }
 
 impl ModbusResponse {
@@ -777,6 +782,7 @@ impl ModbusResponse {
             data_offset: 0,
             data_len,
             exception: None,
+            exception_code: None,
         }
     }
 
@@ -806,6 +812,7 @@ impl ModbusResponse {
             data_offset: data_start,
             data_len,
             exception: None,
+            exception_code: None,
         }
     }
 
@@ -823,19 +830,20 @@ impl ModbusResponse {
             data_offset: 0,
             data_len: 0,
             exception: None,
+            exception_code: None,
         }
     }
 
     /// Create an exception response
     pub fn new_exception(slave_id: SlaveId, function: ModbusFunction, exception_code: u8) -> Self {
-        let exception = ModbusException::from_u8(exception_code);
         Self {
             slave_id,
             function,
             buffer: Vec::new(),
             data_offset: 0,
             data_len: 0,
-            exception,
+            exception: ModbusException::from_u8(exception_code),
+            exception_code: Some(exception_code),
         }
     }
 
@@ -857,13 +865,13 @@ impl ModbusResponse {
     /// Check if this is an exception response
     #[inline]
     pub fn is_exception(&self) -> bool {
-        self.exception.is_some()
+        self.exception_code.is_some()
     }
 
     /// Get exception error if present
     pub fn get_exception(&self) -> Option<ModbusError> {
-        self.exception
-            .map(|exc| ModbusError::protocol(format!("Modbus exception: {}", exc)))
+        self.exception_code
+            .map(|code| ModbusError::exception(self.function.to_u8(), code))
     }
 
     /// Parse response data as registers (u16 values)
@@ -1182,6 +1190,33 @@ mod tests {
             ModbusException::IllegalDataAddress
         );
         assert_eq!(ModbusException::IllegalDataAddress.to_u8(), 0x02);
+    }
+
+    /// Exception responses must surface as `ModbusError::Exception` carrying
+    /// the raw code, so `is_recoverable()` can retry Acknowledge/Busy.
+    #[test]
+    fn test_exception_response_keeps_code() {
+        let busy = ModbusResponse::new_exception(1, ModbusFunction::ReadHoldingRegisters, 0x06);
+        match busy.get_exception() {
+            Some(ModbusError::Exception { function, code, .. }) => {
+                assert_eq!(function, 0x03);
+                assert_eq!(code, 0x06);
+            }
+            other => panic!("expected Exception error, got {:?}", other),
+        }
+        assert!(busy.get_exception().unwrap().is_recoverable());
+        assert!(busy.parse_registers().is_err());
+    }
+
+    /// Codes outside the known `ModbusException` list are still exceptions.
+    #[test]
+    fn test_unknown_exception_code_is_still_exception() {
+        let resp = ModbusResponse::new_exception(1, ModbusFunction::ReadHoldingRegisters, 0x0C);
+        assert!(resp.is_exception());
+        assert!(matches!(
+            resp.get_exception(),
+            Some(ModbusError::Exception { code: 0x0C, .. })
+        ));
     }
 
     #[test]

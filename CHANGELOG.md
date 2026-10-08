@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-10-08
+
+### Fixed
+- **docs.rs build**: 0.7.2's documentation failed to build on docs.rs because nightly removed `feature(doc_auto_cfg)` (merged into `doc_cfg`). Switched to `feature(doc_cfg)`; CI now reproduces the docs.rs build (nightly + `--cfg docsrs`).
+- **TCP connect had no timeout**: every `TcpStream::connect` (TCP, TLS, RTU-over-TCP; initial connect and reconnect) now goes through one helper bounded by the transport's configured timeout. Previously a peer that silently drops SYNs (e.g. a powered-off PLC) blocked for the OS connect timeout (75–127 s), holding any `SharedModbusClient` lock throughout.
+- **Serial port never reopened after an I/O error**: `RtuTransport` and `AsciiTransport` now drop the port handle on a write or read I/O error, so the next request reopens it. Previously an unplugged and re-plugged USB-RS485 adapter failed forever, and `RetryPolicy` retried against the dead handle.
+- **RTU-over-TCP stale reply after cancellation**: if a request future was dropped mid-flight (caller `tokio::time::timeout` / `select!`), the late reply stayed in the socket and the next request returned it as its own data — RTU framing has no transaction ID to catch this. The stream is now taken for the whole round trip and kept only after a complete, CRC-valid frame; a CRC/decode failure also drops the connection, since the stream may be misaligned.
+- **Exception codes were lost**: `ModbusResponse::get_exception()` returned `ModbusError::Protocol(String)`, so `is_recoverable()` never retried Acknowledge (0x05) / Server Busy (0x06) and callers could not match on the code. It now returns `ModbusError::Exception { function, code, .. }`. Exception codes outside `ModbusException` (e.g. 0x0C) are now still treated as exceptions instead of being parsed as a normal response.
+- **README examples did not compile**: the pipelining example was missing the `ModbusClient` import, the coalescing example called a method that exists only on the generic client (now via `generic_mut()`), and the install snippets pointed at 0.5. README code blocks are now compiled as doctests (`cargo test --all-features`).
+
+### Behavior changes
+- Exception responses now surface as `ModbusError::Exception` instead of `ModbusError::Protocol`. The `Display` text still starts with `Modbus exception:` and `is_protocol_error()` is still true, but code that matched the `Protocol` variant for exceptions takes a different branch. With a `RetryPolicy` set, 0x05/0x06 exceptions are now retried as `is_recoverable()` always intended.
+- A connect that exceeds the timeout fails with `ModbusError::Timeout` (previously, after the OS gave up, `Connection`). Both are recoverable transport errors. The timeout applies to connect and to each I/O step separately, so a request that reconnects first can take up to 2× the timeout (3× for TLS, which adds the handshake).
+
+### Changed
+- Removed the unused direct dependencies `chrono` and `bytes` (`crate::bytes` is the crate's own module).
+- `#![forbid(unsafe_code)]` now enforces the "zero unsafe" claim.
+- CI also checks the `embedded` + `defmt` build on `thumbv7em-none-eabihf`.
+
 ## [0.7.2] - 2026-08-04
 
 ### Security

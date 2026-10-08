@@ -134,6 +134,26 @@ use tokio_serial::{self, SerialPort as _};
 use crate::error::{ModbusError, ModbusResult};
 use crate::protocol::{ModbusFunction, ModbusRequest, ModbusResponse};
 
+/// Open a TCP connection bounded by `connect_timeout`, with TCP_NODELAY set.
+///
+/// A bare `TcpStream::connect` waits for the OS SYN timeout (75–127 s) when
+/// the peer silently drops packets, e.g. a powered-off PLC.
+async fn connect_tcp(address: SocketAddr, connect_timeout: Duration) -> ModbusResult<TcpStream> {
+    let stream = timeout(connect_timeout, TcpStream::connect(address))
+        .await
+        .map_err(|_| {
+            ModbusError::timeout(
+                format!("connect to {}", address),
+                connect_timeout.as_millis() as u64,
+            )
+        })?
+        .map_err(|e| ModbusError::connection(format!("Failed to connect to {}: {}", address, e)))?;
+    stream
+        .set_nodelay(true)
+        .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
+    Ok(stream)
+}
+
 // ============================================================================
 // Packet Callback Types - For Real Packet Logging
 // ============================================================================
@@ -742,12 +762,7 @@ pub struct TcpTransport {
 impl TcpTransport {
     /// Create a new TCP transport
     pub async fn new(address: SocketAddr, timeout: Duration) -> ModbusResult<Self> {
-        let stream = TcpStream::connect(address).await.map_err(|e| {
-            ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
-        })?;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
+        let stream = connect_tcp(address, timeout).await?;
 
         Ok(Self {
             stream: Some(stream),
@@ -767,12 +782,7 @@ impl TcpTransport {
         timeout: Duration,
         enable_logging: bool,
     ) -> ModbusResult<Self> {
-        let stream = TcpStream::connect(address).await.map_err(|e| {
-            ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
-        })?;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
+        let stream = connect_tcp(address, timeout).await?;
 
         Ok(Self {
             stream: Some(stream),
@@ -833,12 +843,7 @@ impl TcpTransport {
     async fn reconnect(&mut self) -> ModbusResult<()> {
         self.stream = None;
 
-        let stream = TcpStream::connect(self.address).await.map_err(|e| {
-            ModbusError::connection(format!("Failed to reconnect to {}: {}", self.address, e))
-        })?;
-        stream.set_nodelay(true).map_err(|e| {
-            ModbusError::connection(format!("Failed to set TCP_NODELAY on reconnect: {}", e))
-        })?;
+        let stream = connect_tcp(self.address, self.timeout).await?;
 
         self.stream = Some(stream);
         Ok(())
@@ -1304,10 +1309,7 @@ impl TlsTransport {
     async fn reconnect(&mut self) -> ModbusResult<()> {
         self.stream = None;
 
-        let tcp = TcpStream::connect(self.address).await.map_err(|e| {
-            ModbusError::connection(format!("Failed to connect to {}: {}", self.address, e))
-        })?;
-        tcp.set_nodelay(true).ok();
+        let tcp = connect_tcp(self.address, self.timeout).await?;
 
         let tls = timeout(
             self.timeout,
@@ -1729,6 +1731,8 @@ impl ModbusTransport for RtuTransport {
             }
             Ok(Err(e)) => {
                 self.stats.errors += 1;
+                // The handle may be dead (adapter unplugged); reopen on next request.
+                self.port = None;
                 return Err(ModbusError::io(format!("Failed to send RTU frame: {}", e)));
             }
             Err(_) => {
@@ -1761,6 +1765,10 @@ impl ModbusTransport for RtuTransport {
             Ok(Ok(frame)) => frame,
             Ok(Err(e)) => {
                 self.stats.errors += 1;
+                if matches!(e, ModbusError::Io { .. }) {
+                    // Dead handle (adapter unplugged); reopen on next request.
+                    self.port = None;
+                }
                 return Err(e);
             }
             Err(_) => {
@@ -2277,6 +2285,8 @@ impl ModbusTransport for AsciiTransport {
             }
             Ok(Err(e)) => {
                 self.stats.errors += 1;
+                // The handle may be dead (adapter unplugged); reopen on next request.
+                self.port = None;
                 return Err(ModbusError::io(format!(
                     "Failed to send ASCII frame: {}",
                     e
@@ -2306,6 +2316,10 @@ impl ModbusTransport for AsciiTransport {
             Ok(Ok(frame)) => frame,
             Ok(Err(e)) => {
                 self.stats.errors += 1;
+                if matches!(e, ModbusError::Io { .. }) {
+                    // Dead handle (adapter unplugged); reopen on next request.
+                    self.port = None;
+                }
                 return Err(e);
             }
             Err(_) => {
@@ -2384,12 +2398,7 @@ pub struct RtuOverTcpTransport {
 impl RtuOverTcpTransport {
     /// Connect to a gateway.
     pub async fn new(address: SocketAddr, timeout: Duration) -> ModbusResult<Self> {
-        let stream = TcpStream::connect(address).await.map_err(|e| {
-            ModbusError::connection(format!("Failed to connect to {}: {}", address, e))
-        })?;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| ModbusError::connection(format!("Failed to set TCP_NODELAY: {}", e)))?;
+        let stream = connect_tcp(address, timeout).await?;
         Ok(Self {
             address,
             stream: Some(stream),
@@ -2449,10 +2458,7 @@ impl RtuOverTcpTransport {
     }
 
     async fn reconnect(&mut self) -> ModbusResult<()> {
-        let stream = TcpStream::connect(self.address).await.map_err(|e| {
-            ModbusError::connection(format!("Reconnect to {} failed: {}", self.address, e))
-        })?;
-        stream.set_nodelay(true).ok();
+        let stream = connect_tcp(self.address, self.timeout).await?;
         self.stream = Some(stream);
         Ok(())
     }
@@ -2473,49 +2479,47 @@ impl ModbusTransport for RtuOverTcpTransport {
         if self.stream.is_none() {
             self.reconnect().await?;
         }
-        let stream = self
+        // Take the stream out for the whole round trip and put it back only
+        // after a complete, CRC-valid frame. RTU frames carry no transaction
+        // ID, so if this future is dropped mid-request (caller timeout /
+        // select!) the late reply must die with the connection instead of
+        // being read by the next request as its own.
+        let mut stream = self
             .stream
-            .as_mut()
+            .take()
             .ok_or_else(|| ModbusError::connection("stream not connected"))?;
 
         self.stats.requests_sent += 1;
         self.stats.bytes_sent += frame.len() as u64;
         let io_timeout = self.timeout;
 
-        let write_result = timeout(io_timeout, stream.write_all(&frame)).await;
-        if let Err(_) | Ok(Err(_)) = &write_result {
-            self.stream = None;
-            self.stats.errors += 1;
-        }
-        match write_result {
+        match timeout(io_timeout, stream.write_all(&frame)).await {
             Err(_) => {
+                self.stats.errors += 1;
                 self.stats.timeouts += 1;
                 return Err(ModbusError::timeout("write", io_timeout.as_millis() as u64));
             }
-            Ok(Err(e)) => return Err(ModbusError::connection(format!("write failed: {}", e))),
+            Ok(Err(e)) => {
+                self.stats.errors += 1;
+                return Err(ModbusError::connection(format!("write failed: {}", e)));
+            }
             Ok(Ok(())) => {}
         }
 
         // Broadcast: no response expected
         if request.slave_id == 0 {
+            self.stream = Some(stream);
             self.stats.responses_received += 1;
             return Ok(ModbusResponse::new_broadcast_ack(request.function));
         }
 
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| ModbusError::connection("stream not connected after write"))?;
-        let read_result = timeout(io_timeout, read_rtu_frame(stream)).await;
-        let frame = match read_result {
+        let frame = match timeout(io_timeout, read_rtu_frame(&mut stream)).await {
             Err(_) => {
-                self.stream = None;
                 self.stats.timeouts += 1;
                 self.stats.errors += 1;
                 return Err(ModbusError::timeout("read", io_timeout.as_millis() as u64));
             }
             Ok(Err(e)) => {
-                self.stream = None;
                 self.stats.errors += 1;
                 return Err(e);
             }
@@ -2525,9 +2529,12 @@ impl ModbusTransport for RtuOverTcpTransport {
         self.stats.responses_received += 1;
         self.stats.bytes_received += frame.len() as u64;
 
+        // A CRC/decode failure means the length we framed by may be wrong and
+        // the stream misaligned, so the connection is only kept on success.
         let response = Self::decode_response(frame).inspect_err(|_| {
             self.stats.errors += 1;
         })?;
+        self.stream = Some(stream);
 
         if response.slave_id != request.slave_id {
             self.stats.errors += 1;
@@ -2640,6 +2647,93 @@ mod rtu_over_tcp_tests {
         assert_eq!(stats.bytes_received, 7);
 
         server.await.unwrap();
+    }
+
+    /// A caller-side cancellation (e.g. `tokio::time::timeout` around the
+    /// request) must not leave the late reply in the socket: RTU frames have
+    /// no transaction ID, so the next request would read it as its own.
+    #[tokio::test]
+    async fn cancelled_request_does_not_leak_stale_reply() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+
+        // Gateway: the first request overall is answered late with 0x1111,
+        // every later request immediately with 0x2222.
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let served = served.clone();
+                tokio::spawn(async move {
+                    let mut request = [0u8; 8];
+                    while socket.read_exact(&mut request).await.is_ok() {
+                        let n = served.fetch_add(1, Ordering::SeqCst);
+                        let value: u16 = if n == 0 {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            0x1111
+                        } else {
+                            0x2222
+                        };
+                        let mut response = vec![0x01, 0x03, 0x02];
+                        response.extend_from_slice(&value.to_be_bytes());
+                        let crc = CRC_MODBUS.checksum(&response);
+                        response.extend_from_slice(&crc.to_le_bytes());
+                        if socket.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut transport = RtuOverTcpTransport::new(address, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let request = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+
+        let cancelled =
+            tokio::time::timeout(Duration::from_millis(30), transport.request(&request)).await;
+        assert!(cancelled.is_err(), "first request should be cancelled");
+
+        // Let the late 0x1111 reply land on the old connection.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let response = transport.request(&request).await.unwrap();
+        assert_eq!(response.parse_registers().unwrap(), vec![0x2222]);
+
+        server.abort();
+    }
+}
+
+#[cfg(test)]
+mod connect_tests {
+    use super::*;
+
+    /// A peer that silently drops SYNs (powered-off PLC) must fail within the
+    /// configured timeout, not the OS connect timeout (75–127 s).
+    #[tokio::test]
+    async fn connect_respects_configured_timeout() {
+        // TEST-NET-1 (RFC 5737): never routed, SYNs go unanswered.
+        let address: SocketAddr = "192.0.2.1:502".parse().unwrap();
+        let configured = Duration::from_millis(200);
+
+        let tcp = tokio::time::timeout(
+            Duration::from_secs(3),
+            TcpTransport::new(address, configured),
+        )
+        .await
+        .expect("TcpTransport::new ignored the configured timeout");
+        assert!(tcp.is_err());
+
+        let rtu = tokio::time::timeout(
+            Duration::from_secs(3),
+            RtuOverTcpTransport::new(address, configured),
+        )
+        .await
+        .expect("RtuOverTcpTransport::new ignored the configured timeout");
+        assert!(rtu.is_err());
     }
 }
 

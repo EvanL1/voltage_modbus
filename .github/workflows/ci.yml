@@ -150,6 +150,16 @@ jobs:
       - name: Check documentation
         run: cargo doc --no-deps --all-features --document-private-items
 
+      # Reproduce the docs.rs build (nightly + `--cfg docsrs`): 0.7.2's docs.rs
+      # page failed on a removed nightly feature that stable never sees.
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Check docs.rs build
+        run: cargo +nightly doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+
   no-std:
     name: no_std Check
     runs-on: ubuntu-latest
@@ -160,6 +170,8 @@ jobs:
           targets: thumbv7em-none-eabihf
       - name: Check no_std core modules
         run: cargo check --no-default-features --target thumbv7em-none-eabihf
+      - name: Check embedded transport (no_std + alloc, defmt)
+        run: cargo check --no-default-features --features embedded,defmt --target thumbv7em-none-eabihf
 
   msrv:
     name: MSRV (Rust 1.85.0)

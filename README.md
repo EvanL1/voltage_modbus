@@ -41,20 +41,20 @@ cargo add voltage_modbus
 For RTU (serial) support:
 
 ```toml
-voltage_modbus = { version = "0.5", features = ["rtu"] }
+voltage_modbus = { version = "0.7", features = ["rtu"] }
 ```
 
 For `no_std` (PDU encoding/decoding only):
 
 ```toml
-voltage_modbus = { version = "0.5", default-features = false }
+voltage_modbus = { version = "0.7", default-features = false }
 ```
 
 ## Quick Start
 
 ### TCP Client
 
-```rust
+```rust,no_run
 use voltage_modbus::{ModbusTcpClient, ModbusClient, ModbusResult};
 use std::time::Duration;
 
@@ -76,7 +76,7 @@ async fn main() -> ModbusResult<()> {
 
 ### RTU Client
 
-```rust
+```rust,no_run
 use voltage_modbus::{ModbusRtuClient, ModbusClient, ModbusResult};
 use std::time::Duration;
 
@@ -94,8 +94,8 @@ async fn main() -> ModbusResult<()> {
 
 ### Pipelining — N Requests in ~1 RTT
 
-```rust
-use voltage_modbus::{ModbusTcpClient, ModbusResult};
+```rust,no_run
+use voltage_modbus::{ModbusTcpClient, ModbusClient, ModbusResult};
 use std::time::Duration;
 
 #[tokio::main]
@@ -123,7 +123,7 @@ async fn main() -> ModbusResult<()> {
 
 ### Read Coalescing — Auto-merge Adjacent Reads
 
-```rust
+```rust,no_run
 use voltage_modbus::{ModbusTcpClient, ModbusClient, ModbusResult};
 use std::time::Duration;
 
@@ -132,8 +132,9 @@ async fn main() -> ModbusResult<()> {
     let mut client = ModbusTcpClient::from_address("127.0.0.1:502", Duration::from_secs(5)).await?;
 
     // These 3 regions are close together — the library automatically merges them
-    // into fewer network requests based on a configurable gap threshold
-    let results = client.read_holding_registers_coalesced(1, &[
+    // into fewer network requests based on a configurable gap threshold.
+    // Coalesced reads live on the generic client, reached via `generic_mut()`.
+    let results = client.generic_mut().read_holding_registers_coalesced(1, &[
         (0, 2),    // temperature (registers 0-1)
         (2, 2),    // pressure (registers 2-3)
         (10, 2),   // flow rate (registers 10-11)
@@ -164,7 +165,7 @@ async fn main() -> ModbusResult<()> {
 
 ## Architecture
 
-```
+```text
 ┌───────────────────────────────────────────────┐
 │             Application Layer                 │
 │                                               │
