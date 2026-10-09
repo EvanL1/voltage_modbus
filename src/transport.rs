@@ -125,7 +125,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{debug, info};
 
 #[cfg(feature = "rtu")]
@@ -408,17 +408,39 @@ fn decode_mbap_response(frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
     ))
 }
 
+/// Classify a deadline-bounded I/O result: an elapsed deadline becomes
+/// [`ModbusError::Timeout`]; an I/O failure (connection reset, peer close/EOF)
+/// becomes [`ModbusError::Connection`]. Callers count `stats.timeouts` only for
+/// the former; both are recoverable and both leave the connection broken.
+fn io_outcome<T>(
+    result: Result<std::io::Result<T>, tokio::time::error::Elapsed>,
+    operation: &str,
+    io_timeout: Duration,
+) -> ModbusResult<T> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(ModbusError::connection(format!("{operation} failed: {e}"))),
+        Err(_) => Err(ModbusError::timeout(
+            operation,
+            io_timeout.as_millis() as u64,
+        )),
+    }
+}
+
 /// Read MBAP frames from `stream` until one carries `expected_tid` and
 /// `expected_unit`, discarding stale frames from interleaved responses.
 ///
 /// `on_frame` sees every complete frame received — including discarded stale
-/// ones — so callers hook packet logging and byte counters there. On any
+/// ones — so callers hook packet logging and byte counters there. Every read,
+/// including those of discarded stale frames, is bounded by the single
+/// per-request `deadline` (`io_timeout` only labels the timeout error). On any
 /// error the caller must treat the connection as broken.
 ///
 /// Shared by the plain-TCP and TLS transports.
 async fn read_mbap_frame<S, F>(
     stream: &mut S,
     read_buf: &mut [u8; 512],
+    deadline: Instant,
     io_timeout: Duration,
     expected_tid: u16,
     expected_unit: u8,
@@ -439,17 +461,12 @@ where
         }
 
         // Read MBAP header + function code into the persistent buffer
-        let read_result = timeout(
-            io_timeout,
+        let read_result = timeout_at(
+            deadline,
             stream.read_exact(&mut read_buf[..MBAP_HEADER_SIZE + 1]),
         )
         .await;
-        if !matches!(read_result, Ok(Ok(_))) {
-            return Err(ModbusError::timeout(
-                "read response header",
-                io_timeout.as_millis() as u64,
-            ));
-        }
+        io_outcome(read_result, "read response header", io_timeout)?;
 
         // L1: Validate Length field (must be in valid range [2, 254])
         let length = u16::from_be_bytes([read_buf[4], read_buf[5]]);
@@ -473,17 +490,12 @@ where
         let remaining_bytes = (length as usize).saturating_sub(1); // -1: function code already read
         let total_len = MBAP_HEADER_SIZE + 1 + remaining_bytes;
         if remaining_bytes > 0 {
-            let read_result = timeout(
-                io_timeout,
+            let read_result = timeout_at(
+                deadline,
                 stream.read_exact(&mut read_buf[MBAP_HEADER_SIZE + 1..total_len]),
             )
             .await;
-            if !matches!(read_result, Ok(Ok(_))) {
-                return Err(ModbusError::timeout(
-                    "read response data",
-                    io_timeout.as_millis() as u64,
-                ));
-            }
+            io_outcome(read_result, "read response data", io_timeout)?;
         }
 
         on_frame(&read_buf[..total_len]);
@@ -516,6 +528,52 @@ where
 
         return Ok(read_buf[..total_len].to_vec());
     }
+}
+
+/// Read one complete MBAP frame (any transaction ID) for pipelined receive,
+/// bounded by the pipeline's single `deadline`.
+async fn read_pipeline_frame<S>(
+    stream: &mut S,
+    deadline: Instant,
+    pipeline_timeout: Duration,
+) -> ModbusResult<Vec<u8>>
+where
+    S: tokio::io::AsyncRead + Unpin + Send,
+{
+    // MBAP header + function code byte (7 bytes total)
+    let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
+    let read_result = timeout_at(deadline, stream.read_exact(&mut header_buf)).await;
+    io_outcome(read_result, "pipeline receive header", pipeline_timeout)?;
+
+    let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
+    if !(2..=254).contains(&length) {
+        return Err(ModbusError::frame(format!(
+            "Pipeline: invalid MBAP length: {} (must be 2-254)",
+            length
+        )));
+    }
+
+    let protocol_id = u16::from_be_bytes([header_buf[2], header_buf[3]]);
+    if protocol_id != 0 {
+        return Err(ModbusError::frame(format!(
+            "Pipeline: invalid protocol ID: {:04X}",
+            protocol_id
+        )));
+    }
+
+    let remaining_bytes = (length as usize).saturating_sub(1);
+    let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
+    response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
+    if remaining_bytes > 0 {
+        let read_result = timeout_at(
+            deadline,
+            stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
+        )
+        .await;
+        io_outcome(read_result, "pipeline receive data", pipeline_timeout)?;
+    }
+
+    Ok(response_buf)
 }
 
 /// Format raw bytes as hex string for packet logging
@@ -940,24 +998,27 @@ impl TcpTransport {
             .as_mut()
             .ok_or_else(|| ModbusError::connection("stream not connected during pipeline send"))?;
         let send_result = timeout(self.timeout, stream.write_all(&combined)).await;
-        if !matches!(send_result, Ok(Ok(_))) {
-            self.stats.timeouts += 1;
+        if let Err(error) = io_outcome(send_result, "pipeline send", self.timeout) {
+            if matches!(error, ModbusError::Timeout { .. }) {
+                self.stats.timeouts += 1;
+            }
             self.stats.errors += 1;
             self.stream = None;
-            return Err(ModbusError::timeout(
-                "pipeline send",
-                self.timeout.as_millis() as u64,
-            ));
+            return Err(error);
         }
 
         Ok(tids)
     }
 
-    /// Receive `count` pipeline responses and map them by Transaction ID.
+    /// Receive up to `count` pipeline responses and map them by Transaction ID.
     ///
-    /// Reads exactly `count` frames from the socket and returns a
-    /// `HashMap<tid, ModbusResponse>`.  The overall operation is bounded by
-    /// `pipeline_timeout`.
+    /// Reads frames until `count` have arrived or `pipeline_timeout` elapses,
+    /// and returns a `HashMap<tid, ModbusResult<ModbusResponse>>`.
+    ///
+    /// If the deadline passes first, the frames received so far are returned
+    /// (TIDs with no reply are simply absent from the map) and the connection
+    /// is dropped, since late replies would leave the stream misaligned. Only
+    /// connection loss or an unparseable MBAP header fails the whole call.
     pub async fn receive_pipeline_responses(
         &mut self,
         count: usize,
@@ -970,93 +1031,40 @@ impl TcpTransport {
         }
 
         // Take stream ownership to allow borrow-checker to split field access cleanly.
+        // On any early return the stream is dropped, marking the connection broken.
         let mut stream = self
             .stream
             .take()
             .ok_or_else(|| ModbusError::connection("Pipeline receive: not connected"))?;
 
-        let deadline = tokio::time::Instant::now() + pipeline_timeout;
+        let deadline = Instant::now() + pipeline_timeout;
         // Collect raw frames first; defer decode until after stream is returned.
         let mut raw_frames: Vec<Vec<u8>> = Vec::with_capacity(count);
+        let mut complete = true;
 
         for _ in 0..count {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                // Return stream so connection is marked broken via None
-                drop(stream);
-                self.stats.timeouts += 1;
-                self.stats.errors += 1;
-                return Err(ModbusError::timeout(
-                    "pipeline receive",
-                    pipeline_timeout.as_millis() as u64,
-                ));
-            }
-
-            // Read MBAP header + function code byte (7 bytes total)
-            let mut header_buf = [0u8; MBAP_HEADER_SIZE + 1];
-            let read_result = timeout(remaining, stream.read_exact(&mut header_buf)).await;
-            if !matches!(read_result, Ok(Ok(_))) {
-                drop(stream);
-                self.stats.timeouts += 1;
-                self.stats.errors += 1;
-                return Err(ModbusError::timeout(
-                    "pipeline receive header",
-                    pipeline_timeout.as_millis() as u64,
-                ));
-            }
-
-            // Validate MBAP length field
-            let length = u16::from_be_bytes([header_buf[4], header_buf[5]]);
-            if !(2..=254).contains(&length) {
-                drop(stream);
-                self.stats.errors += 1;
-                return Err(ModbusError::frame(format!(
-                    "Pipeline: invalid MBAP length: {} (must be 2-254)",
-                    length
-                )));
-            }
-
-            // Validate Protocol ID
-            let protocol_id = u16::from_be_bytes([header_buf[2], header_buf[3]]);
-            if protocol_id != 0 {
-                drop(stream);
-                self.stats.errors += 1;
-                return Err(ModbusError::frame(format!(
-                    "Pipeline: invalid protocol ID: {:04X}",
-                    protocol_id
-                )));
-            }
-
-            // Read remaining bytes
-            let remaining_bytes = (length as usize).saturating_sub(1);
-            let mut response_buf = vec![0u8; MBAP_HEADER_SIZE + 1 + remaining_bytes];
-            response_buf[..MBAP_HEADER_SIZE + 1].copy_from_slice(&header_buf);
-
-            if remaining_bytes > 0 {
-                let remaining_time =
-                    deadline.saturating_duration_since(tokio::time::Instant::now());
-                let read_result = timeout(
-                    remaining_time,
-                    stream.read_exact(&mut response_buf[MBAP_HEADER_SIZE + 1..]),
-                )
-                .await;
-
-                if !matches!(read_result, Ok(Ok(_))) {
-                    drop(stream);
+            match read_pipeline_frame(&mut stream, deadline, pipeline_timeout).await {
+                Ok(frame) => raw_frames.push(frame),
+                Err(ModbusError::Timeout { .. }) => {
+                    // Deadline hit: keep what arrived. The caller turns each
+                    // missing TID into a per-entry timeout.
                     self.stats.timeouts += 1;
                     self.stats.errors += 1;
-                    return Err(ModbusError::timeout(
-                        "pipeline receive data",
-                        pipeline_timeout.as_millis() as u64,
-                    ));
+                    complete = false;
+                    break;
+                }
+                Err(error) => {
+                    self.stats.errors += 1;
+                    return Err(error);
                 }
             }
-
-            raw_frames.push(response_buf);
         }
 
-        // All frames received — put stream back before decoding
-        self.stream = Some(stream);
+        // Every expected frame received — keep the connection. Otherwise late
+        // replies may still be in flight, so the stream is dropped.
+        if complete {
+            self.stream = Some(stream);
+        }
 
         // Decode frames and build response map
         let mut map: HashMap<u16, ModbusResult<ModbusResponse>> = HashMap::with_capacity(count);
@@ -1137,15 +1145,17 @@ impl ModbusTransport for TcpTransport {
             .as_mut()
             .ok_or_else(|| ModbusError::connection("stream not connected"))?;
 
-        let send_result = timeout(self.timeout, stream.write_all(frame)).await;
-        if !matches!(send_result, Ok(Ok(_))) {
-            self.stats.timeouts += 1;
+        // One deadline bounds the whole request: send, header/body reads and
+        // any discarded stale frames.
+        let deadline = Instant::now() + self.timeout;
+        let send_result = timeout_at(deadline, stream.write_all(frame)).await;
+        if let Err(error) = io_outcome(send_result, "send request", self.timeout) {
+            if matches!(error, ModbusError::Timeout { .. }) {
+                self.stats.timeouts += 1;
+            }
             self.stats.errors += 1;
             self.stream = None; // Mark connection as broken
-            return Err(ModbusError::timeout(
-                "send request",
-                self.timeout.as_millis() as u64,
-            ));
+            return Err(error);
         }
 
         // Broadcast (slave_id = 0): per Modbus spec no response is expected.
@@ -1166,6 +1176,7 @@ impl ModbusTransport for TcpTransport {
         let result = read_mbap_frame(
             stream,
             &mut self.read_buf,
+            deadline,
             self.timeout,
             expected_transaction_id,
             request.slave_id,
@@ -1371,15 +1382,16 @@ impl ModbusTransport for TlsTransport {
             .as_mut()
             .ok_or_else(|| ModbusError::connection("TLS stream not connected"))?;
 
-        let send_result = timeout(self.timeout, stream.write_all(frame)).await;
-        if !matches!(send_result, Ok(Ok(_))) {
-            self.stats.timeouts += 1;
+        // One deadline bounds the whole request (see TcpTransport::request).
+        let deadline = Instant::now() + self.timeout;
+        let send_result = timeout_at(deadline, stream.write_all(frame)).await;
+        if let Err(error) = io_outcome(send_result, "send request", self.timeout) {
+            if matches!(error, ModbusError::Timeout { .. }) {
+                self.stats.timeouts += 1;
+            }
             self.stats.errors += 1;
             self.stream = None;
-            return Err(ModbusError::timeout(
-                "send request",
-                self.timeout.as_millis() as u64,
-            ));
+            return Err(error);
         }
 
         // Broadcast (slave_id = 0): per Modbus spec no response is expected.
@@ -1392,6 +1404,7 @@ impl ModbusTransport for TlsTransport {
         let result = read_mbap_frame(
             stream,
             &mut self.read_buf,
+            deadline,
             self.timeout,
             tid,
             request.slave_id,
@@ -3206,5 +3219,98 @@ mod rtu_tests {
             inter_char_timeout: Duration::from_millis(100),
             stats: TransportStats::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tcp_io_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Read one MBAP request frame, returning its transaction ID.
+    async fn read_request(socket: &mut TcpStream) -> u16 {
+        let mut mbap = [0u8; MBAP_HEADER_SIZE];
+        socket.read_exact(&mut mbap).await.unwrap();
+        let length = u16::from_be_bytes([mbap[4], mbap[5]]) as usize;
+        let mut pdu = vec![0u8; length];
+        socket.read_exact(&mut pdu).await.unwrap();
+        u16::from_be_bytes([mbap[0], mbap[1]])
+    }
+
+    fn fc03_frame(tid: u16, values: &[u16]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&tid.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&((3 + values.len() * 2) as u16).to_be_bytes());
+        frame.extend_from_slice(&[1, 0x03, (values.len() * 2) as u8]);
+        for v in values {
+            frame.extend_from_slice(&v.to_be_bytes());
+        }
+        frame
+    }
+
+    #[tokio::test]
+    async fn peer_close_is_connection_error_not_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request(&mut socket).await;
+            // Close without replying
+        });
+
+        let mut transport = TcpTransport::new(addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let request = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2);
+        let started = Instant::now();
+        let err = transport.request(&request).await.unwrap_err();
+
+        assert!(
+            !matches!(err, ModbusError::Timeout { .. }),
+            "peer close reported as timeout: {err:?}"
+        );
+        assert!(err.is_recoverable());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(transport.get_stats().timeouts, 0);
+        assert_eq!(transport.get_stats().errors, 1);
+        assert!(!transport.is_connected());
+    }
+
+    #[tokio::test]
+    async fn stale_tid_dribble_bounded_by_one_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let tid = read_request(&mut socket).await;
+            // Each stale frame arrives just inside a per-read timeout, so a
+            // per-read deadline would keep the request alive for ~5x.
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                if socket
+                    .write_all(&fc03_frame(tid.wrapping_add(100), &[0, 0]))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
+        let io_timeout = Duration::from_millis(500);
+        let mut transport = TcpTransport::new(addr, io_timeout).await.unwrap();
+        let request = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2);
+        let started = Instant::now();
+        let err = transport.request(&request).await.unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < io_timeout * 2,
+            "request took {elapsed:?}, timeout {io_timeout:?}"
+        );
+        assert!(matches!(err, ModbusError::Timeout { .. }), "{err:?}");
+        assert_eq!(transport.get_stats().timeouts, 1);
+        assert!(!transport.is_connected());
     }
 }

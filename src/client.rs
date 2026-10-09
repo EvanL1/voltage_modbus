@@ -1604,7 +1604,10 @@ impl ModbusTcpClient {
     ///
     /// A `Vec<ModbusResult<ModbusResponse>>` in the **same order** as `requests`.
     /// Individual entries may be `Err` if that particular request failed, while the
-    /// others remain `Ok`.
+    /// others remain `Ok`. A request with no reply by `pipeline_timeout` yields
+    /// `Err(ModbusError::Timeout)` for its entry; in that case the connection is
+    /// dropped (late replies would misalign the stream) and the next request
+    /// reconnects.
     ///
     /// Returns `Err` only for fatal errors (send failure, connection loss) that
     /// prevent *any* response from being received.
@@ -1655,16 +1658,26 @@ impl ModbusTcpClient {
             .receive_pipeline_responses(count, pipeline_timeout)
             .await?;
 
-        // Reorder by original request order using tids
+        // Reorder by original request order using tids. A TID with no reply
+        // (deadline passed) becomes a per-entry timeout; every reply is checked
+        // against its own request, so a wrong FC or byte count fails only that
+        // entry.
         let results = tids
             .into_iter()
-            .map(|tid| {
-                response_map.remove(&tid).unwrap_or_else(|| {
-                    Err(ModbusError::timeout(
-                        "pipeline response missing",
-                        pipeline_timeout.as_millis() as u64,
-                    ))
-                })
+            .zip(&requests)
+            .map(|(tid, request)| {
+                response_map
+                    .remove(&tid)
+                    .unwrap_or_else(|| {
+                        Err(ModbusError::timeout(
+                            "pipeline response missing",
+                            pipeline_timeout.as_millis() as u64,
+                        ))
+                    })
+                    .and_then(|response| {
+                        validate_response_matches_request(request, &response)?;
+                        Ok(response)
+                    })
             })
             .collect();
 
@@ -3879,6 +3892,95 @@ mod tests {
         );
 
         server_handle.await.unwrap();
+    }
+
+    /// Like `spawn_mock_server`, but keeps the connection open after replying
+    /// (a device that silently drops some in-flight transactions).
+    async fn spawn_holding_server<H>(request_count: usize, handler: H) -> std::net::SocketAddr
+    where
+        H: FnOnce(Vec<(u16, u8, u8)>) -> Vec<u8> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut meta = Vec::new();
+            for _ in 0..request_count {
+                let mut mbap = [0u8; 6];
+                socket.read_exact(&mut mbap).await.unwrap();
+                let length = u16::from_be_bytes([mbap[4], mbap[5]]) as usize;
+                let mut pdu = vec![0u8; length];
+                socket.read_exact(&mut pdu).await.unwrap();
+                meta.push((u16::from_be_bytes([mbap[0], mbap[1]]), pdu[0], pdu[1]));
+            }
+            socket.write_all(&handler(meta)).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_partial_responses_are_per_entry() {
+        // Device answers only the middle transaction and drops the others.
+        let server_addr = spawn_holding_server(3, |meta| {
+            let (tid, slave_id, _) = meta[1];
+            build_fc03_response_frame(tid, slave_id, &[7, 8])
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let requests = vec![
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 10, 2),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 20, 2),
+        ];
+
+        let pipeline_timeout = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let results = client.pipeline(requests, pipeline_timeout).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        assert_eq!(results.len(), 3);
+        assert!(matches!(results[0], Err(ModbusError::Timeout { .. })));
+        assert_eq!(
+            results[1].as_ref().unwrap().parse_registers().unwrap(),
+            vec![7, 8]
+        );
+        assert!(matches!(results[2], Err(ModbusError::Timeout { .. })));
+        // The stream may be misaligned by late replies, so it is dropped.
+        assert!(!client.is_connected());
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_validates_each_response() {
+        // First reply carries 1 register for a 2-register read; second is fine.
+        let server_addr = spawn_holding_server(2, |meta| {
+            let mut out = build_fc03_response_frame(meta[0].0, meta[0].1, &[1]);
+            out.extend_from_slice(&build_fc03_response_frame(meta[1].0, meta[1].1, &[3, 4]));
+            out
+        })
+        .await;
+
+        let mut client = ModbusTcpClient::new(server_addr, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let requests = vec![
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 2),
+            ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 10, 2),
+        ];
+
+        let results = client
+            .pipeline(requests, Duration::from_secs(5))
+            .await
+            .unwrap();
+
+        assert!(results[0].is_err(), "short byte count must be rejected");
+        assert_eq!(
+            results[1].as_ref().unwrap().parse_registers().unwrap(),
+            vec![3, 4]
+        );
     }
 }
 
