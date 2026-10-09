@@ -13,6 +13,12 @@ First stable release. From here on the public API follows Semantic Versioning; s
 the *Stability* section of the README for the exact guarantee. This release also
 contains the fixes prepared as 0.7.3, which was never published.
 
+### Security
+- Lockfile: `rustls` 0.23.41 → 0.23.45 (RUSTSEC-2026-0285: TLS 1.3 handshake messages
+  accepted across encryption level boundaries; affects the `tls` feature). Downstream
+  builds resolve their own `rustls` — run `cargo update -p rustls` if your lockfile
+  pins an older 0.23.x.
+
 ### Breaking changes
 - **`#[non_exhaustive]`** on `ModbusError`, `ModbusFunction`, `ModbusException`,
   `ByteOrder`, `ModbusValue`, `LogLevel`, `LoggingMode`; on the statistics structs
