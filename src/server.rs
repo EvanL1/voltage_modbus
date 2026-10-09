@@ -1189,6 +1189,14 @@ impl RtuFrameAccumulator {
         if self.overflowed {
             return;
         }
+        // Segments before the last gap waited through failed their CRC (that
+        // is why we waited); 1.0.1 would have dropped them already
+        if self.buffer.len() + bytes.len() > MAX_RTU_ADU_SIZE {
+            if let Some(&last_gap) = self.gaps.last() {
+                self.buffer.drain(..last_gap);
+                self.gaps.clear();
+            }
+        }
         if self.buffer.len() + bytes.len() > MAX_RTU_ADU_SIZE {
             warn!(
                 "Discarding RTU frame longer than {} bytes (line noise?)",
@@ -1233,6 +1241,23 @@ impl RtuFrameAccumulator {
         }
     }
 
+    /// At a t3.5 gap: keep waiting (and record the gap) only while the buffer
+    /// is a partly-arrived request to us AND the segment since the previous
+    /// gap fails its CRC — i.e. only through bytes 1.0.1 would have dropped.
+    /// A CRC-valid segment is a frame 1.0.1 would process right now, so the
+    /// wait ends and it is processed on time.
+    fn wait_through_gap(&mut self) -> bool {
+        if self.partial_request_wait().is_none() {
+            return false;
+        }
+        let segment_start = self.gaps.last().copied().unwrap_or(0);
+        if crate::rtu_frame::crc_ok(&self.buffer[segment_start..]) {
+            return false;
+        }
+        self.mark_gap();
+        true
+    }
+
     /// Record a t3.5 gap that was waited through instead of ending the frame.
     fn mark_gap(&mut self) {
         if self.gaps.last() != Some(&self.buffer.len()) {
@@ -1254,18 +1279,26 @@ impl RtuFrameAccumulator {
         if overflowed || buffer.is_empty() {
             return Vec::new();
         }
-        if gaps.is_empty() || crate::rtu_frame::crc_ok(&buffer) {
+        if gaps.is_empty() {
             return vec![buffer];
         }
-        let mut frames = Vec::with_capacity(gaps.len() + 1);
+        let mut segments = Vec::with_capacity(gaps.len() + 1);
         let mut start = 0;
         for end in gaps.into_iter().chain([buffer.len()]) {
             if end > start {
-                frames.push(buffer[start..end].to_vec());
+                segments.push(buffer[start..end].to_vec());
                 start = end;
             }
         }
-        frames
+        // Reassembled only if no segment is a frame on its own (CRC-16 has no
+        // output XOR: a valid frame plus trailing 0x00 bytes still passes)
+        let reassembled = segments.iter().all(|s| !crate::rtu_frame::crc_ok(s))
+            && crate::rtu_frame::crc_ok(&buffer);
+        if reassembled {
+            vec![buffer]
+        } else {
+            segments
+        }
     }
 }
 
@@ -1487,8 +1520,7 @@ impl ModbusRtuServer {
                 }
                 Err(_) => {
                     // A request to us that is still arriving: keep waiting
-                    if frame.partial_request_wait().is_some() {
-                        frame.mark_gap();
+                    if frame.wait_through_gap() {
                         continue;
                     }
                     // t3.5 idle gap elapsed: the frame is complete
@@ -2398,6 +2430,90 @@ mod tests {
             &[(&request[..3], 30), (&request, 0)],
         )
         .await;
+    }
+
+    /// Review round 5, example A: a truncated request whose byte count points
+    /// to a long layout, then the master retries every 30 ms. Each retry must
+    /// be answered at t3.5, as 1.0.1 does — not held back and burst out.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_retries_after_stuck_partial_are_answered_promptly() {
+        for (own, junk) in [
+            (1u8, vec![0x01, 0x10, 0x00, 0x00, 0x00, 0x7B, 0xF6]),
+            // Example B: glitch equal to own ID 0x10 makes the retry's own
+            // bytes read as a long FC10 layout
+            (0x10, vec![0x10]),
+            (0x10, vec![0x00]),
+        ] {
+            let bank = Arc::new(ModbusRegisterBank::new());
+            bank.write_06(0, 0x1234).unwrap();
+            let (mut client, tx, task) = spawn_rtu_loop_as(own, bank, Duration::from_micros(1750));
+            let retry = rtu_frame(&[own, 0x03, 0x00, 0x00, 0x00, 0x7D]);
+            client.write_all(&junk).await.unwrap();
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let start = tokio::time::Instant::now();
+                client.write_all(&retry).await.unwrap();
+                let mut header = [0u8; 3];
+                tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut header))
+                    .await
+                    .expect("no reply")
+                    .unwrap();
+                assert_eq!(header, [own, 0x03, 250], "own {own:#04X}");
+                let mut rest = [0u8; 252];
+                client.read_exact(&mut rest).await.unwrap();
+                assert!(
+                    start.elapsed() < Duration::from_millis(5),
+                    "own {own:#04X} junk {junk:02X?}: reply after {:?}",
+                    start.elapsed()
+                );
+            }
+            tx.send(()).unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    /// Example C: a truncated request, then a maximum-size retry 30 ms later.
+    /// The retry must be executed (the stale bytes must not overflow it away).
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_max_size_retry_after_truncated_request() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let (mut client, tx, task) = spawn_rtu_loop(bank.clone(), Duration::from_micros(1750));
+        let mut body = vec![0x01, 0x10, 0x00, 0x00, 0x00, 123, 246];
+        for i in 0..123u16 {
+            body.extend_from_slice(&i.to_be_bytes());
+        }
+        let retry = rtu_frame(&body);
+        assert_eq!(retry.len(), 255);
+        client.write_all(&retry[..7]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        client.write_all(&retry).await.unwrap();
+        expect_reply(&mut client, &[0x01, 0x10, 0x00, 0x00, 0x00, 123]).await;
+        assert_eq!(bank.read_03(122, 1).unwrap(), vec![122]);
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// CRC-16/MODBUS has no output XOR: a CRC-valid frame followed by 0x00
+    /// bytes still passes. A malformed-but-CRC-valid broadcast that keeps the
+    /// wait open, then a 0x00 glitch, must not become an executed write.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_zero_padding_does_not_create_a_write() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let (mut client, tx, task) = spawn_rtu_loop(bank.clone(), Duration::from_micros(1750));
+        // 7-byte FC06 broadcast: CRC-valid but one byte short of its layout
+        client
+            .write_all(&rtu_frame(&[0x00, 0x06, 0x00, 0x01, 0x55]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        client.write_all(&[0x00]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(bank.read_03(1, 1).unwrap(), vec![0]);
+        tx.send(()).unwrap();
+        task.await.unwrap();
     }
 
     /// EOF (`read` returning 0) used to spin the loop at 100% CPU.
