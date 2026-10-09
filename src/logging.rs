@@ -21,6 +21,7 @@ fn format_hex(data: &[u8]) -> String {
 
 /// Log levels for the callback logging system
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LogLevel {
     /// Error messages
     Error,
@@ -34,6 +35,7 @@ pub enum LogLevel {
 
 /// Logging mode for packet display
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoggingMode {
     /// Show raw packet data only
     Raw,

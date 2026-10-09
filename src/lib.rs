@@ -71,7 +71,7 @@
 //!
 //! Add to `Cargo.toml`:
 //! ```toml
-//! voltage_modbus = { version = "0.7", default-features = false }
+//! voltage_modbus = { version = "1", default-features = false }
 //! ```
 //!
 //! Then use the core PDU/protocol modules without any std dependency:
@@ -130,10 +130,6 @@ pub mod transport;
 #[cfg(feature = "std")]
 pub mod client;
 
-/// Utility functions and performance monitoring
-#[cfg(feature = "std")]
-pub mod utils;
-
 /// Logging system for the library
 #[cfg(feature = "std")]
 pub mod logging;
@@ -161,10 +157,6 @@ pub mod batcher;
 /// Read coalescing for merging adjacent/overlapping register read requests
 #[cfg(feature = "std")]
 pub mod coalescer;
-
-/// Shared scheduler trait over batcher + coalescer request types
-#[cfg(feature = "std")]
-pub mod scheduler;
 
 /// Device-specific protocol limits configuration
 #[cfg(feature = "std")]
@@ -221,12 +213,6 @@ pub use batcher::{BatchCommand, CommandBatcher};
 pub use coalescer::{CoalescedRead, ReadCoalescer, ReadRequest};
 
 #[cfg(feature = "std")]
-pub use scheduler::ScheduledRequest;
-
-#[cfg(feature = "std")]
-pub use codec::ModbusCodec;
-
-#[cfg(feature = "std")]
 pub use device_limits::DeviceLimits;
 
 #[cfg(feature = "std")]
@@ -237,9 +223,6 @@ pub use transport::{ModbusTransport, RtuOverTcpTransport, TcpTransport, Transpor
 
 #[cfg(feature = "std")]
 pub use transport::{PacketCallback, PacketDirection};
-
-#[cfg(feature = "std")]
-pub use utils::PerformanceMetrics;
 
 #[cfg(feature = "std")]
 pub use logging::{CallbackLogger, LogCallback, LogLevel, LoggingMode};
@@ -253,34 +236,25 @@ pub use server::{
     ServerStats, ServiceFuture,
 };
 
-// === Hidden but preserved (backward compatibility, std-only) ===
+// === Codec / byte-order helpers and defaults at the crate root ===
 #[cfg(feature = "std")]
-#[doc(hidden)]
 pub use batcher::{DEFAULT_BATCH_WINDOW_MS, DEFAULT_MAX_BATCH_SIZE};
 
 #[cfg(feature = "std")]
-#[doc(hidden)]
 pub use bytes::{
     regs_to_bytes_4, regs_to_bytes_8, regs_to_f32, regs_to_f64, regs_to_i32, regs_to_u32,
 };
 
 #[cfg(feature = "std")]
-#[doc(hidden)]
 pub use codec::{
-    clamp_to_data_type, decode_register_value, encode_f64_as_type, encode_value,
-    parse_read_response, registers_for_type,
+    clamp_to_data_type, decode_register_value, encode_f64_as_type, encode_value, registers_for_type,
 };
 
 #[cfg(feature = "std")]
-#[doc(hidden)]
 pub use device_limits::{
     DEFAULT_INTER_REQUEST_DELAY_MS, DEFAULT_MAX_READ_COILS, DEFAULT_MAX_READ_REGISTERS,
     DEFAULT_MAX_WRITE_COILS, DEFAULT_MAX_WRITE_REGISTERS,
 };
-
-#[cfg(feature = "std")]
-#[doc(hidden)]
-pub use utils::OperationTimer;
 
 #[cfg(feature = "rtu")]
 pub use client::{ModbusAsciiClient, ModbusRtuClient};

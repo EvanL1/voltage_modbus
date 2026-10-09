@@ -264,7 +264,8 @@ where
 /// fuzzer can drive the length-derivation branches (including the FC 0x2B
 /// per-object read loop) without needing a real stream handshake.
 ///
-/// Not part of the public API — subject to change without notice.
+/// Only compiled under `cfg(fuzzing)` (set by cargo-fuzz) and for tests.
+#[cfg(any(fuzzing, test))]
 #[doc(hidden)]
 pub async fn read_rtu_frame_fuzz<R>(reader: &mut R, header: [u8; 2]) -> ModbusResult<Vec<u8>>
 where
@@ -732,6 +733,7 @@ pub trait ModbusTransport: Send + Sync {
 
 /// Transport layer statistics
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct TransportStats {
     pub requests_sent: u64,
     pub responses_received: u64,
@@ -744,7 +746,7 @@ pub struct TransportStats {
 /// Modbus TCP transport implementation
 pub struct TcpTransport {
     stream: Option<TcpStream>,
-    pub address: SocketAddr,
+    address: SocketAddr,
     timeout: Duration,
     transaction_id: u16,
     stats: TransportStats,
@@ -794,6 +796,11 @@ impl TcpTransport {
             packet_logging: enable_logging,
             packet_callback: None,
         })
+    }
+
+    /// Server address this transport connects (and reconnects) to
+    pub fn address(&self) -> SocketAddr {
+        self.address
     }
 
     /// Enable or disable packet logging
@@ -1252,7 +1259,7 @@ impl ModbusTransport for TcpTransport {
 pub struct TlsTransport {
     stream: Option<tokio_rustls::client::TlsStream<TcpStream>>,
     /// Remote address
-    pub address: SocketAddr,
+    address: SocketAddr,
     server_name: tokio_rustls::rustls::pki_types::ServerName<'static>,
     connector: tokio_rustls::TlsConnector,
     timeout: Duration,
@@ -1321,6 +1328,11 @@ impl TlsTransport {
 
         self.stream = Some(tls);
         Ok(())
+    }
+
+    /// Server address this transport connects (and reconnects) to
+    pub fn address(&self) -> SocketAddr {
+        self.address
     }
 
     fn next_transaction_id(&mut self) -> u16 {
@@ -1644,7 +1656,8 @@ impl RtuTransport {
     /// Create a minimal `RtuTransport` instance without opening a serial port.
     ///
     /// Intended exclusively for fuzz/property-based testing of the decode path.
-    /// Not part of the public API — subject to change without notice.
+    /// Only compiled under `cfg(fuzzing)` (set by cargo-fuzz) and for tests.
+    #[cfg(any(fuzzing, test))]
     #[doc(hidden)]
     pub fn new_for_fuzz() -> Self {
         Self {
@@ -1666,6 +1679,7 @@ impl RtuTransport {
     ///
     /// Feeds arbitrary bytes through the RTU decode path without needing a
     /// real serial port.  Not part of the public API — subject to change.
+    #[cfg(any(fuzzing, test))]
     #[doc(hidden)]
     pub fn decode_response_fuzz(&self, frame: Vec<u8>) -> ModbusResult<ModbusResponse> {
         self.decode_response(frame)

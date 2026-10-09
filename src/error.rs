@@ -1,8 +1,3 @@
-// Deprecated variants below are exposed for backward compatibility; derive
-// macros (thiserror, defmt::Format) reference them and would otherwise trigger
-// lints. Silencing at module scope keeps call-site warnings for users intact.
-#![allow(deprecated)]
-
 //! # Voltage Modbus Error Handling
 //!
 //! This module provides comprehensive error handling for the Voltage Modbus library,
@@ -185,6 +180,7 @@ pub type ModbusResult<T> = Result<T, ModbusError>;
 #[cfg_attr(feature = "std", derive(Error))]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ModbusError {
     /// I/O related errors (network, serial)
     #[cfg_attr(feature = "std", error("I/O error: {message}"))]
@@ -258,32 +254,6 @@ pub enum ModbusError {
     /// Internal errors (should not occur in normal operation)
     #[cfg_attr(feature = "std", error("Internal error: {message}"))]
     Internal { message: String },
-
-    // Legacy aliases for compatibility
-    /// Legacy timeout error (use Timeout instead)
-    #[cfg_attr(feature = "std", error("Timeout"))]
-    #[deprecated(note = "Use Timeout with operation and timeout_ms fields")]
-    TimeoutLegacy,
-
-    /// Legacy invalid frame error (use Frame instead)
-    #[cfg_attr(feature = "std", error("Invalid frame"))]
-    #[deprecated(note = "Use Frame with message field")]
-    InvalidFrame,
-
-    /// Legacy invalid data value error (use InvalidData instead)
-    #[cfg_attr(feature = "std", error("Invalid data value"))]
-    #[deprecated(note = "Use InvalidData with message field")]
-    InvalidDataValue,
-
-    /// Legacy illegal function error (use InvalidFunction instead)
-    #[cfg_attr(feature = "std", error("Illegal function"))]
-    #[deprecated(note = "Use InvalidFunction with code field")]
-    IllegalFunction,
-
-    /// Legacy internal error (use Internal instead)
-    #[cfg_attr(feature = "std", error("Internal error"))]
-    #[deprecated(note = "Use Internal with message field")]
-    InternalError,
 }
 
 // In no_std mode we manually implement Display and core::error::Error,
@@ -329,16 +299,6 @@ impl fmt::Display for ModbusError {
                 expected, actual
             ),
             Self::Internal { message } => write!(f, "Internal error: {}", message),
-            #[allow(deprecated)]
-            Self::TimeoutLegacy => write!(f, "Timeout"),
-            #[allow(deprecated)]
-            Self::InvalidFrame => write!(f, "Invalid frame"),
-            #[allow(deprecated)]
-            Self::InvalidDataValue => write!(f, "Invalid data value"),
-            #[allow(deprecated)]
-            Self::IllegalFunction => write!(f, "Illegal function"),
-            #[allow(deprecated)]
-            Self::InternalError => write!(f, "Internal error"),
         }
     }
 }

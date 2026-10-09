@@ -36,6 +36,7 @@ use core::fmt;
 /// assert!(order.has_word_swap());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ByteOrder {
     /// Big-endian: ABCD (most significant byte first)
     ///

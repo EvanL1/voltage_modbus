@@ -41,14 +41,24 @@ cargo add voltage_modbus
 For RTU (serial) support:
 
 ```toml
-voltage_modbus = { version = "0.7", features = ["rtu"] }
+voltage_modbus = { version = "1", features = ["rtu"] }
 ```
 
 For `no_std` (PDU encoding/decoding only):
 
 ```toml
-voltage_modbus = { version = "0.7", default-features = false }
+voltage_modbus = { version = "1", default-features = false }
 ```
+
+### Cargo features
+
+| Feature | Default | Adds |
+|---------|---------|------|
+| `std` | yes | Tokio TCP client/server, RTU-over-TCP, codec, batching, coalescing |
+| `rtu` | no | Serial RTU and ASCII clients/servers (`tokio-serial`) |
+| `tls` | no | Modbus/TCP Security client (`ModbusTlsClient`, rustls with the ring provider) |
+| `embedded` | no | `no_std` + `alloc` RTU transport over `embedded-io-async` |
+| `defmt` | no | `defmt::Format` for the no_std public types |
 
 ## Quick Start
 
@@ -152,16 +162,27 @@ async fn main() -> ModbusResult<()> {
 
 ## Supported Function Codes
 
-| Code | Function                 | Method |
-| ---- | ------------------------ | ------ |
-| 0x01 | Read Coils               | `read_01()` / `read_coils()` |
-| 0x02 | Read Discrete Inputs     | `read_02()` / `read_discrete_inputs()` |
-| 0x03 | Read Holding Registers   | `read_03()` / `read_holding_registers()` |
-| 0x04 | Read Input Registers     | `read_04()` / `read_input_registers()` |
-| 0x05 | Write Single Coil        | `write_05()` / `write_single_coil()` |
-| 0x06 | Write Single Register    | `write_06()` / `write_single_register()` |
-| 0x0F | Write Multiple Coils     | `write_0f()` / `write_multiple_coils()` |
-| 0x10 | Write Multiple Registers | `write_10()` / `write_multiple_registers()` |
+| Code | Function | Client method | Server |
+| ---- | -------- | ------------- | ------ |
+| 0x01 | Read Coils | `read_01()` / `read_coils()` | ✅ |
+| 0x02 | Read Discrete Inputs | `read_02()` / `read_discrete_inputs()` | ✅ |
+| 0x03 | Read Holding Registers | `read_03()` / `read_holding_registers()` | ✅ |
+| 0x04 | Read Input Registers | `read_04()` / `read_input_registers()` | ✅ |
+| 0x05 | Write Single Coil | `write_05()` / `write_single_coil()` | ✅ |
+| 0x06 | Write Single Register | `write_06()` / `write_single_register()` | ✅ |
+| 0x07 | Read Exception Status | `read_exception_status()` | — |
+| 0x08 | Diagnostics | `diagnostics()` | ✅ (sub 0x00 echo) |
+| 0x0B | Get Comm Event Counter | `get_comm_event_counter()` | — |
+| 0x0C | Get Comm Event Log | `get_comm_event_log()` | — |
+| 0x0F | Write Multiple Coils | `write_0f()` / `write_multiple_coils()` | ✅ |
+| 0x10 | Write Multiple Registers | `write_10()` / `write_multiple_registers()` | ✅ |
+| 0x11 | Report Server ID | `report_server_id()` | — |
+| 0x16 | Mask Write Register | `write_16()` | ✅ |
+| 0x17 | Read/Write Multiple Registers | `read_write_17()` | ✅ |
+| 0x2B | Read Device Identification | `read_device_identification()` | ✅ (`set_device_identity`) |
+
+FC 0x07/0x08/0x0B/0x0C/0x11, and the `mask_write_register()` / `read_write_multiple_registers()`
+aliases, are on the generic client (`client.generic_mut()`).
 
 ## Architecture
 
@@ -198,6 +219,30 @@ async fn main() -> ModbusResult<()> {
 ```
 
 TCP and RTU share identical PDU (Protocol Data Unit), differing only in transport framing.
+
+## Stability
+
+Since 1.0 the crate follows [Semantic Versioning](https://semver.org/): breaking
+changes to the public API only happen in a new major version. Public enums
+(`ModbusError`, `ModbusFunction`, `ModbusException`, `ByteOrder`, `ModbusValue`, …),
+configuration structs (`ModbusTcpServerConfig`, `RetryPolicy`, `DeviceLimits`, …) and
+returned data structs (statistics, `DeviceIdentification`, …) are `#[non_exhaustive]`,
+so new variants and fields arrive in minor releases. Match enums with a `_` arm, and
+build configs from `Default`/constructors and then set fields, rather than with a
+struct literal. Methods added later to the user-implementable traits
+(`ModbusTransport`, `ModbusClient`, `ModbusService`) come with default bodies;
+`ModbusServer` is sealed.
+
+Exceptions to the guarantee:
+
+- **Optional third-party types.** The `rtu`, `tls`, `embedded` and `defmt` features
+  expose types from `tokio-serial`, `rustls`/`tokio-rustls`, `embedded-io-async` and
+  `defmt`. A major
+  upgrade of one of those may ship in a minor release, noted in the CHANGELOG.
+  Default features only expose Tokio (1.x).
+- **MSRV.** The minimum supported Rust version (currently 1.85) may be raised in a
+  minor release, never in a patch release.
+- **`#[doc(hidden)]` items** are not public API.
 
 ## Documentation
 

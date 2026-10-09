@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
 ## Build & Test Commands
 
@@ -9,9 +9,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 cargo build
 cargo build --features rtu                 # Add RTU serial support
 cargo build --features tls                 # Add Modbus/TCP Security (TLS client)
-cargo build --all-features                 # All features (rtu, tls, embedded, defmt)
+cargo build --features "rtu,igw"           # All std features
 cargo build --no-default-features          # no_std build (core modules only: constants, error, pdu, protocol)
-cargo build --no-default-features --features embedded,defmt  # no_std + alloc embedded transport
 
 # Test
 cargo test                                 # All unit + integration tests
@@ -54,29 +53,27 @@ Client methods use function-code naming as primary (`read_03`, `write_06`) with 
 ### Module Responsibilities
 
 - **`client.rs`**: `ModbusClient` trait, `GenericModbusClient<T>`, `ModbusTcpClient`, `ModbusRtuClient`, batch read methods, `RetryPolicy` (opt-in retry with exponential backoff for recoverable errors), extended FCs (`write_16` mask write, `read_write_17`, `read_device_identification`)
-- **`transport.rs`**: `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID, pipelining), `TlsTransport` (`tls`), `RtuOverTcpTransport`, `RtuTransport` / `AsciiTransport` (`rtu`; CRC-16 / LRC, spec t3.5 frame gap, length-aware frame reads), `TransportStats`, `PacketCallback`. All TCP connects go through `connect_tcp()` (timeout-bounded); RTU-over-TCP takes the stream out for each round trip so a cancelled request cannot leave a stale reply. PDU bodies come from the shared `ModbusRequest::encode_pdu()` — add new function codes there, not per-transport
+- **`transport.rs`**: `ModbusTransport` trait, `TcpTransport` (MBAP framing, reconnection, transaction ID, pipelining), `RtuTransport` (CRC-16, spec t3.5 frame gap, length-aware frame reads), `TransportStats`, `PacketCallback`. PDU bodies come from the shared `ModbusRequest::encode_pdu()` — add new function codes there, not per-transport
 - **`server.rs`**: `ModbusTcpServer` / `ModbusRtuServer`, plus the `ModbusService` trait — servers dispatch raw PDUs to a service; `ModbusRegisterBank` is the default in-memory implementation, `set_service()` swaps in custom logic
 - **`register_bank.rs`**: `RegisterBank` — server-side storage for coils / discrete inputs / holding / input registers
 - **`protocol.rs`**: `ModbusFunction` enum, `ModbusRequest`/`ModbusResponse` structs, `data_utils` for register/bit conversions
 - **`pdu.rs`**: `ModbusPdu` — stack-allocated fixed-size buffer (253 bytes, no heap), `PduBuilder` fluent API
 - **`error.rs`**: `ModbusError` enum (`thiserror` in std, hand-rolled `Display` in no_std), classifiable via `is_recoverable()`, `is_transport_error()`, `is_protocol_error()`
-- **`codec.rs`**: free functions (`decode_register_value`, `encode_value`, `encode_f64_as_type`, `registers_for_type`) — typed values ↔ registers with configurable byte order
-- **`bytes.rs`**: `ByteOrder` enum (BigEndian, LittleEndian, BigEndianSwap, LittleEndianSwap, BigEndian16, LittleEndian16) plus `regs_to_*` helpers
+- **`codec.rs`**: `ModbusCodec` — encode/decode typed values (f32, f64, i32, u32, string) with configurable byte order
+- **`bytes.rs`**: `ByteOrder` enum (BigEndian, LittleEndian, MidBigEndian, MidLittleEndian)
 - **`batcher.rs`**: `CommandBatcher` — write command batching with configurable window and max batch size
 - **`coalescer.rs`**: read-request coalescing — merges overlapping/adjacent read ranges into fewer on-wire requests
 - **`value.rs`**: `ModbusValue` enum for typed industrial data values
 - **`device_limits.rs`**: `DeviceLimits` — per-device protocol limit configuration
 - **`constants.rs`**: Modbus spec constants (MAX_PDU_SIZE=253, MAX_READ_REGISTERS=125, etc.) — `no_std` safe
-- **`logging.rs`**: `CallbackLogger` / packet logging helpers (std only)
-- **`embedded.rs`** (`embedded`): `EmbeddedRtuTransport` — no_std + alloc RTU over `embedded-io-async`; callers must bound each request with their own timeout
+- **`logging.rs`** / **`utils.rs`**: tracing setup and shared helpers (std only)
 
 ### Feature Flags
 
-- **`std`** (default): enables `tokio`, `thiserror` — full async TCP client/server
+- **`std`** (default): enables `tokio`, `thiserror`, `bytes`, `chrono` — full async TCP client/server
 - **`rtu`**: implies `std`; adds `tokio-serial` for `ModbusRtuClient` / `RtuTransport`
 - **`tls`**: implies `std`; adds `tokio-rustls` (ring provider) for `ModbusTlsClient` / `TlsTransport` — Modbus/TCP Security, caller supplies the `rustls::ClientConfig`
-- **`embedded`**: no_std + alloc; adds the `embedded` module (`embedded-io-async`, `heapless`)
-- **`defmt`**: derives `defmt::Format` for the no_std public types
+- **`igw`**: implies `std`; optional IGW integration
 - **no_std**: `cargo build --no-default-features` — only `constants`, `error`, `pdu`, `protocol` compile. Keep these four modules `alloc`/`core`-only; guard any `std`-dependent code behind `#[cfg(feature = "std")]`.
 
 ### Zero-Copy Response Parsing
@@ -86,8 +83,7 @@ Client methods use function-code naming as primary (`read_03`, `write_06`) with 
 ## Conventions
 
 - MSRV: Rust 1.85.0, Edition 2021
-- All std I/O is async via Tokio (the `embedded` transport uses `embedded-io-async`)
-- Semver (since 1.0): public enums and stats structs are `#[non_exhaustive]`; no new `pub` fields — add getters. Breaking changes need a major version. Fuzz entry points are `#[cfg(any(fuzzing, test))]`
+- All I/O is async via Tokio
 - Zero `unsafe` code — pure safe Rust
 - Error construction uses factory methods: `ModbusError::timeout(op, ms)`, `ModbusError::frame(msg)`, etc.
 - Protocol constants in `constants.rs` are derived from the Modbus spec with calculation comments

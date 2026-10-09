@@ -1,7 +1,7 @@
 [workspace]
 [package]
 name = "voltage_modbus"
-version = "0.7.3"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.85.0"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
@@ -12,14 +12,14 @@ repository = "https://github.com/EvanL1/voltage_modbus"
 documentation = "https://docs.rs/voltage_modbus"
 readme = "README.md"
 keywords = ["modbus", "industrial", "automation", "tcp", "rtu"]
-categories = ["network-programming", "embedded"]
-exclude = [
-    ".github/*",
-    "tests/*",
-    "docs/*",
-    "target/*",
-    "Cargo.lock",
-    "*.log"
+categories = ["network-programming", "embedded", "no-std"]
+include = [
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "benches/**/*.rs",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
 ]
 
 [lib]
@@ -53,9 +53,6 @@ tokio-rustls = { version = "0.26", optional = true, default-features = false, fe
     "tls12",
 ] }
 
-# IGW integration (optional, requires std)
-igw = { version = "0.2", optional = true }
-
 # Embedded async I/O (no_std compatible)
 embedded-io-async = { version = "0.6", default-features = false, optional = true }
 
@@ -82,7 +79,6 @@ std = [
     "dep:thiserror",
 ]
 rtu = ["std", "dep:tokio-serial"]
-igw = ["std", "dep:igw"]
 
 # Modbus/TCP Security: TLS client transport (IANA port 802) via tokio-rustls
 tls = ["std", "dep:tokio-rustls"]
@@ -133,3 +129,7 @@ targets = ["x86_64-unknown-linux-gnu"]
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[lints.rust]
+# `fuzzing` is set by cargo-fuzz; it gates the `*_fuzz` entry points.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

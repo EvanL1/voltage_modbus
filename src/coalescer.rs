@@ -74,6 +74,7 @@ impl ReadRequest {
 /// 表示多个原始 `ReadRequest` 被合并为一次 Modbus 读操作的结果。
 /// `mappings` 记录了每个原始请求在合并后数据中的位置。
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CoalescedRead {
     /// 从站 ID
     pub slave_id: u8,

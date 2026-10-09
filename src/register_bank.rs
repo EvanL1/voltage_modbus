@@ -289,6 +289,7 @@ impl Default for ModbusRegisterBank {
 
 /// Register bank statistics
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RegisterBankStats {
     pub coils_count: usize,
     pub discrete_inputs_count: usize,

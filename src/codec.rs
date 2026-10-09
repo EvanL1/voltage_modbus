@@ -18,13 +18,8 @@
 //! | f64 | 4 | float64, double, lreal |
 
 use crate::bytes::{bytes_4_to_regs, bytes_8_to_regs, regs_to_bytes_4, regs_to_bytes_8, ByteOrder};
-use crate::constants;
 use crate::error::{ModbusError, ModbusResult};
-use crate::pdu::{ModbusPdu, PduBuilder};
 use crate::value::ModbusValue;
-
-/// Modbus codec for data encoding/decoding.
-pub struct ModbusCodec;
 
 // ============================================================================
 // Decoding Functions
@@ -235,77 +230,6 @@ pub fn clamp_to_data_type(value: f64, data_type: &str) -> f64 {
     value.clamp(min, max)
 }
 
-/// Parse a Modbus response PDU and extract register data.
-///
-/// This function implements graceful degradation - it will attempt to parse
-/// as much valid data as possible even when the response is incomplete.
-///
-/// # Arguments
-/// * `pdu` - The Modbus PDU to parse
-/// * `function_code` - Expected function code (1, 2, 3, or 4)
-/// * `expected_count` - Expected number of coils (FC01/02) or registers (FC03/04)
-///
-/// # Returns
-/// - For FC01/02: Vec of bytes (each stored as u16 for uniform processing)
-/// - For FC03/04: Vec of 16-bit register values
-pub fn parse_read_response(
-    pdu: &ModbusPdu,
-    function_code: u8,
-    _expected_count: u16,
-) -> ModbusResult<Vec<u16>> {
-    let pdu_data = pdu.as_slice();
-
-    // Minimum viable PDU check
-    if pdu_data.len() < 2 {
-        return Ok(Vec::new()); // Return empty instead of failing
-    }
-
-    let actual_fc = pdu.function_code().unwrap_or(0);
-    if actual_fc != function_code {
-        return Err(ModbusError::Protocol {
-            message: format!(
-                "Function code mismatch: expected {}, got {}",
-                function_code, actual_fc
-            ),
-        });
-    }
-
-    let byte_count = pdu_data[1] as usize;
-    let available_bytes = pdu_data.len().saturating_sub(2);
-    let actual_byte_count = byte_count.min(available_bytes);
-
-    match function_code {
-        1 | 2 => {
-            // FC 01/02: coils/discrete inputs
-            // Pre-allocate capacity to avoid reallocations
-            let mut registers = Vec::with_capacity(actual_byte_count);
-            for &byte in &pdu_data[2..2 + actual_byte_count] {
-                registers.push(u16::from(byte));
-            }
-            Ok(registers)
-        }
-        3 | 4 => {
-            // FC 03/04: holding/input registers
-            let complete_pairs = actual_byte_count / 2;
-            // Pre-allocate capacity to avoid reallocations
-            let mut registers = Vec::with_capacity(complete_pairs);
-
-            for i in 0..complete_pairs {
-                let offset = 2 + i * 2;
-                if offset + 1 < pdu_data.len() {
-                    let value =
-                        (u16::from(pdu_data[offset]) << 8) | u16::from(pdu_data[offset + 1]);
-                    registers.push(value);
-                }
-            }
-            Ok(registers)
-        }
-        _ => Err(ModbusError::Protocol {
-            message: format!("Unsupported function code: {}", function_code),
-        }),
-    }
-}
-
 // ============================================================================
 // Encoding Functions
 // ============================================================================
@@ -442,141 +366,6 @@ pub fn encode_f64_as_type(
     Err(ModbusError::InvalidData {
         message: format!("Unsupported data type: {}", data_type),
     })
-}
-
-// ============================================================================
-// PDU Building Functions
-// ============================================================================
-
-impl ModbusCodec {
-    /// Build write PDU for FC05 (Write Single Coil).
-    pub fn build_fc05_pdu(address: u16, value: bool) -> ModbusResult<ModbusPdu> {
-        Ok(PduBuilder::new()
-            .function_code(0x05)?
-            .address(address)?
-            .byte(if value { 0xFF } else { 0x00 })?
-            .byte(0x00)?
-            .build())
-    }
-
-    /// Build write PDU for FC06 (Write Single Register).
-    pub fn build_fc06_pdu(address: u16, value: u16) -> ModbusResult<ModbusPdu> {
-        Ok(PduBuilder::new()
-            .function_code(0x06)?
-            .address(address)?
-            .quantity(value)?
-            .build())
-    }
-
-    /// Build write PDU for FC15 (Write Multiple Coils).
-    pub fn build_fc15_pdu(start_address: u16, values: &[bool]) -> ModbusResult<ModbusPdu> {
-        if values.is_empty() || values.len() > constants::MAX_WRITE_COILS {
-            return Err(ModbusError::InvalidData {
-                message: "Invalid coil count for FC15".to_string(),
-            });
-        }
-
-        let mut pdu = ModbusPdu::new();
-
-        // Function code
-        pdu.push(0x0F)?;
-
-        // Starting address
-        pdu.push_u16(start_address)?;
-
-        // Quantity of coils
-        let quantity = values.len() as u16;
-        pdu.push_u16(quantity)?;
-
-        // Byte count
-        let byte_count = values.len().div_ceil(8) as u8;
-        pdu.push(byte_count)?;
-
-        // Coil values (packed as bits)
-        let mut current_byte = 0u8;
-        let mut bit_index = 0;
-
-        for &value in values {
-            if value {
-                current_byte |= 1 << bit_index;
-            }
-            bit_index += 1;
-
-            if bit_index == 8 {
-                pdu.push(current_byte)?;
-                current_byte = 0;
-                bit_index = 0;
-            }
-        }
-
-        // Push last byte if needed
-        if bit_index > 0 {
-            pdu.push(current_byte)?;
-        }
-
-        Ok(pdu)
-    }
-
-    /// Build write PDU for FC16 (Write Multiple Registers).
-    pub fn build_fc16_pdu(start_address: u16, values: &[u16]) -> ModbusResult<ModbusPdu> {
-        if values.is_empty() || values.len() > constants::MAX_WRITE_REGISTERS {
-            return Err(ModbusError::InvalidData {
-                message: "Invalid register count for FC16".to_string(),
-            });
-        }
-
-        let mut pdu = ModbusPdu::new();
-
-        // Function code
-        pdu.push(0x10)?;
-
-        // Starting address
-        pdu.push_u16(start_address)?;
-
-        // Quantity of registers
-        let quantity = values.len() as u16;
-        pdu.push_u16(quantity)?;
-
-        // Byte count
-        let byte_count = (values.len() * 2) as u8;
-        pdu.push(byte_count)?;
-
-        // Register values
-        for &value in values {
-            pdu.push_u16(value)?;
-        }
-
-        Ok(pdu)
-    }
-
-    /// Parse write response PDU.
-    pub fn parse_write_response(pdu: &ModbusPdu, expected_fc: u8) -> ModbusResult<bool> {
-        let data = pdu.as_slice();
-
-        if data.is_empty() {
-            return Err(ModbusError::Protocol {
-                message: "Empty response PDU".to_string(),
-            });
-        }
-
-        // Check for exception response
-        if data[0] & 0x80 != 0 {
-            let exception_code = if data.len() > 1 { data[1] } else { 0 };
-            return Err(ModbusError::exception(data[0] & 0x7F, exception_code));
-        }
-
-        // Verify function code
-        if data[0] != expected_fc {
-            return Err(ModbusError::Protocol {
-                message: format!(
-                    "Function code mismatch: expected {:02X}, got {:02X}",
-                    expected_fc, data[0]
-                ),
-            });
-        }
-
-        Ok(true)
-    }
 }
 
 /// Get the number of registers required for a data type.
@@ -736,36 +525,5 @@ mod tests {
         assert_eq!(registers_for_type("uint16"), 1);
         assert_eq!(registers_for_type("int32"), 2);
         assert_eq!(registers_for_type("float64"), 4);
-    }
-
-    #[test]
-    fn test_build_fc05_pdu() {
-        let pdu = ModbusCodec::build_fc05_pdu(0x0100, true).unwrap();
-        assert_eq!(pdu.as_slice(), &[0x05, 0x01, 0x00, 0xFF, 0x00]);
-    }
-
-    #[test]
-    fn test_build_fc06_pdu() {
-        let pdu = ModbusCodec::build_fc06_pdu(0x0100, 0x1234).unwrap();
-        assert_eq!(pdu.as_slice(), &[0x06, 0x01, 0x00, 0x12, 0x34]);
-    }
-
-    #[test]
-    fn test_build_fc15_pdu() {
-        let pdu = ModbusCodec::build_fc15_pdu(0x0100, &[true, false, true]).unwrap();
-        // FC15: [FC, AddrH, AddrL, QtyH, QtyL, ByteCount, Data...]
-        assert_eq!(
-            pdu.as_slice(),
-            &[0x0F, 0x01, 0x00, 0x00, 0x03, 0x01, 0b0000_0101]
-        );
-    }
-
-    #[test]
-    fn test_build_fc16_pdu() {
-        let pdu = ModbusCodec::build_fc16_pdu(0x0100, &[0x1234, 0x5678]).unwrap();
-        assert_eq!(
-            pdu.as_slice(),
-            &[0x10, 0x01, 0x00, 0x00, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78]
-        );
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! Demonstrates the voltage_modbus library features including:
 //! - Basic Modbus TCP client operations (read/write registers and coils)
-//! - Industrial Enhancement features (ModbusValue, ByteOrder, ModbusCodec)
+//! - Industrial Enhancement features (ModbusValue, ByteOrder, codec)
 //! - Simplified API with function code naming (read_03, write_06, etc.)
 //!
 //! Usage: cargo run --bin demo \[server_address\]

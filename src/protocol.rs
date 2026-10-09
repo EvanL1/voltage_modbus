@@ -112,9 +112,6 @@ use crate::pdu::ModbusPdu;
 /// Modbus address type (0-65535)
 pub type ModbusAddress = u16;
 
-/// Modbus value type (16-bit register value)
-pub type ModbusValue = u16;
-
 /// Modbus slave/unit identifier (1-247)
 pub type SlaveId = u8;
 
@@ -122,6 +119,7 @@ pub type SlaveId = u8;
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ModbusFunction {
     /// Read Coils (0x01)
     ReadCoils = 0x01,
@@ -244,6 +242,7 @@ impl fmt::Display for ModbusFunction {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum ModbusException {
     IllegalFunction = 0x01,
     IllegalDataAddress = 0x02,
@@ -760,9 +759,8 @@ pub struct ModbusResponse {
     data_offset: usize,
     /// Length of payload data
     data_len: usize,
-    /// Decoded exception, `None` for success *and* for exception codes
-    /// outside [`ModbusException`]; use [`Self::is_exception`] to test.
-    pub exception: Option<ModbusException>,
+    /// Decoded exception; `None` for success and for codes outside [`ModbusException`]
+    exception: Option<ModbusException>,
     /// Raw exception code as received, kept so unknown codes still count as
     /// exceptions and errors carry the exact code.
     exception_code: Option<u8>,
@@ -862,6 +860,14 @@ impl ModbusResponse {
         self.data_len
     }
 
+    /// Decoded exception, if this is an exception response with a code known
+    /// to [`ModbusException`]. Use [`Self::is_exception`] to test for any
+    /// exception, including unknown codes.
+    #[inline]
+    pub fn exception(&self) -> Option<ModbusException> {
+        self.exception
+    }
+
     /// Check if this is an exception response
     #[inline]
     pub fn is_exception(&self) -> bool {
@@ -940,6 +946,7 @@ impl ModbusResponse {
 
 /// Parsed get-comm-event-log response (FC 0x0C)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct CommEventLog {
     /// Device status word (0x0000 ready, 0xFFFF busy)
     pub status: u16,
@@ -953,6 +960,7 @@ pub struct CommEventLog {
 
 /// Parsed report-server-id response (FC 0x11)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct ServerIdReport {
     /// Device-specific server id bytes
     pub server_id: Vec<u8>,
@@ -983,6 +991,7 @@ impl ServerIdReport {
 
 /// A single device-identification object (FC 0x2B / MEI 0x0E)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DeviceIdObject {
     /// Object id: 0x00 VendorName, 0x01 ProductCode, 0x02 MajorMinorRevision,
     /// 0x03 VendorUrl, 0x04 ProductName, 0x05 ModelName, 0x06 UserApplicationName,
@@ -1001,6 +1010,7 @@ impl DeviceIdObject {
 
 /// Parsed read-device-identification response (FC 0x2B / MEI 0x0E)
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct DeviceIdentification {
     /// Conformity level reported by the device (0x01-0x03, 0x81-0x83)
     pub conformity_level: u8,

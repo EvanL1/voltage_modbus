@@ -31,8 +31,18 @@ const MAX_TCP_FRAME_SIZE: usize = 260;
 /// MBAP header size
 const MBAP_HEADER_SIZE: usize = 6;
 
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::ModbusTcpServer {}
+    #[cfg(feature = "rtu")]
+    impl Sealed for super::ModbusRtuServer {}
+}
+
 /// Modbus server trait
-pub trait ModbusServer: Send + Sync {
+///
+/// Sealed: implemented only by this crate's servers, so methods can be added
+/// without a breaking change. Customize behavior through [`ModbusService`].
+pub trait ModbusServer: sealed::Sealed + Send + Sync {
     /// Start the server
     fn start(&mut self) -> impl std::future::Future<Output = ModbusResult<()>> + Send;
 
@@ -180,7 +190,8 @@ impl DeviceIdentity {
 
     /// Thin public wrapper around [`Self::handle_request`] for fuzz testing.
     ///
-    /// Not part of the public API — subject to change without notice.
+    /// Only compiled under `cfg(fuzzing)` (set by cargo-fuzz) and for tests.
+    #[cfg(any(fuzzing, test))]
     #[doc(hidden)]
     pub fn handle_request_fuzz(&self, data: &[u8]) -> ModbusResult<Vec<u8>> {
         self.handle_request(data)
@@ -293,6 +304,7 @@ fn effective_service(
 
 /// Server statistics
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ServerStats {
     pub connections_count: u64,
     pub total_requests: u64,
@@ -306,6 +318,7 @@ pub struct ServerStats {
 
 /// Modbus TCP server configuration
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ModbusTcpServerConfig {
     pub bind_address: SocketAddr,
     pub max_connections: usize,
@@ -1082,6 +1095,7 @@ impl ModbusServer for ModbusTcpServer {
 /// Modbus RTU server configuration
 #[cfg(feature = "rtu")]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ModbusRtuServerConfig {
     pub port: String,
     pub baud_rate: u32,
@@ -1253,7 +1267,8 @@ impl ModbusRtuServer {
     /// fuzzed frames exercise the full CRC-check → slave-filter → FC-dispatch
     /// → register-bank path, including the register read/write handlers.
     ///
-    /// Not part of the public API — subject to change without notice.
+    /// Only compiled under `cfg(fuzzing)` (set by cargo-fuzz) and for tests.
+    #[cfg(any(fuzzing, test))]
     #[doc(hidden)]
     pub async fn process_frame_fuzz(frame: &[u8], own_slave_id: u8) -> Option<Vec<u8>> {
         let bank = ModbusRegisterBank::new();

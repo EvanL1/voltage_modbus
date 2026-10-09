@@ -9,7 +9,7 @@ use core::fmt;
 ///
 /// This enum represents all numeric types commonly used in industrial
 /// automation and SCADA systems. It is designed to be self-contained
-/// (no external dependencies) for use with `ModbusCodec`.
+/// (no external dependencies) for use with the [`codec`](crate::codec) module.
 ///
 /// # Register Mapping
 ///
@@ -30,6 +30,7 @@ use core::fmt;
 /// assert!((temp.as_f64() - 25.5).abs() < 0.001);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ModbusValue {
     /// Boolean value (typically from coils)
     Bool(bool),

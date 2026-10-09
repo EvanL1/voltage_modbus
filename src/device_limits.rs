@@ -46,6 +46,7 @@ pub const DEFAULT_INTER_REQUEST_DELAY_MS: u64 = 0;
 /// assert_eq!(limits.max_read_registers, 50);
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DeviceLimits {
     /// Maximum registers per read request.
     pub max_read_registers: u16,

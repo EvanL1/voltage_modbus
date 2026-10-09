@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.3] - 2026-10-08
+## [1.0.0] - 2026-10-09
+
+First stable release. From here on the public API follows Semantic Versioning; see
+the *Stability* section of the README for the exact guarantee. This release also
+contains the fixes prepared as 0.7.3, which was never published.
+
+### Breaking changes
+- **`#[non_exhaustive]`** on `ModbusError`, `ModbusFunction`, `ModbusException`,
+  `ByteOrder`, `ModbusValue`, `LogLevel`, `LoggingMode`; on the statistics structs
+  `TransportStats`, `ServerStats`, `RegisterBankStats`; on the config structs
+  `ModbusTcpServerConfig`, `ModbusRtuServerConfig`, `RetryPolicy`, `DeviceLimits`; and
+  on the returned data structs `CoalescedRead`, `CommEventLog`, `ServerIdReport`,
+  `DeviceIdObject`, `DeviceIdentification`. Exhaustive `match`es need a `_` arm.
+  Struct literals (including `..Default::default()`) no longer compile outside the
+  crate: start from `Default::default()` / the constructor and assign fields; custom
+  `ModbusTransport` impls build stats with `TransportStats::default()`.
+- **`ModbusServer` is sealed** — it was only ever implemented by `ModbusTcpServer` /
+  `ModbusRtuServer`; custom server behavior goes through `ModbusService`.
+- **Fields → getters**: `ModbusResponse::exception` is now a method
+  (`response.exception()`); `TcpTransport::address` / `TlsTransport::address` are now
+  `address()`. The fields are private.
+- **Exception responses** surface as `ModbusError::Exception` instead of
+  `ModbusError::Protocol` (see *Fixed*).
+- **Removed** (unused or superseded):
+  - `scheduler` module and the `ScheduledRequest` trait.
+  - `ModbusCodec` and its `build_fc05_pdu` / `build_fc06_pdu` / `build_fc15_pdu` /
+    `build_fc16_pdu` / `parse_write_response` — use `ModbusRequest` (`encode_pdu()`)
+    or `PduBuilder`.
+  - `codec::parse_read_response` (returned `Ok(empty)` on truncated PDUs) — use
+    `ModbusResponse::parse_registers()` / `parse_bits()`.
+  - The crate-level `utils` module: `PerformanceMetrics`, `OperationTimer`,
+    `utils::validation`, `utils::format`, `utils::logging` (`client::utils` stays).
+  - `protocol::ModbusValue` (a `u16` alias that clashed with `value::ModbusValue`).
+  - Deprecated `ModbusError` variants `TimeoutLegacy`, `InvalidFrame`,
+    `InvalidDataValue`, `IllegalFunction`, `InternalError` — use `Timeout`, `Frame`,
+    `InvalidData`, `InvalidFunction`, `Internal`.
+  - The `igw` feature, which enabled a dependency but no code.
+- **Fuzz entry points** (`*_fuzz`, `RtuTransport::new_for_fuzz`) only compile under
+  `cfg(fuzzing)` (set by cargo-fuzz) and for the crate's own tests.
+- Crate-root re-exports of the codec / byte-order helpers (`regs_to_f32`,
+  `decode_register_value`, `DEFAULT_*`, …) are no longer `#[doc(hidden)]`; they are
+  documented, supported API.
+
+### Migration from 0.7
+- `match err { … }` over `ModbusError` (or `ByteOrder`, `ModbusFunction`, …): add `_ => …`.
+- `resp.exception` → `resp.exception()`; prefer `resp.is_exception()` /
+  `resp.get_exception()`, which also cover codes outside `ModbusException`.
+- `transport.address` → `transport.address()`.
+- `ModbusTcpServerConfig { bind_address, ..Default::default() }` →
+  `let mut cfg = ModbusTcpServerConfig::default(); cfg.bind_address = …;` (same for the
+  other config structs; `DeviceLimits` and `RetryPolicy` also have builder methods).
+- Code that matched `ModbusError::Protocol` to detect device exceptions: match
+  `ModbusError::Exception { code, .. }`.
+- If you used anything from the removed list, the replacement is named next to it above.
 
 ### Fixed
 - **docs.rs build**: 0.7.2's documentation failed to build on docs.rs because nightly removed `feature(doc_auto_cfg)` (merged into `doc_cfg`). Switched to `feature(doc_cfg)`; CI now reproduces the docs.rs build (nightly + `--cfg docsrs`).

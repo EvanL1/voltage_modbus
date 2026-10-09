@@ -92,6 +92,7 @@ use crate::transport::RtuTransport;
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RetryPolicy {
     /// Extra attempts after the first failure (0 = no retries)
     pub max_retries: u32,
@@ -838,7 +839,8 @@ impl<T: ModbusTransport> GenericModbusClient<T> {
 /// on this function having already bounds-checked the response) is otherwise
 /// only reachable through a live transport round trip.
 ///
-/// Not part of the public API — subject to change without notice.
+/// Only compiled under `cfg(fuzzing)` (set by cargo-fuzz) and for tests.
+#[cfg(any(fuzzing, test))]
 #[doc(hidden)]
 pub fn validate_response_matches_request_fuzz(
     request: &ModbusRequest,
@@ -1553,7 +1555,7 @@ impl ModbusTcpClient {
 
     /// Get the server address
     pub fn server_address(&self) -> SocketAddr {
-        self.inner.transport().address
+        self.inner.transport().address()
     }
 
     /// Enable or disable packet logging on existing client
@@ -2424,6 +2426,46 @@ impl ModbusTlsClient {
     /// (extended FCs, serial diagnostics, coalesced reads, ...)
     pub fn generic_mut(&mut self) -> &mut GenericModbusClient<crate::transport::TlsTransport> {
         &mut self.inner
+    }
+
+    /// Mask write register (FC 0x16) — see [`GenericModbusClient::write_16`]
+    pub async fn write_16(
+        &mut self,
+        slave_id: SlaveId,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<()> {
+        self.inner
+            .write_16(slave_id, address, and_mask, or_mask)
+            .await
+    }
+
+    /// Read/write multiple registers (FC 0x17) — see [`GenericModbusClient::read_write_17`]
+    pub async fn read_write_17(
+        &mut self,
+        slave_id: SlaveId,
+        read_address: u16,
+        read_quantity: u16,
+        write_address: u16,
+        values: &[u16],
+    ) -> ModbusResult<Vec<u16>> {
+        self.inner
+            .read_write_17(slave_id, read_address, read_quantity, write_address, values)
+            .await
+    }
+
+    /// Read device identification (FC 0x2B / MEI 0x0E) —
+    /// see [`GenericModbusClient::read_device_identification`]
+    pub async fn read_device_identification(
+        &mut self,
+        slave_id: SlaveId,
+        read_code: u8,
+        object_id: u8,
+    ) -> ModbusResult<crate::protocol::DeviceIdentification> {
+        self.inner
+            .read_device_identification(slave_id, read_code, object_id)
+            .await
     }
 
     /// Convert into a cloneable, task-shareable handle — see [`SharedModbusClient`]
