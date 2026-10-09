@@ -148,7 +148,13 @@ impl CommandBatcher {
     }
 
     /// Add a command to the pending batch.
+    ///
+    /// The batch window starts when the first command enters an empty batch,
+    /// so an idle period before it does not cause an immediate release.
     pub fn add_command(&mut self, command: BatchCommand) {
+        if self.total_pending == 0 {
+            self.last_batch_time = Instant::now();
+        }
         let key = (command.slave_id, command.function_code);
         self.pending_commands.entry(key).or_default().push(command);
         self.total_pending += 1;
@@ -167,14 +173,17 @@ impl CommandBatcher {
         let mut indices: Vec<usize> = (0..commands.len()).collect();
         indices.sort_by_key(|&i| commands[i].register_address);
 
-        let mut expected_addr = commands[indices[0]].register_address;
+        // `None` once a span reaches past address 65535: nothing can follow it.
+        let mut expected_addr = Some(commands[indices[0]].register_address);
 
         for &idx in &indices {
-            if commands[idx].register_address != expected_addr {
+            if Some(commands[idx].register_address) != expected_addr {
                 return false;
             }
             // Calculate registers used by this data type
-            expected_addr += Self::get_register_count(commands[idx].data_type);
+            expected_addr = commands[idx]
+                .register_address
+                .checked_add(Self::get_register_count(commands[idx].data_type));
         }
         true
     }
@@ -417,6 +426,69 @@ mod tests {
         batcher.clear();
         assert_eq!(batcher.pending_count(), 0);
         assert!(batcher.is_empty());
+    }
+
+    #[test]
+    fn test_window_starts_at_first_command_after_idle() {
+        let mut batcher = CommandBatcher::with_config(30, 100);
+        // Idle longer than the window before any command arrives.
+        std::thread::sleep(Duration::from_millis(50));
+        batcher.add_command(create_test_command(1, 1, 6, 100, "uint16"));
+        assert!(
+            !batcher.should_execute(),
+            "window must start at the first command, not at construction"
+        );
+        // Subsequent commands must not restart the window.
+        std::thread::sleep(Duration::from_millis(40));
+        batcher.add_command(create_test_command(2, 1, 6, 101, "uint16"));
+        assert!(batcher.should_execute());
+    }
+
+    #[test]
+    fn test_window_restarts_after_idle_following_take() {
+        let mut batcher = CommandBatcher::with_config(30, 100);
+        batcher.add_command(create_test_command(1, 1, 6, 100, "uint16"));
+        let _ = batcher.take_commands();
+        std::thread::sleep(Duration::from_millis(50));
+        batcher.add_command(create_test_command(2, 1, 6, 101, "uint16"));
+        assert!(!batcher.should_execute());
+    }
+
+    #[test]
+    fn test_consecutive_near_address_end_does_not_overflow() {
+        // float32 at 65534 occupies 65534..=65535; next address would be 65536.
+        let commands = vec![
+            create_test_command(1, 1, 16, 65533, "uint16"),
+            create_test_command(2, 1, 16, 65534, "float32"),
+        ];
+        assert!(CommandBatcher::are_strictly_consecutive(&commands));
+
+        // Anything after an overflowing span cannot be contiguous.
+        let commands = vec![
+            create_test_command(1, 1, 16, 65534, "float32"),
+            create_test_command(2, 1, 16, 65535, "uint16"),
+        ];
+        assert!(!CommandBatcher::are_strictly_consecutive(&commands));
+    }
+
+    // Lives here (not in protocol.rs) to keep the protocol.rs diff to `new_write` only.
+    #[test]
+    fn test_new_write_oversize_coil_payload_does_not_panic_and_is_rejected() {
+        use crate::protocol::{ModbusFunction, ModbusRequest};
+        for len in [8192usize, 10_000, 70_000] {
+            let req =
+                ModbusRequest::new_write(1, ModbusFunction::WriteMultipleCoils, 0, vec![0xFF; len]);
+            assert!(req.validate().is_err(), "len {len}");
+        }
+        for len in [300usize, 140_000] {
+            let req = ModbusRequest::new_write(
+                1,
+                ModbusFunction::WriteMultipleRegisters,
+                0,
+                vec![0x00; len],
+            );
+            assert!(req.validate().is_err(), "len {len}");
+        }
     }
 
     #[test]

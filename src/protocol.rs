@@ -343,8 +343,14 @@ impl ModbusRequest {
     ) -> Self {
         let quantity = match function {
             ModbusFunction::WriteSingleCoil | ModbusFunction::WriteSingleRegister => 1,
-            ModbusFunction::WriteMultipleCoils => data.len() as u16 * 8,
-            ModbusFunction::WriteMultipleRegisters => data.len() as u16 / 2,
+            // Saturate instead of truncating/overflowing on oversize payloads;
+            // `validate()` then rejects the too-large quantity.
+            ModbusFunction::WriteMultipleCoils => {
+                u16::try_from(data.len().saturating_mul(8)).unwrap_or(u16::MAX)
+            }
+            ModbusFunction::WriteMultipleRegisters => {
+                u16::try_from(data.len() / 2).unwrap_or(u16::MAX)
+            }
             _ => 0,
         };
 

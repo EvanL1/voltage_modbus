@@ -12,6 +12,10 @@
 //! * **`heapless::Vec<u8, 256>`** used for the outgoing frame buffer so the
 //!   encode path is entirely stack-allocated.
 //! * **CRC-16/Modbus** computed with the `crc` crate which is `no_std` native.
+//! * **No timer** — the transport never times out on its own. Bound every
+//!   [`EmbeddedRtuTransport::request`] call with your executor's timeout
+//!   (e.g. `embassy_time::with_timeout`), and wait the turnaround delay
+//!   yourself after a broadcast (slave ID 0).
 //!
 //! ## Usage
 //!
@@ -101,12 +105,36 @@ where
     ///
     /// Encodes the request into an RTU frame (slave + PDU + CRC-16 LE),
     /// writes it to the I/O object, then reads bytes according to the response
-    /// header. The response CRC is verified before returning.
+    /// header. The response CRC is verified, and the response slave ID and
+    /// function code must match the request (an exception response,
+    /// `function | 0x80`, for the same function is accepted and returned as
+    /// an exception `ModbusResponse`); a mismatch is a `ModbusError::Protocol`.
+    ///
+    /// # Timeouts
+    ///
+    /// This transport has no timer, so a silent or disconnected slave makes
+    /// this future wait forever. Callers must bound every call with their own
+    /// timeout, e.g. `embassy_time::with_timeout(Duration::from_millis(500),
+    /// transport.request(&req))`.
+    ///
+    /// # Broadcast
+    ///
+    /// For `slave_id == 0` (broadcast, write functions only) no response is
+    /// read: a synthetic ack ([`ModbusResponse::new_broadcast_ack`]) is
+    /// returned as soon as the frame is written. Without a timer this
+    /// transport cannot wait out the turnaround delay, so the caller must wait
+    /// the bus turnaround delay (typically 100–200 ms) before sending the next
+    /// request.
     pub async fn request(&mut self, request: &ModbusRequest) -> ModbusResult<ModbusResponse> {
         let frame = self.encode_request(request)?;
         self.write_frame(&frame).await?;
+        if request.slave_id == 0 {
+            return Ok(ModbusResponse::new_broadcast_ack(request.function));
+        }
         let response_buf = self.read_response().await?;
-        self.decode_response(response_buf)
+        let response = self.decode_response(response_buf)?;
+        check_response_matches(request, &response)?;
+        Ok(response)
     }
 
     // ------------------------------------------------------------------ //
@@ -314,6 +342,26 @@ where
 // ============================================================================
 // Internal helpers — heapless push/extend with uniform error mapping
 // ============================================================================
+
+/// Reject a decoded response whose slave ID or function code does not belong
+/// to `request`. An exception response decodes to the original function
+/// (`fc & 0x7F`), so an exception for the same function matches.
+fn check_response_matches(request: &ModbusRequest, response: &ModbusResponse) -> ModbusResult<()> {
+    if response.slave_id != request.slave_id {
+        return Err(ModbusError::protocol(format!(
+            "Response slave ID mismatch: expected {}, got {}",
+            request.slave_id, response.slave_id
+        )));
+    }
+    if response.function != request.function {
+        return Err(ModbusError::protocol(format!(
+            "Response function code mismatch: expected 0x{:02X}, got 0x{:02X}",
+            request.function.to_u8(),
+            response.function.to_u8()
+        )));
+    }
+    Ok(())
+}
 
 #[inline]
 fn push(buf: &mut HVec<u8, MAX_FRAME>, byte: u8) -> ModbusResult<()> {
@@ -601,6 +649,71 @@ mod tests {
 
             let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
             assert!(transport.request(&req).await.is_err());
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Broadcast and response/request matching
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_broadcast_returns_ack_without_reading() {
+        tokio_test::block_on(async {
+            // A read on this mock would fail (no data) — broadcast must not read.
+            let mut transport = EmbeddedRtuTransport::new(MockIo::new(vec![]));
+            let req = ModbusRequest::new_write(
+                0,
+                ModbusFunction::WriteSingleRegister,
+                0x0010,
+                vec![0x00, 0x2A],
+            );
+            let response = transport.request(&req).await.unwrap();
+            assert_eq!(response.slave_id, 0);
+            assert_eq!(response.function, ModbusFunction::WriteSingleRegister);
+            assert!(!response.is_exception());
+            assert_eq!(transport.io.written[0], 0); // frame was still sent
+            assert_eq!(transport.io.read_pos, 0);
+        });
+    }
+
+    #[test]
+    fn test_request_rejects_slave_id_mismatch() {
+        tokio_test::block_on(async {
+            let mock = MockIo::new(make_fc03_response(2, &[0x0001]));
+            let mut transport = EmbeddedRtuTransport::new(mock);
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+            let err = transport.request(&req).await.unwrap_err();
+            assert!(matches!(err, ModbusError::Protocol { .. }), "{err:?}");
+        });
+    }
+
+    #[test]
+    fn test_request_rejects_function_code_mismatch() {
+        tokio_test::block_on(async {
+            // FC04 response to an FC03 request
+            let mut frame = make_fc03_response(1, &[0x0001]);
+            frame[1] = 0x04;
+            let len = frame.len() - 2;
+            let crc = CRC_MODBUS.checksum(&frame[..len]);
+            frame.truncate(len);
+            frame.extend_from_slice(&crc.to_le_bytes());
+
+            let mut transport = EmbeddedRtuTransport::new(MockIo::new(frame));
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+            let err = transport.request(&req).await.unwrap_err();
+            assert!(matches!(err, ModbusError::Protocol { .. }), "{err:?}");
+        });
+    }
+
+    #[test]
+    fn test_request_rejects_exception_for_other_function() {
+        tokio_test::block_on(async {
+            // Exception for FC04 in reply to an FC03 request
+            let mock = MockIo::new(make_exception_frame(1, 0x04, 0x02));
+            let mut transport = EmbeddedRtuTransport::new(mock);
+            let req = ModbusRequest::new_read(1, ModbusFunction::ReadHoldingRegisters, 0, 1);
+            let err = transport.request(&req).await.unwrap_err();
+            assert!(matches!(err, ModbusError::Protocol { .. }), "{err:?}");
         });
     }
 }

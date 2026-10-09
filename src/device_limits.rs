@@ -11,7 +11,11 @@
 //! - **Write Multiple Coils (FC15)**: Max 1968 coils per request
 //!
 //! Some devices may have lower limits. This module allows configuring
-//! per-device limits for optimal communication.
+//! per-device limits for optimal communication. The `with_max_*` builders
+//! clamp their input to `1..=` the spec limit, so a configured limit is never
+//! zero and never exceeds what the protocol allows.
+
+use crate::constants::{MAX_READ_COILS, MAX_READ_REGISTERS, MAX_WRITE_COILS, MAX_WRITE_REGISTERS};
 
 /// Default maximum registers per read operation (Modbus specification).
 pub const DEFAULT_MAX_READ_REGISTERS: u16 = 125;
@@ -83,26 +87,38 @@ impl DeviceLimits {
     }
 
     /// Set maximum read registers.
+    ///
+    /// `count` is clamped to `1..=125` (`MAX_READ_REGISTERS`, the Modbus spec
+    /// limit for FC03/04): `0` becomes `1`, larger values become `125`.
     pub fn with_max_read_registers(mut self, count: u16) -> Self {
-        self.max_read_registers = count;
+        self.max_read_registers = clamp_limit(count, MAX_READ_REGISTERS);
         self
     }
 
     /// Set maximum write registers.
+    ///
+    /// `count` is clamped to `1..=123` (`MAX_WRITE_REGISTERS`, the Modbus spec
+    /// limit for FC16): `0` becomes `1`, larger values become `123`.
     pub fn with_max_write_registers(mut self, count: u16) -> Self {
-        self.max_write_registers = count;
+        self.max_write_registers = clamp_limit(count, MAX_WRITE_REGISTERS);
         self
     }
 
     /// Set maximum read coils.
+    ///
+    /// `count` is clamped to `1..=2000` (`MAX_READ_COILS`, the Modbus spec
+    /// limit for FC01/02): `0` becomes `1`, larger values become `2000`.
     pub fn with_max_read_coils(mut self, count: u16) -> Self {
-        self.max_read_coils = count;
+        self.max_read_coils = clamp_limit(count, MAX_READ_COILS);
         self
     }
 
     /// Set maximum write coils.
+    ///
+    /// `count` is clamped to `1..=1968` (`MAX_WRITE_COILS`, the Modbus spec
+    /// limit for FC15): `0` becomes `1`, larger values become `1968`.
     pub fn with_max_write_coils(mut self, count: u16) -> Self {
-        self.max_write_coils = count;
+        self.max_write_coils = clamp_limit(count, MAX_WRITE_COILS);
         self
     }
 
@@ -117,7 +133,8 @@ impl DeviceLimits {
         if total_registers == 0 {
             return 0;
         }
-        total_registers.div_ceil(self.max_read_registers)
+        // `.max(1)`: the fields are public and may be set to 0 directly.
+        total_registers.div_ceil(self.max_read_registers.max(1))
     }
 
     /// Calculate the number of write requests needed for a given register count.
@@ -125,7 +142,7 @@ impl DeviceLimits {
         if total_registers == 0 {
             return 0;
         }
-        total_registers.div_ceil(self.max_write_registers)
+        total_registers.div_ceil(self.max_write_registers.max(1))
     }
 
     /// Check if a read request is within limits.
@@ -147,6 +164,12 @@ impl DeviceLimits {
     pub fn is_coil_write_within_limits(&self, coil_count: u16) -> bool {
         coil_count <= self.max_write_coils
     }
+}
+
+/// Clamp a configured per-request limit to `1..=spec_max`.
+#[inline]
+fn clamp_limit(count: u16, spec_max: usize) -> u16 {
+    count.clamp(1, spec_max as u16)
 }
 
 impl Default for DeviceLimits {
@@ -237,6 +260,36 @@ mod tests {
 
         assert!(limits.is_write_within_limits(80));
         assert!(!limits.is_write_within_limits(81));
+    }
+
+    #[test]
+    fn test_zero_limits_are_clamped_and_do_not_panic() {
+        let limits = DeviceLimits::new()
+            .with_max_read_registers(0)
+            .with_max_write_registers(0)
+            .with_max_read_coils(0)
+            .with_max_write_coils(0);
+
+        assert_eq!(limits.max_read_registers, 1);
+        assert_eq!(limits.max_write_registers, 1);
+        assert_eq!(limits.max_read_coils, 1);
+        assert_eq!(limits.max_write_coils, 1);
+        assert_eq!(limits.read_request_count(10), 10);
+        assert_eq!(limits.write_request_count(10), 10);
+    }
+
+    #[test]
+    fn test_limits_above_spec_are_clamped() {
+        let limits = DeviceLimits::new()
+            .with_max_read_registers(200)
+            .with_max_write_registers(200)
+            .with_max_read_coils(5000)
+            .with_max_write_coils(5000);
+
+        assert_eq!(limits.max_read_registers, DEFAULT_MAX_READ_REGISTERS);
+        assert_eq!(limits.max_write_registers, DEFAULT_MAX_WRITE_REGISTERS);
+        assert_eq!(limits.max_read_coils, DEFAULT_MAX_READ_COILS);
+        assert_eq!(limits.max_write_coils, DEFAULT_MAX_WRITE_COILS);
     }
 
     #[test]
