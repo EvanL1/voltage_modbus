@@ -30,7 +30,9 @@
 //! assert_eq!(coalesced.len(), 1);
 //! ```
 
-use crate::constants::MAX_READ_REGISTERS;
+use crate::constants::{
+    FC_READ_COILS, FC_READ_DISCRETE_INPUTS, MAX_READ_COILS, MAX_READ_REGISTERS,
+};
 
 /// 默认合并间隙阈值（寄存器数）
 ///
@@ -102,12 +104,14 @@ pub struct CoalescedRead {
 /// 1. 只合并相同 `slave_id` 和 `function` 的请求
 /// 2. 按起始地址排序
 /// 3. 如果两个请求之间的间隙 ≤ `gap_threshold`，合并为一个
-/// 4. 合并后的请求不超过 `max_registers`（默认 125）
+/// 4. 合并后的请求不超过单次读取上限：默认按功能码取规范上限
+///    （FC01/02 为 2000 位，其余为 125 寄存器）；`with_config` 指定的
+///    `max_registers` 对所有功能码生效
 pub struct ReadCoalescer {
     /// 合并间隙阈值（寄存器数）
     gap_threshold: u16,
-    /// 单次读取的最大寄存器数
-    max_registers: u16,
+    /// 单次读取的最大数量；`None` 表示按功能码使用规范上限
+    max_registers: Option<u16>,
 }
 
 impl Default for ReadCoalescer {
@@ -117,28 +121,38 @@ impl Default for ReadCoalescer {
 }
 
 impl ReadCoalescer {
-    /// 创建默认配置的合并器（gap_threshold=10, max_registers=125）
+    /// 创建默认配置的合并器（gap_threshold=10，上限按功能码取规范值：
+    /// FC01/02 为 2000，FC03/04 为 125）
     pub fn new() -> Self {
         Self {
             gap_threshold: DEFAULT_GAP_THRESHOLD,
-            max_registers: MAX_READ_REGISTERS as u16,
+            max_registers: None,
         }
     }
 
-    /// 创建自定义间隙阈值的合并器
+    /// 创建自定义间隙阈值的合并器（上限同 [`new`](Self::new)）
     pub fn with_gap_threshold(gap_threshold: u16) -> Self {
         Self {
             gap_threshold,
-            max_registers: MAX_READ_REGISTERS as u16,
+            max_registers: None,
         }
     }
 
-    /// 创建完整自定义配置的合并器
+    /// 创建完整自定义配置的合并器（`max_registers` 对所有功能码生效）
     pub fn with_config(gap_threshold: u16, max_registers: u16) -> Self {
         Self {
             gap_threshold,
-            max_registers,
+            max_registers: Some(max_registers),
         }
+    }
+
+    /// 某功能码的单次读取上限
+    fn max_quantity(&self, function: u8) -> u32 {
+        let max = self.max_registers.unwrap_or(match function {
+            FC_READ_COILS | FC_READ_DISCRETE_INPUTS => MAX_READ_COILS as u16,
+            _ => MAX_READ_REGISTERS as u16,
+        });
+        u32::from(max)
     }
 
     /// 将多个读请求合并为更少的请求
@@ -184,7 +198,7 @@ impl ReadCoalescer {
                 let new_end = req.end_address().max(group_end);
                 let merged_qty = new_end - u32::from(group_start);
 
-                if merged_qty <= u32::from(self.max_registers) {
+                if merged_qty <= self.max_quantity(group_fn) {
                     // 检查间隙：req.address 到 group_end 的距离
                     let gap = u32::from(req.address).saturating_sub(group_end);
                     if gap <= u32::from(self.gap_threshold) || u32::from(req.address) <= group_end {
@@ -243,13 +257,22 @@ impl ReadCoalescer {
     ///
     /// 按 `mappings` 中 `original_index` 的顺序返回各原始请求的数据切片。
     /// 结果顺序与 `mappings` 中的顺序一致（即排序后的顺序）。
+    ///
+    /// # Short data
+    ///
+    /// A mapping that extends past the end of `data` yields an **empty**
+    /// `Vec` rather than an error, so a short response is indistinguishable
+    /// from a zero-length region. Callers must check
+    /// `data.len() == coalesced.quantity as usize` before calling this
+    /// (`GenericModbusClient`'s coalesced reads already reject responses whose
+    /// byte count does not match the requested quantity).
     pub fn extract_results(&self, coalesced: &CoalescedRead, data: &[u16]) -> Vec<Vec<u16>> {
         coalesced
             .mappings
             .iter()
             .map(|&(_, offset, qty)| {
-                let start = offset as usize;
-                let end = (offset + qty) as usize;
+                let start = usize::from(offset);
+                let end = start + usize::from(qty);
                 if end <= data.len() {
                     data[start..end].to_vec()
                 } else {
@@ -518,5 +541,44 @@ mod tests {
         let extracted = coalescer.extract_results(&coalesced, &short_data);
         assert_eq!(extracted[0], vec![1, 2]); // 正常提取
         assert!(extracted[1].is_empty()); // 超出范围返回空
+    }
+
+    #[test]
+    fn test_extract_results_huge_mapping_does_not_overflow() {
+        let coalescer = ReadCoalescer::new();
+        let coalesced = CoalescedRead {
+            slave_id: 1,
+            function: 0x03,
+            address: 0,
+            quantity: 10,
+            mappings: vec![(0, 10, u16::MAX)],
+        };
+        let extracted = coalescer.extract_results(&coalesced, &[0u16; 10]);
+        assert!(extracted[0].is_empty());
+    }
+
+    #[test]
+    fn test_coils_use_coil_limit_not_register_limit() {
+        // FC01/FC02 allow up to 2000 bits per request; 125 is the register cap.
+        let coalescer = ReadCoalescer::new();
+        for function in [0x01u8, 0x02] {
+            let requests = vec![req(1, function, 0, 100), req(1, function, 100, 900)];
+            let result = coalescer.coalesce(&requests);
+            assert_eq!(result.len(), 1, "fc {function:#04x}");
+            assert_eq!(result[0].quantity, 1000);
+
+            let requests = vec![req(1, function, 0, 1500), req(1, function, 1500, 600)];
+            assert_eq!(coalescer.coalesce(&requests).len(), 2);
+        }
+        // Registers still capped at 125.
+        let requests = vec![req(1, 0x03, 0, 100), req(1, 0x03, 100, 50)];
+        assert_eq!(coalescer.coalesce(&requests).len(), 2);
+    }
+
+    #[test]
+    fn test_with_gap_threshold_coils_use_coil_limit() {
+        let coalescer = ReadCoalescer::with_gap_threshold(0);
+        let requests = vec![req(1, 0x01, 0, 100), req(1, 0x01, 100, 900)];
+        assert_eq!(coalescer.coalesce(&requests).len(), 1);
     }
 }
