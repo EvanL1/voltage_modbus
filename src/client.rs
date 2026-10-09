@@ -150,7 +150,7 @@ impl Default for RetryPolicy {
 /// # Implemented By
 ///
 /// - [`ModbusTcpClient`] - Modbus TCP client
-/// - [`ModbusRtuClient`] - Modbus RTU client (requires `rtu` feature)
+/// - `ModbusRtuClient` - Modbus RTU client (requires `rtu` feature)
 /// - [`GenericModbusClient`] - Generic client for custom transports
 ///
 /// # Protocol Limits

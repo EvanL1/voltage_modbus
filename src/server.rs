@@ -145,7 +145,7 @@ impl ModbusService for ModbusRegisterBank {
 /// Device identification objects served for FC 0x2B / MEI 0x0E requests.
 ///
 /// Install on a server with [`ModbusTcpServer::set_device_identity`] /
-/// [`ModbusRtuServer::set_device_identity`]; FC 0x2B requests are then
+/// `ModbusRtuServer::set_device_identity` (`rtu` feature); FC 0x2B requests are then
 /// answered from these objects while all other function codes continue to
 /// flow to the active [`ModbusService`].
 #[derive(Debug, Clone, Default)]
