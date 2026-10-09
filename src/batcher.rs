@@ -430,26 +430,28 @@ mod tests {
 
     #[test]
     fn test_window_starts_at_first_command_after_idle() {
-        let mut batcher = CommandBatcher::with_config(30, 100);
+        // Wide window: the "not yet" assertions run microseconds after an
+        // add, so only the window length guards against a slow CI runner.
+        let mut batcher = CommandBatcher::with_config(300, 100);
         // Idle longer than the window before any command arrives.
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(350));
         batcher.add_command(create_test_command(1, 1, 6, 100, "uint16"));
         assert!(
             !batcher.should_execute(),
             "window must start at the first command, not at construction"
         );
         // Subsequent commands must not restart the window.
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(320));
         batcher.add_command(create_test_command(2, 1, 6, 101, "uint16"));
         assert!(batcher.should_execute());
     }
 
     #[test]
     fn test_window_restarts_after_idle_following_take() {
-        let mut batcher = CommandBatcher::with_config(30, 100);
+        let mut batcher = CommandBatcher::with_config(300, 100);
         batcher.add_command(create_test_command(1, 1, 6, 100, "uint16"));
         let _ = batcher.take_commands();
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(350));
         batcher.add_command(create_test_command(2, 1, 6, 101, "uint16"));
         assert!(!batcher.should_execute());
     }

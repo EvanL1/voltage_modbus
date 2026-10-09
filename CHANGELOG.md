@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-09
+
+### Fixed
+- **Server FC 0x16 / FC 0x17 were not atomic**: Mask Write and Read/Write Multiple
+  took the register lock once per step, so a concurrent write from another
+  connection could be lost. Each now runs under a single lock. FC 0x17 also checks
+  the read range before writing, so an invalid request leaves registers unchanged.
+- **RTU server latency and memory**: a request was only answered after a fixed 100 ms
+  read timeout; it is now answered once `frame_gap` (t3.5) of silence ends the frame.
+  Frame splitting is unchanged from 1.0.0 (a `frame_gap` silence separates frames, so
+  back-to-back frames on a multi-drop bus still split correctly). The frame buffer is
+  capped at the 256-byte RTU ADU; longer bursts are discarded.
+- **TCP accept loop** no longer spins at 100 % CPU on persistent `accept()` errors
+  (e.g. out of file descriptors); it backs off 100 ms.
+- **TCP/TLS timeouts**: one request now takes at most ~1× the configured timeout
+  (header, body and skipped stale frames share one deadline; previously up to ~10×).
+  A peer closing or resetting the connection is reported as `ModbusError::Connection`
+  instead of `Timeout` and no longer counts in `stats.timeouts`. Both stay
+  `is_recoverable()`; code matching `Timeout` specifically to trigger a reconnect
+  should also handle `Connection`.
+- **Pipelining**: when some replies never arrive, `pipeline` / `pipeline_reads` now
+  return the replies that did arrive plus per-entry timeout errors, as documented,
+  instead of failing the whole call — including when *no* reply arrives (`Ok` with
+  every entry `Err(Timeout)`). Code that detected timeouts with `pipeline(..).is_err()`
+  must inspect the entries. Every pipelined reply is validated against its request
+  (function code, byte count, slave ID); a bad one fails only its entry.
+- **Codec, 16-bit types**: `uint16`/`int16` decode and encode now honor
+  `ByteOrder::LittleEndian16` (byte swap), matching `bytes::reg_to_u16`. Other byte
+  orders are unchanged.
+- **Codec, type aliases**: all aliases (`word`, `short`, `dword`, `long`, `float`,
+  `real`, `qword`, `longlong`, `double`, `lreal`, …) now clamp, encode, decode and size
+  exactly like their canonical names — e.g. `encode_f64_as_type(1e40, "real")` writes
+  `f32::MAX` instead of `+inf`.
+- **Embedded transport**: a broadcast (slave 0) request returned never — it now
+  returns an ack right after sending. Replies from the wrong slave or with the wrong
+  function code are rejected. Callers must still bound each request with their own
+  timeout (documented).
+- **CommandBatcher**: the batch window now starts at the first command after an idle
+  period (it used to flush single commands immediately), and contiguity checks near
+  address 65535 no longer overflow.
+- **DeviceLimits**: `with_max_*` builders clamp to `1..=` the Modbus spec maximum, so
+  `with_max_read_registers(0)` no longer panics later (it now means one item per
+  request) and values above the spec (e.g. 200 registers) become the spec maximum (125).
+- **ReadCoalescer**: the default limit for coil / discrete-input reads is the spec's
+  2000 (was 125). Only direct users of `ReadCoalescer` see this (the client coalesces
+  FC03/04 only); devices with a lower coil limit should set it via `with_config`.
+- `ModbusRequest::new_write` no longer overflows on ≥ 8192 bytes of data; `validate()`
+  rejects such requests.
+
+### Known limitations
+- The RTU **server** still delimits request frames by silence. At high baud rates a
+  USB-RS485 adapter that delivers bytes in ~16 ms chunks can split a frame (as in
+  1.0.0); the RTU *client* is not affected (it reads by frame length). A length-aware
+  server reader is planned for a minor release.
+
+### Changed
+- CI runs `cargo-semver-checks` against the latest release; the MSRV job checks all features.
+
 ## [1.0.0] - 2026-10-09
 
 First stable release. From here on the public API follows Semantic Versioning; see

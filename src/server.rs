@@ -1139,7 +1139,6 @@ impl Default for ModbusRtuServerConfig {
     }
 }
 
-/// Modbus RTU server implementation
 /// Maximum Modbus RTU ADU size (slave + 253-byte PDU + CRC).
 #[cfg(feature = "rtu")]
 const MAX_RTU_ADU_SIZE: usize = 256;
@@ -1198,6 +1197,7 @@ impl RtuFrameAccumulator {
     }
 }
 
+/// Modbus RTU server implementation
 #[cfg(feature = "rtu")]
 pub struct ModbusRtuServer {
     config: ModbusRtuServerConfig,
@@ -2089,6 +2089,42 @@ mod tests {
             start.elapsed() < Duration::from_millis(20),
             "reply took {:?}",
             start.elapsed()
+        );
+
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Multi-drop bus: another slave's reply is followed, after only a few
+    /// t3.5 gaps, by the master's request to us. The gap must split the two
+    /// frames (as in 1.0.0); a longer idle threshold would merge them and the
+    /// CRC check would silently drop our request.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_splits_back_to_back_frames_on_multidrop_bus() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_millis(2));
+
+        // Slave 2's reply to the master, then 3 ms later the request to us
+        client
+            .write_all(&rtu_frame(&[0x02, 0x03, 0x02, 0xAB, 0xCD]))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        client
+            .write_all(&rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]))
+            .await
+            .unwrap();
+
+        let mut response = [0u8; 7];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("request after another slave's reply was dropped")
+            .unwrap();
+        assert_eq!(
+            &response[..],
+            &rtu_frame(&[0x01, 0x03, 0x02, 0x12, 0x34])[..]
         );
 
         tx.send(()).unwrap();

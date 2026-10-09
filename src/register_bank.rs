@@ -200,7 +200,7 @@ impl ModbusRegisterBank {
     /// Computes `(current & and_mask) | (or_mask & !and_mask)` and stores it
     /// under a single write lock, so concurrent writers cannot interleave
     /// between the read and the write. Returns the new register value.
-    pub fn mask_write_register(
+    pub(crate) fn mask_write_register(
         &self,
         address: u16,
         and_mask: u16,
@@ -221,7 +221,7 @@ impl ModbusRegisterBank {
     /// Per spec the write is performed before the read; both happen under a
     /// single write lock. Both ranges are validated before anything is
     /// written, so an invalid request leaves the bank unchanged.
-    pub fn write_read_registers(
+    pub(crate) fn write_read_registers(
         &self,
         write_address: u16,
         values: &[u16],
