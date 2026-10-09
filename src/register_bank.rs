@@ -195,6 +195,58 @@ impl ModbusRegisterBank {
         Ok(())
     }
 
+    /// Mask write register (function code 0x16), atomically.
+    ///
+    /// Computes `(current & and_mask) | (or_mask & !and_mask)` and stores it
+    /// under a single write lock, so concurrent writers cannot interleave
+    /// between the read and the write. Returns the new register value.
+    pub fn mask_write_register(
+        &self,
+        address: u16,
+        and_mask: u16,
+        or_mask: u16,
+    ) -> ModbusResult<u16> {
+        let mut registers = self
+            .holding_registers
+            .write()
+            .map_err(|_| ModbusError::internal("Failed to lock holding registers"))?;
+        let current = registers.get(&address).copied().unwrap_or(0);
+        let result = (current & and_mask) | (or_mask & !and_mask);
+        registers.insert(address, result);
+        Ok(result)
+    }
+
+    /// Write then read holding registers (function code 0x17), atomically.
+    ///
+    /// Per spec the write is performed before the read; both happen under a
+    /// single write lock. Both ranges are validated before anything is
+    /// written, so an invalid request leaves the bank unchanged.
+    pub fn write_read_registers(
+        &self,
+        write_address: u16,
+        values: &[u16],
+        read_address: u16,
+        read_quantity: u16,
+    ) -> ModbusResult<Vec<u16>> {
+        let write_quantity = u16::try_from(values.len())
+            .map_err(|_| ModbusError::invalid_address(write_address, u16::MAX))?;
+        validate_address_range(write_address, write_quantity)?;
+        validate_address_range(read_address, read_quantity)?;
+        let mut registers = self
+            .holding_registers
+            .write()
+            .map_err(|_| ModbusError::internal("Failed to lock holding registers"))?;
+        for (i, &value) in values.iter().enumerate() {
+            registers.insert(checked_address(write_address, i)?, value);
+        }
+        (0..read_quantity)
+            .map(|i| {
+                checked_address(read_address, i)
+                    .map(|addr| registers.get(&addr).copied().unwrap_or(0))
+            })
+            .collect()
+    }
+
     /// Read input registers starting at address (function code 0x04)
     pub fn read_input_registers(&self, address: u16, quantity: u16) -> ModbusResult<Vec<u16>> {
         validate_address_range(address, quantity)?;
@@ -329,6 +381,35 @@ mod tests {
         bank.write_10(100, &[100, 200, 300]).unwrap();
         let registers = bank.read_03(100, 3).unwrap();
         assert_eq!(registers, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn test_mask_write_register() {
+        let bank = ModbusRegisterBank::new();
+        bank.write_06(4, 0x0012).unwrap();
+
+        // Spec example: (0x12 & 0xF2) | (0x25 & !0xF2) = 0x17
+        assert_eq!(bank.mask_write_register(4, 0x00F2, 0x0025).unwrap(), 0x0017);
+        assert_eq!(bank.read_03(4, 1).unwrap(), vec![0x0017]);
+
+        // Unset register reads as 0; OR bits inside the AND mask are ignored
+        assert_eq!(bank.mask_write_register(9, 0xFFFF, 0x00FF).unwrap(), 0x0000);
+        assert_eq!(bank.mask_write_register(9, 0x0000, 0x00FF).unwrap(), 0x00FF);
+    }
+
+    #[test]
+    fn test_write_read_registers_writes_before_read() {
+        let bank = ModbusRegisterBank::new();
+        bank.write_10(0, &[1, 2, 3, 4]).unwrap();
+
+        // Overlapping ranges: the read must observe the write
+        let read = bank.write_read_registers(1, &[20, 30], 0, 4).unwrap();
+        assert_eq!(read, vec![1, 20, 30, 4]);
+
+        // Invalid read range fails without performing the write
+        assert!(bank.write_read_registers(0, &[99], u16::MAX, 2).is_err());
+        assert_eq!(bank.read_03(0, 1).unwrap(), vec![1]);
+        assert!(bank.write_read_registers(0, &[], 0, 1).is_err());
     }
 
     #[test]
