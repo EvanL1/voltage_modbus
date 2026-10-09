@@ -31,6 +31,10 @@ const MAX_TCP_FRAME_SIZE: usize = 260;
 /// MBAP header size
 const MBAP_HEADER_SIZE: usize = 6;
 
+/// Pause after a failed `accept()` so persistent errors (e.g. EMFILE when out
+/// of file descriptors) don't spin the accept loop at 100% CPU.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
 mod sealed {
     pub trait Sealed {}
     impl Sealed for super::ModbusTcpServer {}
@@ -883,9 +887,8 @@ impl ModbusTcpServer {
         let and_mask = u16::from_be_bytes([data[2], data[3]]);
         let or_mask = u16::from_be_bytes([data[4], data[5]]);
 
-        let current = register_bank.read_03(address, 1)?[0];
-        let result = (current & and_mask) | (or_mask & !and_mask);
-        register_bank.write_06(address, result)?;
+        // Single lock for the read-modify-write (atomic vs. other connections)
+        register_bank.mask_write_register(address, and_mask, or_mask)?;
 
         // Response echoes the request
         let mut response = Vec::with_capacity(7);
@@ -930,9 +933,13 @@ impl ModbusTcpServer {
             .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
             .collect();
 
-        // Write first, then read (spec-mandated ordering)
-        register_bank.write_10(write_address, &values)?;
-        let registers = register_bank.read_03(read_address, read_quantity)?;
+        // Write first, then read (spec-mandated ordering), under one lock
+        let registers = register_bank.write_read_registers(
+            write_address,
+            &values,
+            read_address,
+            read_quantity,
+        )?;
 
         let data_len = registers.len() * 2;
         let mut response = Vec::with_capacity(2 + data_len);
@@ -1041,6 +1048,9 @@ impl ModbusServer for ModbusTcpServer {
                             }
                             Err(e) => {
                                 error!("Failed to accept connection: {}", e);
+                                // accept() errors such as EMFILE/ENFILE persist until
+                                // resources free up; back off instead of busy-looping.
+                                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                             }
                         }
                     }
@@ -1130,6 +1140,64 @@ impl Default for ModbusRtuServerConfig {
 }
 
 /// Modbus RTU server implementation
+/// Maximum Modbus RTU ADU size (slave + 253-byte PDU + CRC).
+#[cfg(feature = "rtu")]
+const MAX_RTU_ADU_SIZE: usize = 256;
+
+/// Accumulates received bytes into one RTU frame until a t3.5 idle gap.
+///
+/// The buffer is capped at [`MAX_RTU_ADU_SIZE`]: an over-long burst (line
+/// noise, garbage) is discarded entirely, including any bytes received after
+/// the overflow, until the next idle gap ends it.
+#[cfg(feature = "rtu")]
+#[derive(Debug, Default)]
+struct RtuFrameAccumulator {
+    buffer: Vec<u8>,
+    overflowed: bool,
+}
+
+#[cfg(feature = "rtu")]
+impl RtuFrameAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append received bytes; on overflow drop the frame being accumulated.
+    fn push(&mut self, bytes: &[u8]) {
+        if self.overflowed {
+            return;
+        }
+        if self.buffer.len() + bytes.len() > MAX_RTU_ADU_SIZE {
+            warn!(
+                "Discarding RTU frame longer than {} bytes (line noise?)",
+                MAX_RTU_ADU_SIZE
+            );
+            self.buffer.clear();
+            self.overflowed = true;
+            return;
+        }
+        self.buffer.extend_from_slice(bytes);
+    }
+
+    /// True when no frame is in progress (no idle timer needed).
+    fn is_idle(&self) -> bool {
+        self.buffer.is_empty() && !self.overflowed
+    }
+
+    #[cfg(test)]
+    fn buffered_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// Called on a t3.5 idle gap: returns the completed frame, if any, and
+    /// resets for the next frame.
+    fn end_frame(&mut self) -> Option<Vec<u8>> {
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let frame = std::mem::take(&mut self.buffer);
+        (!overflowed && !frame.is_empty()).then_some(frame)
+    }
+}
+
 #[cfg(feature = "rtu")]
 pub struct ModbusRtuServer {
     config: ModbusRtuServerConfig,
@@ -1293,75 +1361,65 @@ impl ModbusRtuServer {
     }
 
     /// Handle RTU communication loop
-    async fn handle_rtu_communication(
-        mut port: tokio_serial::SerialStream,
+    async fn handle_rtu_communication<S>(
+        mut port: S,
         own_slave_id: u8,
         service: Arc<dyn ModbusService>,
         stats: Arc<Mutex<ServerStats>>,
         mut shutdown_rx: broadcast::Receiver<()>,
         frame_gap: Duration,
-    ) {
+    ) where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         info!("🔌 RTU server communication started");
 
-        let mut buffer = vec![0u8; 256];
-        let mut frame_buffer = Vec::new();
-        let mut last_activity = std::time::Instant::now();
+        let mut buffer = [0u8; MAX_RTU_ADU_SIZE];
+        let mut frame = RtuFrameAccumulator::new();
 
         loop {
-            tokio::select! {
+            // While a frame is in progress, t3.5 of silence ends it; when idle,
+            // wait for the next byte with no timeout.
+            let read = async {
+                if frame.is_idle() {
+                    Ok(port.read(&mut buffer).await)
+                } else {
+                    tokio::time::timeout(frame_gap, port.read(&mut buffer)).await
+                }
+            };
+
+            let result = tokio::select! {
                 _ = shutdown_rx.recv() => {
                     debug!("Shutdown signal received for RTU server");
                     break;
                 }
+                result = read => result,
+            };
 
-                result = tokio::time::timeout(Duration::from_millis(100), port.read(&mut buffer)) => {
-                    match result {
-                        Ok(Ok(bytes_read)) if bytes_read > 0 => {
-                            let now = std::time::Instant::now();
-
-                            // Check for frame gap
-                            if now.duration_since(last_activity) > frame_gap && !frame_buffer.is_empty() {
-                                // Process accumulated frame
-                                Self::process_accumulated_frame(
-                                    &frame_buffer,
-                                    &mut port,
-                                    own_slave_id,
-                                    service.as_ref(),
-                                    &stats
-                                ).await;
-                                frame_buffer.clear();
-                            }
-
-                            // Accumulate data
-                            frame_buffer.extend_from_slice(&buffer[..bytes_read]);
-                            last_activity = now;
-
-                            // Update stats
-                            if let Ok(mut stats) = stats.lock() {
-                                stats.bytes_received += bytes_read as u64;
-                            }
-                        }
-                        Ok(Ok(_)) => {
-                            // No data read, but successful read operation
-                        }
-                        Ok(Err(e)) => {
-                            error!("RTU read error: {}", e);
-                            break;
-                        }
-                        Err(_) => {
-                            // Timeout - check if we have a complete frame
-                            let now = std::time::Instant::now();
-                            if !frame_buffer.is_empty() && now.duration_since(last_activity) > frame_gap {
-                                Self::process_accumulated_frame(
-                                    &frame_buffer,
-                                    &mut port,
-                                    own_slave_id,
-                                    service.as_ref(),
-                                    &stats
-                                ).await;
-                                frame_buffer.clear();
-                            }
-                        }
+            match result {
+                Ok(Ok(bytes_read)) if bytes_read > 0 => {
+                    frame.push(&buffer[..bytes_read]);
+                    if let Ok(mut stats) = stats.lock() {
+                        stats.bytes_received += bytes_read as u64;
+                    }
+                }
+                Ok(Ok(_)) => {
+                    // No data read, but successful read operation
+                }
+                Ok(Err(e)) => {
+                    error!("RTU read error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // t3.5 idle gap elapsed: the frame is complete
+                    if let Some(complete) = frame.end_frame() {
+                        Self::process_accumulated_frame(
+                            &complete,
+                            &mut port,
+                            own_slave_id,
+                            service.as_ref(),
+                            &stats,
+                        )
+                        .await;
                     }
                 }
             }
@@ -1371,13 +1429,15 @@ impl ModbusRtuServer {
     }
 
     /// Process accumulated frame data
-    async fn process_accumulated_frame(
+    async fn process_accumulated_frame<S>(
         frame: &[u8],
-        port: &mut tokio_serial::SerialStream,
+        port: &mut S,
         own_slave_id: u8,
         service: &dyn ModbusService,
         stats: &Arc<Mutex<ServerStats>>,
-    ) {
+    ) where
+        S: tokio::io::AsyncWrite + Unpin,
+    {
         // Update request stats
         if let Ok(mut stats) = stats.lock() {
             stats.total_requests += 1;
@@ -1689,6 +1749,45 @@ mod tests {
         assert_eq!(register_bank.read_03(4, 1).unwrap(), vec![0x0017]);
     }
 
+    /// FC22 must be atomic: concurrent mask writes from different connections
+    /// to distinct bits of one register must never lose each other's update.
+    /// Each task owns one bit; after setting it, that bit must stay set until
+    /// the same task clears it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_tcp_mask_write_is_atomic_under_concurrency() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let mut tasks = Vec::new();
+        for bit in 0..16u16 {
+            let bank = bank.clone();
+            tasks.push(tokio::spawn(async move {
+                let mask = 1u16 << bit;
+                for _ in 0..2000 {
+                    for or in [mask, 0] {
+                        let [a0, a1] = (!mask).to_be_bytes();
+                        let [o0, o1] = or.to_be_bytes();
+                        let request = [
+                            0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x01, 0x16, 0x00, 0x00, a0, a1, o0,
+                            o1,
+                        ];
+                        ModbusTcpServer::handle_request(&request, bank.as_ref())
+                            .await
+                            .unwrap();
+                        let current = bank.read_03(0, 1).unwrap()[0];
+                        if or != 0 && current & mask == 0 {
+                            return false;
+                        }
+                    }
+                    tokio::task::yield_now().await;
+                }
+                true
+            }));
+        }
+        for task in tasks {
+            assert!(task.await.unwrap(), "a concurrent mask write was lost");
+        }
+        assert_eq!(bank.read_03(0, 1).unwrap(), vec![0]);
+    }
+
     #[tokio::test]
     async fn test_tcp_handle_request_read_write_multiple() {
         let register_bank = Arc::new(ModbusRegisterBank::new());
@@ -1940,6 +2039,121 @@ mod tests {
         let split = response.len() - 2;
         let crc = u16::from_le_bytes([response[split], response[split + 1]]);
         assert_eq!(crc, ModbusRtuServer::calculate_crc(&response[..split]));
+    }
+
+    /// Spawn the RTU read loop over an in-memory duplex "serial line".
+    #[cfg(feature = "rtu")]
+    fn spawn_rtu_loop(
+        bank: Arc<ModbusRegisterBank>,
+        frame_gap: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        broadcast::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (tx, rx) = broadcast::channel(1);
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
+        let task = tokio::spawn(ModbusRtuServer::handle_rtu_communication(
+            server, 1, bank, stats, rx, frame_gap,
+        ));
+        (client, tx, task)
+    }
+
+    /// Bug: a frame was only processed after a fixed 100 ms read timeout.
+    /// The frame must end after the configured t3.5 gap instead. Uses paused
+    /// tokio time, so the elapsed time is virtual and deterministic.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_replies_after_frame_gap() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_millis(2));
+
+        let start = tokio::time::Instant::now();
+        // Request split across two writes with no gap is still one frame
+        let request = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        client.write_all(&request[..3]).await.unwrap();
+        client.write_all(&request[3..]).await.unwrap();
+
+        let mut response = [0u8; 7];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("no RTU reply")
+            .unwrap();
+        assert_eq!(
+            &response[..],
+            &rtu_frame(&[0x01, 0x03, 0x02, 0x12, 0x34])[..]
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(20),
+            "reply took {:?}",
+            start.elapsed()
+        );
+
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Bug: continuous line noise grew `frame_buffer` without bound. An
+    /// over-long burst (> 256-byte RTU ADU) is discarded as a whole — even a
+    /// valid-looking tail is not answered — and the next frame works.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_discards_overlong_burst() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1111).unwrap();
+        bank.write_06(1, 0x2222).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_millis(2));
+
+        let mut burst = vec![0xAAu8; 1000];
+        burst.extend_from_slice(&rtu_frame(&[0x01, 0x03, 0x00, 0x01, 0x00, 0x01]));
+        client.write_all(&burst).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        client
+            .write_all(&rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]))
+            .await
+            .unwrap();
+        let mut response = [0u8; 7];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("no RTU reply")
+            .unwrap();
+        // Reply to the second request only (register 0), not the burst tail
+        assert_eq!(
+            &response[..],
+            &rtu_frame(&[0x01, 0x03, 0x02, 0x11, 0x11])[..]
+        );
+
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[cfg(feature = "rtu")]
+    #[test]
+    fn test_rtu_frame_accumulator_caps_buffer() {
+        let mut acc = RtuFrameAccumulator::new();
+        assert!(acc.is_idle());
+
+        // Exactly one max-size ADU is accepted
+        acc.push(&[0x55; MAX_RTU_ADU_SIZE]);
+        assert_eq!(acc.end_frame().map(|f| f.len()), Some(MAX_RTU_ADU_SIZE));
+        assert!(acc.is_idle());
+
+        // Overflow discards the buffer and the rest of the burst
+        for _ in 0..100 {
+            acc.push(&[0xAA; 64]);
+            assert!(acc.buffered_len() <= MAX_RTU_ADU_SIZE);
+        }
+        assert!(!acc.is_idle());
+        assert_eq!(acc.end_frame(), None);
+        assert!(acc.is_idle());
+
+        // Next frame after the gap is accumulated normally
+        acc.push(&[1, 2, 3, 4]);
+        assert_eq!(acc.end_frame(), Some(vec![1, 2, 3, 4]));
+        assert_eq!(acc.end_frame(), None);
     }
 
     #[cfg(feature = "rtu")]
