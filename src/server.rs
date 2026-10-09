@@ -1118,6 +1118,9 @@ pub struct ModbusRtuServerConfig {
     pub stop_bits: tokio_serial::StopBits,
     pub parity: tokio_serial::Parity,
     pub timeout: Duration,
+    /// Inter-frame silence (t3.5). The server ends a request frame after
+    /// `max(frame_gap, 20 ms)` of silence so USB-RS485 adapters, which deliver
+    /// bytes in ~16 ms chunks, do not split frames.
     pub frame_gap: Duration,
     pub register_bank: Option<Arc<ModbusRegisterBank>>,
 }
@@ -1143,6 +1146,12 @@ impl Default for ModbusRtuServerConfig {
 /// Maximum Modbus RTU ADU size (slave + 253-byte PDU + CRC).
 #[cfg(feature = "rtu")]
 const MAX_RTU_ADU_SIZE: usize = 256;
+
+/// Lower bound on the silence that ends an RTU request frame. USB-RS485
+/// adapters deliver bytes in chunks (FTDI's default latency timer is 16 ms),
+/// so a pure t3.5 gap (1.75 ms above 19200 baud) would split frames.
+#[cfg(feature = "rtu")]
+const MIN_RTU_FRAME_IDLE: Duration = Duration::from_millis(20);
 
 /// Accumulates received bytes into one RTU frame until a t3.5 idle gap.
 ///
@@ -1375,15 +1384,16 @@ impl ModbusRtuServer {
 
         let mut buffer = [0u8; MAX_RTU_ADU_SIZE];
         let mut frame = RtuFrameAccumulator::new();
+        let frame_idle = frame_gap.max(MIN_RTU_FRAME_IDLE);
 
         loop {
-            // While a frame is in progress, t3.5 of silence ends it; when idle,
-            // wait for the next byte with no timeout.
+            // While a frame is in progress, `frame_idle` of silence ends it;
+            // when idle, wait for the next byte with no timeout.
             let read = async {
                 if frame.is_idle() {
                     Ok(port.read(&mut buffer).await)
                 } else {
-                    tokio::time::timeout(frame_gap, port.read(&mut buffer)).await
+                    tokio::time::timeout(frame_idle, port.read(&mut buffer)).await
                 }
             };
 
@@ -2085,10 +2095,41 @@ mod tests {
             &response[..],
             &rtu_frame(&[0x01, 0x03, 0x02, 0x12, 0x34])[..]
         );
+        // Ends after the idle floor (20 ms), not the old fixed 100 ms
         assert!(
-            start.elapsed() < Duration::from_millis(20),
+            start.elapsed() < Duration::from_millis(50),
             "reply took {:?}",
             start.elapsed()
+        );
+
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// USB-RS485 adapters (FTDI latency timer: 16 ms) deliver a frame in
+    /// chunks separated by far more than t3.5 at high baud rates. Ending the
+    /// frame on a pure t3.5 gap (1.75 ms above 19200 baud) would split it and
+    /// fail the CRC, so the idle threshold has a floor that covers the chunking.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_tolerates_usb_adapter_chunking() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_micros(1750));
+
+        let request = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        client.write_all(&request[..3]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        client.write_all(&request[3..]).await.unwrap();
+
+        let mut response = [0u8; 7];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("frame split by USB chunking was not answered")
+            .unwrap();
+        assert_eq!(
+            &response[..],
+            &rtu_frame(&[0x01, 0x03, 0x02, 0x12, 0x34])[..]
         );
 
         tx.send(()).unwrap();
@@ -2109,7 +2150,7 @@ mod tests {
         let mut burst = vec![0xAAu8; 1000];
         burst.extend_from_slice(&rtu_frame(&[0x01, 0x03, 0x00, 0x01, 0x00, 0x01]));
         client.write_all(&burst).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         client
             .write_all(&rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]))
