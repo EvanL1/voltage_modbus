@@ -174,6 +174,10 @@ pub mod embedded;
 #[cfg(feature = "std")]
 pub mod register_bank;
 
+/// Recognizes partly-arrived requests for the RTU server
+#[cfg(feature = "rtu")]
+mod rtu_frame;
+
 // ============================================================================
 // Re-exports for convenience
 // ============================================================================

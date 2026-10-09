@@ -1118,6 +1118,9 @@ pub struct ModbusRtuServerConfig {
     pub stop_bits: tokio_serial::StopBits,
     pub parity: tokio_serial::Parity,
     pub timeout: Duration,
+    /// Inter-frame silence (t3.5) that ends a frame. A request to this server
+    /// that has only partly arrived (e.g. split by a USB-RS485 adapter's
+    /// chunking) waits up to 50 ms after its last byte for the rest.
     pub frame_gap: Duration,
     pub register_bank: Option<Arc<ModbusRegisterBank>>,
 }
@@ -1143,7 +1146,17 @@ impl Default for ModbusRtuServerConfig {
 #[cfg(feature = "rtu")]
 const MAX_RTU_ADU_SIZE: usize = 256;
 
+/// How long a partly-arrived request to this server may wait, after its last
+/// byte, for the rest. Covers USB-RS485 adapters that deliver a frame in
+/// chunks (FTDI's default latency timer is 16 ms).
+#[cfg(feature = "rtu")]
+const PARTIAL_REQUEST_GRACE: Duration = Duration::from_millis(50);
+
 /// Accumulates received bytes into one RTU frame until a t3.5 idle gap.
+///
+/// At the gap, a buffer that is the beginning of a request to this server
+/// (see [`crate::rtu_frame::is_partial_request`]) keeps waiting, up to
+/// [`PARTIAL_REQUEST_GRACE`] after its last byte, instead of ending there.
 ///
 /// The buffer is capped at [`MAX_RTU_ADU_SIZE`]: an over-long burst (line
 /// noise, garbage) is discarded entirely, including any bytes received after
@@ -1151,18 +1164,25 @@ const MAX_RTU_ADU_SIZE: usize = 256;
 #[cfg(feature = "rtu")]
 #[derive(Debug, Default)]
 struct RtuFrameAccumulator {
+    own_slave_id: u8,
     buffer: Vec<u8>,
     overflowed: bool,
+    /// When the last byte arrived (tokio clock, so paused-time tests work)
+    last_byte: Option<tokio::time::Instant>,
 }
 
 #[cfg(feature = "rtu")]
 impl RtuFrameAccumulator {
-    fn new() -> Self {
-        Self::default()
+    fn new(own_slave_id: u8) -> Self {
+        Self {
+            own_slave_id,
+            ..Self::default()
+        }
     }
 
     /// Append received bytes; on overflow drop the frame being accumulated.
     fn push(&mut self, bytes: &[u8]) {
+        self.last_byte = Some(tokio::time::Instant::now());
         if self.overflowed {
             return;
         }
@@ -1186,6 +1206,18 @@ impl RtuFrameAccumulator {
     #[cfg(test)]
     fn buffered_len(&self) -> usize {
         self.buffer.len()
+    }
+
+    /// Remaining wait for the rest of a partly-arrived request to us, if the
+    /// buffer is one and the grace has not run out.
+    fn partial_request_wait(&self) -> Option<Duration> {
+        if self.overflowed || !crate::rtu_frame::is_partial_request(&self.buffer, self.own_slave_id)
+        {
+            return None;
+        }
+        let deadline = self.last_byte? + PARTIAL_REQUEST_GRACE;
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        (!left.is_zero()).then_some(left)
     }
 
     /// Called on a t3.5 idle gap: returns the completed frame, if any, and
@@ -1374,16 +1406,18 @@ impl ModbusRtuServer {
         info!("🔌 RTU server communication started");
 
         let mut buffer = [0u8; MAX_RTU_ADU_SIZE];
-        let mut frame = RtuFrameAccumulator::new();
+        let mut frame = RtuFrameAccumulator::new(own_slave_id);
 
         loop {
-            // While a frame is in progress, t3.5 of silence ends it; when idle,
+            // While a frame is in progress, t3.5 of silence ends it (or, for a
+            // partly-arrived request to us, the rest of its grace); when idle,
             // wait for the next byte with no timeout.
+            let idle_limit = frame.partial_request_wait().unwrap_or(frame_gap);
             let read = async {
                 if frame.is_idle() {
                     Ok(port.read(&mut buffer).await)
                 } else {
-                    tokio::time::timeout(frame_gap, port.read(&mut buffer)).await
+                    tokio::time::timeout(idle_limit, port.read(&mut buffer)).await
                 }
             };
 
@@ -1403,13 +1437,19 @@ impl ModbusRtuServer {
                     }
                 }
                 Ok(Ok(_)) => {
-                    // No data read, but successful read operation
+                    // EOF: the port is gone; looping would spin at 100% CPU
+                    info!("RTU port closed (EOF)");
+                    break;
                 }
                 Ok(Err(e)) => {
                     error!("RTU read error: {}", e);
                     break;
                 }
                 Err(_) => {
+                    // A request to us that is still arriving: keep waiting
+                    if frame.partial_request_wait().is_some() {
+                        continue;
+                    }
                     // t3.5 idle gap elapsed: the frame is complete
                     if let Some(complete) = frame.end_frame() {
                         Self::process_accumulated_frame(
@@ -2131,6 +2171,145 @@ mod tests {
         task.await.unwrap();
     }
 
+    #[cfg(feature = "rtu")]
+    fn spawn_rtu_loop_as(
+        own_slave_id: u8,
+        bank: Arc<ModbusRegisterBank>,
+        frame_gap: Duration,
+    ) -> (
+        tokio::io::DuplexStream,
+        broadcast::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (client, server) = tokio::io::duplex(4096);
+        let (tx, rx) = broadcast::channel(1);
+        let stats = Arc::new(Mutex::new(ServerStats::default()));
+        let task = tokio::spawn(ModbusRtuServer::handle_rtu_communication(
+            server,
+            own_slave_id,
+            bank,
+            stats,
+            rx,
+            frame_gap,
+        ));
+        (client, tx, task)
+    }
+
+    #[cfg(feature = "rtu")]
+    async fn expect_reply(client: &mut tokio::io::DuplexStream, body: &[u8]) {
+        let expected = rtu_frame(body);
+        let mut response = vec![0u8; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), client.read_exact(&mut response))
+            .await
+            .expect("no RTU reply")
+            .unwrap();
+        assert_eq!(response, expected);
+    }
+
+    /// USB-RS485 adapters (FTDI latency timer: 16 ms) deliver a request in
+    /// chunks far more than t3.5 apart (1.75 ms above 19200 baud). The server
+    /// waits for the rest of a request to it instead of dropping each chunk.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_reassembles_usb_chunked_request() {
+        for own in [1u8, 7, 0x10, 247] {
+            let bank = Arc::new(ModbusRegisterBank::new());
+            bank.write_06(0, 0x1234).unwrap();
+            let (mut client, tx, task) = spawn_rtu_loop_as(own, bank, Duration::from_micros(1750));
+            let request = rtu_frame(&[own, 0x03, 0x00, 0x00, 0x00, 0x01]);
+            for cut in 1..request.len() {
+                client.write_all(&request[..cut]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(16)).await;
+                client.write_all(&request[cut..]).await.unwrap();
+                expect_reply(&mut client, &[own, 0x03, 0x02, 0x12, 0x34]).await;
+            }
+            tx.send(()).unwrap();
+            task.await.unwrap();
+        }
+    }
+
+    /// A long request takes longer than the 50 ms grace on the wire; the
+    /// grace runs from the last byte, so chunk after chunk keeps it alive.
+    /// 129-byte FC10 at 9600 baud (~134 ms), 16 bytes every 16 ms.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_reassembles_long_chunked_request() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let (mut client, tx, task) = spawn_rtu_loop_as(1, bank.clone(), Duration::from_millis(4));
+        let mut body = vec![0x01, 0x10, 0x00, 0x00, 0x00, 60, 120];
+        for i in 0..60u16 {
+            body.extend_from_slice(&i.to_be_bytes());
+        }
+        let request = rtu_frame(&body);
+        assert_eq!(request.len(), 129);
+        for chunk in request.chunks(16) {
+            client.write_all(chunk).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(16)).await;
+        }
+        expect_reply(&mut client, &[0x01, 0x10, 0x00, 0x00, 0x00, 60]).await;
+        assert_eq!(bank.read_03(59, 1).unwrap(), vec![59]);
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// A partial request that never completes is dropped after the grace,
+    /// and the next request is answered normally.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_drops_request_that_never_completes() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_micros(1750));
+        client.write_all(&[0x01, 0x03, 0x00]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client
+            .write_all(&rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]))
+            .await
+            .unwrap();
+        expect_reply(&mut client, &[0x01, 0x03, 0x02, 0x12, 0x34]).await;
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Other slaves' traffic is never waited on: our request right after
+    /// another slave's frame is answered at t3.5, not after the grace.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_does_not_wait_on_other_slaves() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop(bank, Duration::from_millis(2));
+        // Another slave's request, cut short (only part of it heard)
+        client.write_all(&[0x02, 0x03, 0x00]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(3)).await;
+        let start = tokio::time::Instant::now();
+        client
+            .write_all(&rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]))
+            .await
+            .unwrap();
+        expect_reply(&mut client, &[0x01, 0x03, 0x02, 0x12, 0x34]).await;
+        assert!(
+            start.elapsed() < Duration::from_millis(10),
+            "{:?}",
+            start.elapsed()
+        );
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// EOF (`read` returning 0) used to spin the loop at 100% CPU.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_exits_on_eof() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let (client, _tx, task) = spawn_rtu_loop(bank, Duration::from_millis(2));
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("RTU loop kept running after EOF")
+            .unwrap();
+    }
+
     /// Bug: continuous line noise grew `frame_buffer` without bound. An
     /// over-long burst (> 256-byte RTU ADU) is discarded as a whole — even a
     /// valid-looking tail is not answered — and the next frame works.
@@ -2169,7 +2348,7 @@ mod tests {
     #[cfg(feature = "rtu")]
     #[test]
     fn test_rtu_frame_accumulator_caps_buffer() {
-        let mut acc = RtuFrameAccumulator::new();
+        let mut acc = RtuFrameAccumulator::new(0x01);
         assert!(acc.is_idle());
 
         // Exactly one max-size ADU is accepted

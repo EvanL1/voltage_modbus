@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-09
+
+### Changed
+- **RTU server waits for the rest of a partly-arrived request.** USB-RS485 adapters
+  deliver bytes in chunks (FTDI's default latency timer is 16 ms), far longer apart
+  than t3.5 at high baud rates, so a request to the server was split at the gap and
+  dropped. Now, when the bytes received so far are the beginning of a fixed-layout
+  request addressed to this server (or broadcast), the server waits up to 50 ms after
+  the last byte for the rest — however long the request, since each chunk renews the
+  wait. Everything else is unchanged from 1.0.1: frames are still delimited by t3.5
+  silence and processed only whole and CRC-valid, so this can delay a frame but never
+  invent one. Other slaves' traffic is never waited on. No API or configuration changes.
+
+### Fixed
+- The RTU server loop now stops when the port reports EOF; it used to spin at 100 % CPU.
+
+### Known limitations
+- If another slave's reply and the master's request to this server reach the server
+  in the *same* USB chunk, the merged bytes still fail the CRC and the request is
+  dropped (as in 1.0.1). Lower the adapter's latency timer to avoid it, e.g. on Linux
+  `echo 1 > /sys/bus/usb-serial/devices/ttyUSB0/latency_timer`.
+
 ## [1.0.1] - 2026-10-09
 
 ### Fixed
@@ -59,8 +81,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Known limitations
 - The RTU **server** still delimits request frames by silence. At high baud rates a
   USB-RS485 adapter that delivers bytes in ~16 ms chunks can split a frame (as in
-  1.0.0); the RTU *client* is not affected (it reads by frame length). A length-aware
-  server reader is planned for a minor release.
+  1.0.0); the RTU *client* is not affected (it reads by frame length). Addressed in
+  1.1.0 for requests to the server.
 
 ### Changed
 - CI runs `cargo-semver-checks` against the latest release; the MSRV job checks all features.
