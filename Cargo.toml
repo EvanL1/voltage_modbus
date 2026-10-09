@@ -7,7 +7,6 @@ rust-version = "1.85.0"
 authors = ["Evan Liu <liuyifanz.1996@gmail.com>"]
 description = "A high-performance industrial Modbus library for Rust with TCP and RTU support"
 license = "MIT"
-homepage = "https://github.com/EvanL1/voltage_modbus"
 repository = "https://github.com/EvanL1/voltage_modbus"
 documentation = "https://docs.rs/voltage_modbus"
 readme = "README.md"
