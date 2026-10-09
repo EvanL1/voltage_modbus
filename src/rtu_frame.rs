@@ -8,8 +8,23 @@
 //! beginning of a fixed-layout request addressed to it (or broadcast) and still
 //! shorter than that layout, it waits for the rest instead of dropping it.
 //!
-//! Nothing else changes: frames are still only processed whole and CRC-valid,
-//! so this can delay a frame but never invent one.
+//! Nothing else changes: frames are still only processed whole and CRC-valid.
+//! If the wait does not end in a CRC-valid request, the server falls back to
+//! exactly the frames 1.0.1 would have seen (split at every t3.5 gap it waited
+//! through), so waiting can delay a frame but never lose or invent one.
+
+use crc::{Crc, CRC_16_MODBUS};
+
+const CRC_MODBUS: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
+
+/// True when `frame` (slave .. CRC) carries a valid CRC-16/MODBUS.
+pub(crate) fn crc_ok(frame: &[u8]) -> bool {
+    if frame.len() < 4 {
+        return false;
+    }
+    let (body, crc) = frame.split_at(frame.len() - 2);
+    CRC_MODBUS.checksum(body) == u16::from_le_bytes([crc[0], crc[1]])
+}
 
 /// Length of a request layout, if enough of the frame has arrived to tell.
 enum Expected {
@@ -59,9 +74,7 @@ pub(crate) fn is_partial_request(buf: &[u8], own_slave_id: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crc::{Crc, CRC_16_MODBUS};
 
-    const CRC_MODBUS: Crc<u16> = Crc::<u16>::new(&CRC_16_MODBUS);
     const OWN: u8 = 0x07;
 
     fn frame(body: &[u8]) -> Vec<u8> {

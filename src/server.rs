@@ -1166,6 +1166,9 @@ const PARTIAL_REQUEST_GRACE: Duration = Duration::from_millis(50);
 struct RtuFrameAccumulator {
     own_slave_id: u8,
     buffer: Vec<u8>,
+    /// Buffer lengths at each t3.5 gap waited through — where 1.0.1 would
+    /// have ended a frame
+    gaps: Vec<usize>,
     overflowed: bool,
     /// When the last byte arrived (tokio clock, so paused-time tests work)
     last_byte: Option<tokio::time::Instant>,
@@ -1220,12 +1223,49 @@ impl RtuFrameAccumulator {
         (!left.is_zero()).then_some(left)
     }
 
-    /// Called on a t3.5 idle gap: returns the completed frame, if any, and
-    /// resets for the next frame.
-    fn end_frame(&mut self) -> Option<Vec<u8>> {
+    /// How long the next read may block before the buffer is looked at:
+    /// t3.5 after fresh bytes (so every gap 1.0.1 would have ended a frame at
+    /// is observed and recorded), then the rest of a partial request's grace.
+    fn idle_limit(&self, frame_gap: Duration) -> Duration {
+        match self.partial_request_wait() {
+            Some(wait) if self.gaps.last() == Some(&self.buffer.len()) => wait.max(frame_gap),
+            _ => frame_gap,
+        }
+    }
+
+    /// Record a t3.5 gap that was waited through instead of ending the frame.
+    fn mark_gap(&mut self) {
+        if self.gaps.last() != Some(&self.buffer.len()) {
+            self.gaps.push(self.buffer.len());
+        }
+    }
+
+    /// Called on a t3.5 idle gap: returns the completed frame(s) and resets
+    /// for the next frame.
+    ///
+    /// A wait that ended in a CRC-valid frame yields that reassembled frame.
+    /// Otherwise the buffer is split at every gap waited through, yielding
+    /// exactly the frames 1.0.1 would have processed — so a glitch byte or a
+    /// truncated request cannot swallow the request that follows it.
+    fn end_frame(&mut self) -> Vec<Vec<u8>> {
         let overflowed = std::mem::take(&mut self.overflowed);
-        let frame = std::mem::take(&mut self.buffer);
-        (!overflowed && !frame.is_empty()).then_some(frame)
+        let buffer = std::mem::take(&mut self.buffer);
+        let gaps = std::mem::take(&mut self.gaps);
+        if overflowed || buffer.is_empty() {
+            return Vec::new();
+        }
+        if gaps.is_empty() || crate::rtu_frame::crc_ok(&buffer) {
+            return vec![buffer];
+        }
+        let mut frames = Vec::with_capacity(gaps.len() + 1);
+        let mut start = 0;
+        for end in gaps.into_iter().chain([buffer.len()]) {
+            if end > start {
+                frames.push(buffer[start..end].to_vec());
+                start = end;
+            }
+        }
+        frames
     }
 }
 
@@ -1412,7 +1452,7 @@ impl ModbusRtuServer {
             // While a frame is in progress, t3.5 of silence ends it (or, for a
             // partly-arrived request to us, the rest of its grace); when idle,
             // wait for the next byte with no timeout.
-            let idle_limit = frame.partial_request_wait().unwrap_or(frame_gap);
+            let idle_limit = frame.idle_limit(frame_gap);
             let read = async {
                 if frame.is_idle() {
                     Ok(port.read(&mut buffer).await)
@@ -1448,10 +1488,11 @@ impl ModbusRtuServer {
                 Err(_) => {
                     // A request to us that is still arriving: keep waiting
                     if frame.partial_request_wait().is_some() {
+                        frame.mark_gap();
                         continue;
                     }
                     // t3.5 idle gap elapsed: the frame is complete
-                    if let Some(complete) = frame.end_frame() {
+                    for complete in frame.end_frame() {
                         Self::process_accumulated_frame(
                             &complete,
                             &mut port,
@@ -2297,6 +2338,68 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// Cases where 1.0.1 answered and the partial-request wait must not
+    /// change that (review round 4): the wait may only ever add a frame —
+    /// a reassembled request — never lose one 1.0.1 would have processed.
+    #[cfg(feature = "rtu")]
+    async fn answered_after(own: u8, frame_gap: Duration, steps: &[(&[u8], u64)]) {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        bank.write_06(0, 0x1234).unwrap();
+        let (mut client, tx, task) = spawn_rtu_loop_as(own, bank, frame_gap);
+        for (bytes, pause_ms) in steps {
+            client.write_all(bytes).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(*pause_ms)).await;
+        }
+        expect_reply(&mut client, &[own, 0x03, 0x02, 0x12, 0x34]).await;
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// A configured frame gap longer than the 50 ms grace is still honored.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_partial_wait_honors_long_frame_gap() {
+        let request = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        answered_after(
+            1,
+            Duration::from_millis(100),
+            &[(&request[..3], 70), (&request[3..], 0)],
+        )
+        .await;
+    }
+
+    /// A glitch byte that looks like the start of a request to us, then the
+    /// master's real request within the grace: the request is answered.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_glitch_then_request_within_grace() {
+        for own in [1u8, 0x10, 0x2B, 100] {
+            let request = rtu_frame(&[own, 0x03, 0x00, 0x00, 0x00, 0x01]);
+            for glitch in [0x00u8, own] {
+                answered_after(
+                    own,
+                    Duration::from_micros(1750),
+                    &[(&[glitch], 10), (&request, 0)],
+                )
+                .await;
+            }
+        }
+    }
+
+    /// A truncated request, then the master's retry within the grace: the
+    /// retry is answered.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_retry_after_truncated_request() {
+        let request = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        answered_after(
+            1,
+            Duration::from_micros(1750),
+            &[(&request[..3], 30), (&request, 0)],
+        )
+        .await;
+    }
+
     /// EOF (`read` returning 0) used to spin the loop at 100% CPU.
     #[cfg(feature = "rtu")]
     #[tokio::test(start_paused = true)]
@@ -2308,6 +2411,39 @@ mod tests {
             .await
             .expect("RTU loop kept running after EOF")
             .unwrap();
+    }
+
+    /// A wait that does not end in a CRC-valid frame yields exactly the
+    /// segments 1.0.1 would have produced at each gap.
+    #[cfg(feature = "rtu")]
+    #[test]
+    fn test_rtu_accumulator_falls_back_to_gap_segments() {
+        let request = rtu_frame(&[0x01, 0x03, 0x00, 0x00, 0x00, 0x01]);
+
+        // Reassembled: one frame
+        let mut acc = RtuFrameAccumulator::new(0x01);
+        acc.push(&request[..3]);
+        acc.mark_gap();
+        acc.push(&request[3..]);
+        assert_eq!(acc.end_frame(), vec![request.clone()]);
+
+        // Glitch, gap, request: the 1.0.1 segments
+        let mut acc = RtuFrameAccumulator::new(0x01);
+        acc.push(&[0x00]);
+        acc.mark_gap();
+        acc.push(&request);
+        assert_eq!(acc.end_frame(), vec![vec![0x00], request.clone()]);
+
+        // Truncated request, gap, retry
+        let mut acc = RtuFrameAccumulator::new(0x01);
+        acc.push(&request[..3]);
+        acc.mark_gap();
+        acc.mark_gap(); // repeated timeouts at the same length record one gap
+        acc.push(&request);
+        assert_eq!(
+            acc.end_frame(),
+            vec![request[..3].to_vec(), request.clone()]
+        );
     }
 
     /// Bug: continuous line noise grew `frame_buffer` without bound. An
@@ -2353,7 +2489,10 @@ mod tests {
 
         // Exactly one max-size ADU is accepted
         acc.push(&[0x55; MAX_RTU_ADU_SIZE]);
-        assert_eq!(acc.end_frame().map(|f| f.len()), Some(MAX_RTU_ADU_SIZE));
+        assert_eq!(
+            acc.end_frame().iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![MAX_RTU_ADU_SIZE]
+        );
         assert!(acc.is_idle());
 
         // Overflow discards the buffer and the rest of the burst
@@ -2362,13 +2501,13 @@ mod tests {
             assert!(acc.buffered_len() <= MAX_RTU_ADU_SIZE);
         }
         assert!(!acc.is_idle());
-        assert_eq!(acc.end_frame(), None);
+        assert!(acc.end_frame().is_empty());
         assert!(acc.is_idle());
 
         // Next frame after the gap is accumulated normally
         acc.push(&[1, 2, 3, 4]);
-        assert_eq!(acc.end_frame(), Some(vec![1, 2, 3, 4]));
-        assert_eq!(acc.end_frame(), None);
+        assert_eq!(acc.end_frame(), vec![vec![1, 2, 3, 4]]);
+        assert!(acc.end_frame().is_empty());
     }
 
     #[cfg(feature = "rtu")]

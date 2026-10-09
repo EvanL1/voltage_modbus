@@ -16,9 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped. Now, when the bytes received so far are the beginning of a fixed-layout
   request addressed to this server (or broadcast), the server waits up to 50 ms after
   the last byte for the rest — however long the request, since each chunk renews the
-  wait. Everything else is unchanged from 1.0.1: frames are still delimited by t3.5
-  silence and processed only whole and CRC-valid, so this can delay a frame but never
-  invent one. Other slaves' traffic is never waited on. No API or configuration changes.
+  wait (and never less than the configured `frame_gap`). Everything else is unchanged
+  from 1.0.1: frames are delimited by t3.5 silence and processed only whole and
+  CRC-valid. If the wait does not end in a CRC-valid request — a glitch byte, a
+  truncated request followed by the master's retry — the bytes are split at every gap
+  that was waited through, i.e. into exactly the frames 1.0.1 would have processed.
+  So the only new frame is a reassembled request; nothing 1.0.1 answered is lost.
+  Other slaves' traffic is never waited on. No API or configuration changes.
 
 ### Fixed
 - The RTU server loop now stops when the port reports EOF; it used to spin at 100 % CPU.
