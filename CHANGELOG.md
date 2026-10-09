@@ -18,11 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the last byte for the rest — however long the request, since each chunk renews the
   wait (and never less than the configured `frame_gap`). Everything else is unchanged
   from 1.0.1: frames are delimited by t3.5 silence and processed only whole and
-  CRC-valid. If the wait does not end in a CRC-valid request — a glitch byte, a
-  truncated request followed by the master's retry — the bytes are split at every gap
-  that was waited through, i.e. into exactly the frames 1.0.1 would have processed.
-  So the only new frame is a reassembled request; nothing 1.0.1 answered is lost.
-  Other slaves' traffic is never waited on. No API or configuration changes.
+  CRC-valid. The wait only ever spans bytes 1.0.1 would have dropped: it continues
+  through a t3.5 gap only while the segment since the previous gap fails its CRC, and
+  the bytes count as a reassembled request only if every segment failed its CRC and
+  the whole is exactly one fixed-layout request to this server. Otherwise they are
+  split at every gap, i.e. into exactly the frames 1.0.1 would have processed, at the
+  same moment. A differential test against 1.0.1 (1.1M random timed streams: glitches,
+  truncations, retries, other slaves' traffic, USB chunking) found no frame 1.0.1
+  processes that is lost, changed or delayed; the only difference is the reassembled
+  request. Other slaves' traffic is never waited on. No API or configuration changes.
 
 ### Fixed
 - The RTU server loop now stops when the port reports EOF; it used to spin at 100 % CPU.

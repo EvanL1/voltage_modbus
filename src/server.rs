@@ -1293,6 +1293,7 @@ impl RtuFrameAccumulator {
         // Reassembled only if no segment is a frame on its own (CRC-16 has no
         // output XOR: a valid frame plus trailing 0x00 bytes still passes)
         let reassembled = segments.iter().all(|s| !crate::rtu_frame::crc_ok(s))
+            && crate::rtu_frame::is_complete_request(&buffer, self.own_slave_id)
             && crate::rtu_frame::crc_ok(&buffer);
         if reassembled {
             vec![buffer]
@@ -2512,6 +2513,31 @@ mod tests {
         client.write_all(&[0x00]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(bank.read_03(1, 1).unwrap(), vec![0]);
+        tx.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Review round 6: a chunked request followed by 0x00 still passes the
+    /// CRC as a whole. It is not reassembled (wrong length), so the server
+    /// stays silent, exactly as 1.0.1 does for these gap-split segments.
+    #[cfg(feature = "rtu")]
+    #[tokio::test(start_paused = true)]
+    async fn test_rtu_loop_does_not_reassemble_zero_padded_request() {
+        let bank = Arc::new(ModbusRegisterBank::new());
+        let (mut client, tx, task) = spawn_rtu_loop_as(0x06, bank, Duration::from_micros(1750));
+        let request = rtu_frame(&[0x06, 0x06, 0x00, 0x01, 0x00, 0x03]);
+        client.write_all(&request[..1]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(16)).await;
+        client.write_all(&request[1..]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        client.write_all(&[0x00]).await.unwrap();
+        let mut reply = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), client.read(&mut reply))
+                .await
+                .is_err(),
+            "server answered a zero-padded reassembly"
+        );
         tx.send(()).unwrap();
         task.await.unwrap();
     }

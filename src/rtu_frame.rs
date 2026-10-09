@@ -71,6 +71,16 @@ pub(crate) fn is_partial_request(buf: &[u8], own_slave_id: u8) -> bool {
     }
 }
 
+/// True when `buf` is exactly one complete fixed-layout request to
+/// `own_slave_id` (or a broadcast) — the only shape a reassembled frame may
+/// take. CRC-16/MODBUS has no output XOR, so a request followed by 0x00 bytes
+/// still passes the CRC; the exact length rules that out.
+pub(crate) fn is_complete_request(buf: &[u8], own_slave_id: u8) -> bool {
+    buf.len() >= 2
+        && (buf[0] == own_slave_id || buf[0] == 0)
+        && matches!(request_len(buf), Some(Expected::Len(n)) if n == buf.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,6 +142,20 @@ mod tests {
         for cut in 1..=other.len() {
             assert!(!is_partial_request(&other[..cut], OWN));
         }
+    }
+
+    #[test]
+    fn complete_request_requires_exact_layout_length() {
+        let f = frame(&[OWN, 0x03, 0x00, 0x00, 0x00, 0x01]);
+        assert!(is_complete_request(&f, OWN));
+        let mut padded = f.clone();
+        padded.push(0x00);
+        assert!(!is_complete_request(&padded, OWN));
+        assert!(!is_complete_request(&f[..7], OWN));
+        assert!(!is_complete_request(
+            &frame(&[0x02, 0x03, 0x00, 0x00, 0x00, 0x01]),
+            OWN
+        ));
     }
 
     #[test]
